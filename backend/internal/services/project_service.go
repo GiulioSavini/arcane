@@ -2065,6 +2065,14 @@ func (s *ProjectService) UpdateProject(ctx context.Context, projectID string, na
 		return nil, err
 	}
 
+	// When compose content changes, recalculate service counts and status so the
+	// overview doesn't show stale values (e.g. ghost services after removal).
+	if composeContent != nil {
+		if err := s.updateProjectStatusandCountsInternal(ctx, proj.ID, proj.Status); err != nil {
+			slog.WarnContext(ctx, "failed to update service counts after compose edit", "projectID", proj.ID, "error", err)
+		}
+	}
+
 	metadata := models.JSON{
 		"action":      "update",
 		"projectID":   proj.ID,
@@ -2107,6 +2115,11 @@ func (s *ProjectService) ApplyGitSyncProjectFiles(ctx context.Context, projectID
 	}
 	if err := s.db.WithContext(ctx).Save(&proj).Error; err != nil {
 		return nil, fmt.Errorf("failed to update project: %w", err)
+	}
+
+	// Recalculate service counts and status after compose file sync
+	if err := s.updateProjectStatusandCountsInternal(ctx, proj.ID, proj.Status); err != nil {
+		slog.WarnContext(ctx, "failed to update service counts after git sync", "projectID", proj.ID, "error", err)
 	}
 
 	metadata := models.JSON{
@@ -2612,6 +2625,11 @@ func (s *ProjectService) UpdateProjectIncludeFile(ctx context.Context, projectID
 
 	if err := projects.WriteIncludeFile(proj.Path, relativePath, content); err != nil {
 		return fmt.Errorf("failed to update include file: %w", err)
+	}
+
+	// Recalculate service counts since include files can define services
+	if err := s.updateProjectStatusandCountsInternal(ctx, proj.ID, proj.Status); err != nil {
+		slog.WarnContext(ctx, "failed to update service counts after include file edit", "projectID", proj.ID, "error", err)
 	}
 
 	metadata := models.JSON{
