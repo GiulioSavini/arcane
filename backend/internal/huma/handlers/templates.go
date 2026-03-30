@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"net/http"
 
 	"github.com/danielgtaylor/huma/v2"
 	"github.com/getarcaneapp/arcane/backend/internal/common"
@@ -16,7 +17,8 @@ import (
 
 // TemplateHandler handles template management endpoints.
 type TemplateHandler struct {
-	templateService *services.TemplateService
+	templateService    *services.TemplateService
+	environmentService *services.EnvironmentService
 }
 
 // ============================================================================
@@ -150,14 +152,17 @@ type FetchTemplateRegistryOutput struct {
 	Body base.ApiResponse[template.RemoteRegistry]
 }
 
-type GetGlobalVariablesInput struct{}
+type GetGlobalVariablesInput struct {
+	EnvironmentID string `path:"id" doc:"Environment ID"`
+}
 
 type GetGlobalVariablesOutput struct {
 	Body base.ApiResponse[[]env.Variable]
 }
 
 type UpdateGlobalVariablesInput struct {
-	Body env.Summary
+	EnvironmentID string `path:"id" doc:"Environment ID"`
+	Body          env.Summary
 }
 
 type UpdateGlobalVariablesOutput struct {
@@ -169,8 +174,8 @@ type UpdateGlobalVariablesOutput struct {
 // ============================================================================
 
 // RegisterTemplates registers all template management endpoints.
-func RegisterTemplates(api huma.API, templateService *services.TemplateService) {
-	h := &TemplateHandler{templateService: templateService}
+func RegisterTemplates(api huma.API, templateService *services.TemplateService, environmentService *services.EnvironmentService) {
+	h := &TemplateHandler{templateService: templateService, environmentService: environmentService}
 
 	// Public endpoints (no auth required in original)
 	huma.Register(api, huma.Operation{
@@ -352,9 +357,9 @@ func RegisterTemplates(api huma.API, templateService *services.TemplateService) 
 	huma.Register(api, huma.Operation{
 		OperationID: "getGlobalVariables",
 		Method:      "GET",
-		Path:        "/templates/variables",
+		Path:        "/environments/{id}/templates/variables",
 		Summary:     "Get global variables",
-		Description: "Get global template variables",
+		Description: "Get global template variables for an environment",
 		Tags:        []string{"Templates"},
 		Security: []map[string][]string{
 			{"BearerAuth": {}},
@@ -365,9 +370,9 @@ func RegisterTemplates(api huma.API, templateService *services.TemplateService) 
 	huma.Register(api, huma.Operation{
 		OperationID: "updateGlobalVariables",
 		Method:      "PUT",
-		Path:        "/templates/variables",
+		Path:        "/environments/{id}/templates/variables",
 		Summary:     "Update global variables",
-		Description: "Update global template variables",
+		Description: "Update global template variables for an environment",
 		Tags:        []string{"Templates"},
 		Security: []map[string][]string{
 			{"BearerAuth": {}},
@@ -818,9 +823,13 @@ func (h *TemplateHandler) FetchRegistry(ctx context.Context, input *FetchTemplat
 }
 
 // GetGlobalVariables returns global template variables.
-func (h *TemplateHandler) GetGlobalVariables(ctx context.Context, _ *GetGlobalVariablesInput) (*GetGlobalVariablesOutput, error) {
+func (h *TemplateHandler) GetGlobalVariables(ctx context.Context, input *GetGlobalVariablesInput) (*GetGlobalVariablesOutput, error) {
 	if h.templateService == nil {
 		return nil, huma.Error500InternalServerError("service not available")
+	}
+
+	if input.EnvironmentID != "0" {
+		return h.getGlobalVariablesForRemoteEnvironment(ctx, input)
 	}
 
 	vars, err := h.templateService.GetGlobalVariables(ctx)
@@ -836,10 +845,36 @@ func (h *TemplateHandler) GetGlobalVariables(ctx context.Context, _ *GetGlobalVa
 	}, nil
 }
 
+func (h *TemplateHandler) getGlobalVariablesForRemoteEnvironment(ctx context.Context, input *GetGlobalVariablesInput) (*GetGlobalVariablesOutput, error) {
+	if h.environmentService == nil {
+		return nil, huma.Error500InternalServerError("environment service not available")
+	}
+
+	respBody, statusCode, err := h.environmentService.ProxyRequest(ctx, input.EnvironmentID, http.MethodGet, "/api/environments/0/templates/variables", nil)
+	if err != nil {
+		return nil, huma.Error502BadGateway("failed to proxy request to environment: " + err.Error())
+	}
+
+	if statusCode != http.StatusOK {
+		return nil, huma.Error502BadGateway("remote environment returned status " + http.StatusText(statusCode))
+	}
+
+	var response base.ApiResponse[[]env.Variable]
+	if err := json.Unmarshal(respBody, &response); err != nil {
+		return nil, huma.Error500InternalServerError("failed to parse remote response: " + err.Error())
+	}
+
+	return &GetGlobalVariablesOutput{Body: response}, nil
+}
+
 // UpdateGlobalVariables updates global template variables.
 func (h *TemplateHandler) UpdateGlobalVariables(ctx context.Context, input *UpdateGlobalVariablesInput) (*UpdateGlobalVariablesOutput, error) {
 	if h.templateService == nil {
 		return nil, huma.Error500InternalServerError("service not available")
+	}
+
+	if input.EnvironmentID != "0" {
+		return h.updateGlobalVariablesForRemoteEnvironment(ctx, input)
 	}
 
 	if err := h.templateService.UpdateGlobalVariables(ctx, input.Body.Variables); err != nil {
@@ -854,4 +889,31 @@ func (h *TemplateHandler) UpdateGlobalVariables(ctx context.Context, input *Upda
 			},
 		},
 	}, nil
+}
+
+func (h *TemplateHandler) updateGlobalVariablesForRemoteEnvironment(ctx context.Context, input *UpdateGlobalVariablesInput) (*UpdateGlobalVariablesOutput, error) {
+	if h.environmentService == nil {
+		return nil, huma.Error500InternalServerError("environment service not available")
+	}
+
+	body, err := json.Marshal(input.Body)
+	if err != nil {
+		return nil, huma.Error500InternalServerError("failed to marshal request body: " + err.Error())
+	}
+
+	respBody, statusCode, err := h.environmentService.ProxyRequest(ctx, input.EnvironmentID, http.MethodPut, "/api/environments/0/templates/variables", body)
+	if err != nil {
+		return nil, huma.Error502BadGateway("failed to proxy request to environment: " + err.Error())
+	}
+
+	if statusCode != http.StatusOK {
+		return nil, huma.Error502BadGateway("remote environment returned status " + http.StatusText(statusCode))
+	}
+
+	var response base.ApiResponse[base.MessageResponse]
+	if err := json.Unmarshal(respBody, &response); err != nil {
+		return nil, huma.Error500InternalServerError("failed to parse remote response: " + err.Error())
+	}
+
+	return &UpdateGlobalVariablesOutput{Body: response}, nil
 }
