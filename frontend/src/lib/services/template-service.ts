@@ -100,14 +100,12 @@ export default class TemplateService extends BaseAPIService {
 	}
 
 	async getGlobalVariables(): Promise<Variable[]> {
-		await environmentStore.ready;
 		const envId = await environmentStore.getCurrentEnvironmentId();
 		const response = await this.api.get(`/environments/${envId}/templates/variables`);
 		return response.data?.data ?? [];
 	}
 
 	async updateGlobalVariables(variables: Variable[]): Promise<void> {
-		await environmentStore.ready;
 		const envId = await environmentStore.getCurrentEnvironmentId();
 		await this.api.put(`/environments/${envId}/templates/variables`, { variables });
 	}

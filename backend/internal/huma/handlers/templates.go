@@ -829,7 +829,7 @@ func (h *TemplateHandler) GetGlobalVariables(ctx context.Context, input *GetGlob
 	}
 
 	if input.EnvironmentID != "0" {
-		return h.getGlobalVariablesForRemoteEnvironment(ctx, input)
+		return h.getGlobalVariablesForRemoteEnvironmentInternal(ctx, input)
 	}
 
 	vars, err := h.templateService.GetGlobalVariables(ctx)
@@ -845,7 +845,7 @@ func (h *TemplateHandler) GetGlobalVariables(ctx context.Context, input *GetGlob
 	}, nil
 }
 
-func (h *TemplateHandler) getGlobalVariablesForRemoteEnvironment(ctx context.Context, input *GetGlobalVariablesInput) (*GetGlobalVariablesOutput, error) {
+func (h *TemplateHandler) getGlobalVariablesForRemoteEnvironmentInternal(ctx context.Context, input *GetGlobalVariablesInput) (*GetGlobalVariablesOutput, error) {
 	if h.environmentService == nil {
 		return nil, huma.Error500InternalServerError("environment service not available")
 	}
@@ -856,7 +856,7 @@ func (h *TemplateHandler) getGlobalVariablesForRemoteEnvironment(ctx context.Con
 	}
 
 	if statusCode != http.StatusOK {
-		return nil, huma.Error502BadGateway("remote environment returned status " + http.StatusText(statusCode))
+		return nil, huma.NewError(statusCode, "remote environment returned error: "+string(respBody), nil)
 	}
 
 	var response base.ApiResponse[[]env.Variable]
@@ -874,7 +874,7 @@ func (h *TemplateHandler) UpdateGlobalVariables(ctx context.Context, input *Upda
 	}
 
 	if input.EnvironmentID != "0" {
-		return h.updateGlobalVariablesForRemoteEnvironment(ctx, input)
+		return h.updateGlobalVariablesForRemoteEnvironmentInternal(ctx, input)
 	}
 
 	if err := h.templateService.UpdateGlobalVariables(ctx, input.Body.Variables); err != nil {
@@ -891,7 +891,7 @@ func (h *TemplateHandler) UpdateGlobalVariables(ctx context.Context, input *Upda
 	}, nil
 }
 
-func (h *TemplateHandler) updateGlobalVariablesForRemoteEnvironment(ctx context.Context, input *UpdateGlobalVariablesInput) (*UpdateGlobalVariablesOutput, error) {
+func (h *TemplateHandler) updateGlobalVariablesForRemoteEnvironmentInternal(ctx context.Context, input *UpdateGlobalVariablesInput) (*UpdateGlobalVariablesOutput, error) {
 	if h.environmentService == nil {
 		return nil, huma.Error500InternalServerError("environment service not available")
 	}
@@ -907,7 +907,7 @@ func (h *TemplateHandler) updateGlobalVariablesForRemoteEnvironment(ctx context.
 	}
 
 	if statusCode != http.StatusOK {
-		return nil, huma.Error502BadGateway("remote environment returned status " + http.StatusText(statusCode))
+		return nil, huma.NewError(statusCode, "remote environment returned error: "+string(respBody), nil)
 	}
 
 	var response base.ApiResponse[base.MessageResponse]
