@@ -239,6 +239,16 @@ func buildProjectImagePullPlan(services composetypes.Services) map[string]imageP
 	return plan
 }
 
+func ptrStringEqualInternal(a, b *string) bool {
+	if a == nil && b == nil {
+		return true
+	}
+	if a == nil || b == nil {
+		return false
+	}
+	return *a == *b
+}
+
 func normalizeComposeProjectName(name string) string {
 	if name == "" {
 		return ""
@@ -939,18 +949,20 @@ func (s *ProjectService) upsertProjectForDir(ctx context.Context, dirName, dirPa
 		Path: dirPath,
 	}
 	serviceCount, serviceCountErr := s.countServicesFromCompose(ctx, filesystemProject)
+	composeProjectName := s.resolveComposeProjectNameInternal(ctx, dirPath, dirName)
 
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		// Create a minimal project entry
 		reason := "Project discovered from filesystem, status pending Docker service query"
 		proj := &models.Project{
-			Name:         dirName,
-			DirName:      new(dirName),
-			Path:         dirPath,
-			Status:       models.ProjectStatusUnknown,
-			StatusReason: new(reason),
-			ServiceCount: serviceCount,
-			RunningCount: 0,
+			Name:               dirName,
+			DirName:            new(dirName),
+			Path:               dirPath,
+			Status:             models.ProjectStatusUnknown,
+			StatusReason:       new(reason),
+			ServiceCount:       serviceCount,
+			RunningCount:       0,
+			ComposeProjectName: composeProjectName,
 		}
 		slog.InfoContext(ctx, "Discovered new project with unknown status",
 			"project", dirName,
@@ -979,6 +991,9 @@ func (s *ProjectService) upsertProjectForDir(ctx context.Context, dirName, dirPa
 		updates["service_count"] = serviceCount
 	} else if serviceCountErr != nil {
 		slog.WarnContext(ctx, "failed to refresh compose service count during project sync", "projectID", existing.ID, "path", dirPath, "error", serviceCountErr)
+	}
+	if !ptrStringEqualInternal(existing.ComposeProjectName, composeProjectName) {
+		updates["compose_project_name"] = composeProjectName
 	}
 	if len(updates) == 0 {
 		return nil
@@ -1143,6 +1158,9 @@ func (s *ProjectService) GetProjectStatusCounts(ctx context.Context) (folderCoun
 	for _, p := range projectsList {
 		normName := normalizeComposeProjectName(p.Name)
 		projectContainers := containersByProject[normName]
+		if len(projectContainers) == 0 && p.ComposeProjectName != nil && *p.ComposeProjectName != normName {
+			projectContainers = containersByProject[*p.ComposeProjectName]
+		}
 
 		// Convert to ProjectServiceInfo (minimal needed for calculateProjectStatus)
 		var services []ProjectServiceInfo
@@ -2997,9 +3015,14 @@ func (s *ProjectService) mapProjectToDto(ctx context.Context, projectsDir string
 	resp.IconURL = meta.ProjectIconURL
 	resp.URLs = meta.ProjectURLS
 
-	// Find containers for this project
+	// Find containers for this project. Try the normalized directory name first,
+	// then fall back to the effective compose project name (from COMPOSE_PROJECT_NAME
+	// in .env) which may differ from the directory name.
 	normName := normalizeComposeProjectName(p.Name)
 	projectContainers := containersByProject[normName]
+	if len(projectContainers) == 0 && p.ComposeProjectName != nil && *p.ComposeProjectName != normName {
+		projectContainers = containersByProject[*p.ComposeProjectName]
+	}
 
 	var services []ProjectServiceInfo
 	runningCount := 0
@@ -3126,6 +3149,37 @@ func (s *ProjectService) countServicesFromCompose(ctx context.Context, p models.
 	}
 
 	return len(proj.Services), nil
+}
+
+// resolveComposeProjectNameInternal loads the compose project without forcing a
+// project name so that compose-go can resolve it from COMPOSE_PROJECT_NAME in
+// the .env file (or fall back to the directory name). Returns the effective
+// project name that Docker Compose would use when starting containers, or nil
+// if it matches the normalized directory name (no override needed).
+func (s *ProjectService) resolveComposeProjectNameInternal(ctx context.Context, dirPath, dirName string) *string {
+	projectsDirSetting := s.settingsService.GetStringSetting(ctx, "projectsDirectory", "/app/data/projects")
+	projectsDirectory, err := projects.GetProjectsDirectory(ctx, strings.TrimSpace(projectsDirSetting))
+	if err != nil {
+		return nil
+	}
+
+	pathMapper, pmErr := s.getPathMapper(ctx)
+	if pmErr != nil {
+		slog.WarnContext(ctx, "failed to create path mapper for compose name resolution", "error", pmErr)
+	}
+
+	autoInjectEnv := s.settingsService.GetBoolSetting(ctx, "autoInjectEnv", false)
+	// Pass empty project name so compose-go resolves it from COMPOSE_PROJECT_NAME or directory name
+	proj, _, err := projects.LoadComposeProjectFromDir(ctx, dirPath, "", projectsDirectory, autoInjectEnv, pathMapper)
+	if err != nil {
+		return nil
+	}
+
+	effectiveName := proj.Name
+	if effectiveName == "" || effectiveName == normalizeComposeProjectName(dirName) {
+		return nil
+	}
+	return &effectiveName
 }
 
 func (s *ProjectService) calculateProjectStatus(services []ProjectServiceInfo) models.ProjectStatus {
