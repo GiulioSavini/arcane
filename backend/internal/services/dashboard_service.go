@@ -416,7 +416,7 @@ func (s *DashboardService) getActionableVulnerabilitiesCountInternal(ctx context
 		return 0, nil
 	}
 
-	return s.vulnerabilityService.GetActionableCountExcludingIgnoredInternal(ctx)
+	return s.vulnerabilityService.getActionableCountExcludingIgnoredInternal(ctx)
 }
 
 func (s *DashboardService) getExpiringAPIKeysCountInternal(ctx context.Context) (int, error) {
