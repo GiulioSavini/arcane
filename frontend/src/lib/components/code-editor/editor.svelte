@@ -3,7 +3,7 @@
 	import * as Command from '$lib/components/ui/command';
 	import { autocompletion, type Completion, type CompletionContext } from '@codemirror/autocomplete';
 	import { yaml } from '@codemirror/lang-yaml';
-	import { StreamLanguage, foldAll, unfoldAll, foldKeymap } from '@codemirror/language';
+	import { StreamLanguage, indentUnit, foldAll, unfoldAll, foldKeymap } from '@codemirror/language';
 	import { properties } from '@codemirror/legacy-modes/mode/properties';
 	import {
 		linter,
@@ -534,7 +534,7 @@
 
 		switch (lang) {
 			case 'yaml':
-				extensions.push(yaml());
+				extensions.push(yaml(), indentUnit.of('  '));
 				if (!readOnly && !lightweight) {
 					extensions.push(
 						lintGutter(),
