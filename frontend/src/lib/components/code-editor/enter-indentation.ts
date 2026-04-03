@@ -3,22 +3,17 @@ import { EditorState, Prec, type Extension } from '@codemirror/state';
 import { EditorView } from '@codemirror/view';
 import type { CodeLanguage } from './analysis/types';
 
-function getYamlIndent(
-	lineBreakState: EditorState,
-	textBeforeCursor: string,
-	currentIndent: string,
-	isCursorAtLineEnd: boolean
-): string {
+function getYamlIndent(state: EditorState, textBeforeCursor: string, currentIndent: string, isCursorAtLineEnd: boolean): string {
 	if (!isCursorAtLineEnd) return currentIndent;
 
 	const trimmedBeforeCursor = textBeforeCursor.trimEnd();
 	const startsYamlBlock =
 		/:\s*(?:#.*)?$/.test(trimmedBeforeCursor) ||
 		/:\s*[|>][-+0-9]*\s*(?:#.*)?$/.test(trimmedBeforeCursor) ||
-		/^-\s*(?:#.*)?$/.test(trimmedBeforeCursor);
+		/^-\s*(?:#.*)?$/.test(trimmedBeforeCursor.trimStart());
 
 	if (startsYamlBlock) {
-		return indentString(lineBreakState, currentIndent.length + getIndentUnit(lineBreakState));
+		return indentString(state, currentIndent.length + getIndentUnit(state));
 	}
 
 	return currentIndent;
@@ -54,10 +49,7 @@ export function createEnterIndentKeymap(language: CodeLanguage): Extension {
 				let indentation: string;
 
 				if (language === 'yaml') {
-					const lineBreakTransaction = view.state.update({
-						changes: { from, to, insert: '\n' }
-					});
-					indentation = getYamlIndent(lineBreakTransaction.state, textBeforeCursor, currentIndent, isCursorAtLineEnd);
+					indentation = getYamlIndent(view.state, textBeforeCursor, currentIndent, isCursorAtLineEnd);
 				} else {
 					indentation = textBeforeCursor.match(/^\s*/)?.[0] ?? '';
 				}
