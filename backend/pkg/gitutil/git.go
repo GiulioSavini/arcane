@@ -114,7 +114,13 @@ func (c *Client) getSSHHostKeyCallback(mode string) (gossh.HostKeyCallback, erro
 func (c *Client) createAcceptNewHostKeyCallback() (gossh.HostKeyCallback, error) {
 	knownHostsPath := getKnownHostsPath()
 
-	// Create the file if it doesn't exist (directory is already ensured by getKnownHostsPath)
+	// Ensure the parent directory exists (needed when SSH_KNOWN_HOSTS points to a custom path)
+	dir := filepath.Dir(knownHostsPath)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, fmt.Errorf("failed to create known_hosts directory: %w", err)
+	}
+
+	// Create the file if it doesn't exist
 	if _, err := os.Stat(knownHostsPath); os.IsNotExist(err) {
 		file, err := os.OpenFile(knownHostsPath, os.O_CREATE|os.O_WRONLY, 0o600)
 		if err != nil {
