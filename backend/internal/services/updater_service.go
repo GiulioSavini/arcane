@@ -207,11 +207,8 @@ func (s *UpdaterService) ApplyPending(ctx context.Context, dryRun bool) (*update
 			item.Status = "skipped"
 			item.Error = "image already up to date"
 			out.Skipped++
-			// We skip checking for pull, but we still proceed to container update checks
-			// treating this as "successful" for the pipeline, but invalidating oldIDs
-			// because they represent the *current* image, not a stale one.
-			plans[i].pulled = true
-			plans[i].oldIDs = nil
+			// Image is already up to date — do NOT mark as pulled so that
+			// containers using this image are not scheduled for recreation.
 			skipPull = true
 
 			s.logAutoUpdate(ctx, s.severityFromStatus(item.Status), models.JSON{
