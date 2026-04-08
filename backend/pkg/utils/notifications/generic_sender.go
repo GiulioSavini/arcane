@@ -47,20 +47,17 @@ func BuildGenericURL(config models.GenericConfig) (string, error) {
 
 	// Start with the base URL.
 	// Preserve any query parameters from the original webhook URL by encoding
-	// the ? as %3F so it stays in the path component. Shoutrrr decodes the path
-	// when constructing the outbound HTTP request, recovering the original query
-	// string for the upstream service.
-	rawPath := webhookURL.Path
-	decodedPath := webhookURL.Path
+	// them into the path. Shoutrrr's generic service uses the path to build the
+	// HTTP request URL, while its own query params are config-only.
+	path := webhookURL.Path
 	if webhookURL.RawQuery != "" {
-		rawPath = webhookURL.Path + "%3F" + webhookURL.RawQuery
-		decodedPath = webhookURL.Path + "?" + webhookURL.RawQuery
+		path = path + "?" + webhookURL.RawQuery
 	}
 	shoutrrrURL := &url.URL{
 		Scheme:  scheme,
 		Host:    webhookURL.Host,
-		RawPath: rawPath,
-		Path:    decodedPath,
+		RawPath: path,
+		Path:    path,
 	}
 
 	// Build query parameters
