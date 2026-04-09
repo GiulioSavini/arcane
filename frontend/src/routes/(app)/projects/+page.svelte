@@ -41,18 +41,27 @@
 	const checkUpdatesMutation = createMutation(() => ({
 		mutationKey: ['projects', 'check-updates', envId],
 		mutationFn: async () => {
-			const projectList = projects?.data ?? [];
-			for (const proj of projectList) {
-				await projectService.pullProjectImages(proj.id);
-				await projectService.deployProject(proj.id, { pullPolicy: 'always' });
+			const allProjects = await projectService.getProjectsForEnvironment(envId, { limit: 1000 });
+			const results = await Promise.allSettled(
+				allProjects.data.map(async (proj) => {
+					await projectService.pullProjectImages(proj.id);
+					await projectService.deployProject(proj.id, { pullPolicy: 'always' });
+					return proj.name;
+				})
+			);
+			const failed = results.filter((r): r is PromiseRejectedResult => r.status === 'rejected');
+			if (failed.length > 0) {
+				const succeeded = results.length - failed.length;
+				throw new Error(`${failed.length} project(s) failed to update (${succeeded} succeeded)`);
 			}
 		},
 		onSuccess: async () => {
 			toast.success(m.compose_update_success());
 			await projectsQuery.refetch();
 		},
-		onError: () => {
-			toast.error(m.containers_check_updates_failed());
+		onError: (error) => {
+			toast.error(error instanceof Error ? error.message : m.containers_check_updates_failed());
+			projectsQuery.refetch();
 		}
 	}));
 
