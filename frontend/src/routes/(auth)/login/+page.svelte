@@ -11,7 +11,6 @@
 	import { authService } from '$lib/services/auth-service';
 	import { queryKeys } from '$lib/query/query-keys';
 	import { getApplicationLogo } from '$lib/utils/image.util';
-	import { Motion } from 'svelte-motion';
 	import { ArcaneButton } from '$lib/components/arcane-button/index.js';
 	import { onMount } from 'svelte';
 	import { createMutation, useQueryClient } from '@tanstack/svelte-query';
@@ -93,58 +92,75 @@
 	}
 
 	const showDivider = $derived(showOidcLoginButton && showLocalLoginForm);
-
-	function getOrbAnimation(startX: number, startY: number, duration: number, delay: number) {
-		const xOffset = startX * 4;
-		const yOffset = startY * 4;
-
-		return {
-			animate: {
-				x: [-20 + xOffset, 60 + xOffset, 20 + xOffset, -80 + xOffset, -20 + xOffset],
-				y: [-20 + yOffset, -80 + yOffset, 20 + yOffset, 60 + yOffset, -20 + yOffset],
-				scale: [1, 1.15, 0.95, 1.1, 1]
-			},
-			transition: {
-				duration: duration,
-				ease: 'easeInOut',
-				repeat: Infinity,
-				delay: delay
-			}
-		};
-	}
-
-	const orb1Anim = getOrbAnimation(-20, 30, 18, 0.5);
-	const orb2Anim = getOrbAnimation(35, -10, 22, 1.2);
-	const orb3Anim = getOrbAnimation(-15, -30, 20, 0.8);
-	const orb4Anim = getOrbAnimation(25, 15, 16, 1.8);
 </script>
 
-<div class="fixed inset-0 overflow-hidden">
-	<Motion animate={orb1Anim.animate} transition={orb1Anim.transition} let:motion>
-		<div
-			use:motion
-			class="bg-primary absolute top-[-150px] left-[10%] h-[330px] w-[330px] rounded-full opacity-30 blur-[57px] md:h-[500px] md:w-[500px] md:blur-[85px]"
-		></div>
-	</Motion>
-	<Motion animate={orb2Anim.animate} transition={orb2Anim.transition} let:motion>
-		<div
-			use:motion
-			class="bg-primary absolute right-[15%] bottom-[-150px] h-[280px] w-[280px] rounded-full opacity-30 blur-[57px] md:h-[420px] md:w-[420px] md:blur-[85px]"
-		></div>
-	</Motion>
-	<Motion animate={orb3Anim.animate} transition={orb3Anim.transition} let:motion>
-		<div
-			use:motion
-			class="bg-primary absolute top-[20%] right-[-120px] h-[250px] w-[250px] rounded-full opacity-30 blur-[57px] md:h-[380px] md:w-[380px] md:blur-[85px]"
-		></div>
-	</Motion>
-	<Motion animate={orb4Anim.animate} transition={orb4Anim.transition} let:motion>
-		<div
-			use:motion
-			class="bg-primary absolute bottom-[30%] left-[-100px] h-[210px] w-[210px] rounded-full opacity-30 blur-[57px] md:h-[320px] md:w-[320px] md:blur-[85px]"
-		></div>
-	</Motion>
+<!--
+	Background orbs use pure CSS keyframe animations so browsers can run them
+	on the compositor thread and cache the expensive blur filter between
+	frames. Firefox re-rasterises heavily-blurred elements on every transform
+	tick when the animation is JS-driven (see svelte-motion), which produced
+	a visible flicker on the login screen (#2297).
+-->
+<div class="orb-stage fixed inset-0 overflow-hidden">
+	<div class="orb orb-1 bg-primary absolute top-[-150px] left-[10%] h-[330px] w-[330px] rounded-full opacity-30 blur-[57px] md:h-[500px] md:w-[500px] md:blur-[85px]"></div>
+	<div class="orb orb-2 bg-primary absolute right-[15%] bottom-[-150px] h-[280px] w-[280px] rounded-full opacity-30 blur-[57px] md:h-[420px] md:w-[420px] md:blur-[85px]"></div>
+	<div class="orb orb-3 bg-primary absolute top-[20%] right-[-120px] h-[250px] w-[250px] rounded-full opacity-30 blur-[57px] md:h-[380px] md:w-[380px] md:blur-[85px]"></div>
+	<div class="orb orb-4 bg-primary absolute bottom-[30%] left-[-100px] h-[210px] w-[210px] rounded-full opacity-30 blur-[57px] md:h-[320px] md:w-[320px] md:blur-[85px]"></div>
 </div>
+
+<style>
+	.orb {
+		/* Hint the compositor to keep each orb on its own layer so the blur
+		   filter is rasterised once and reused across animation frames. */
+		will-change: transform;
+		backface-visibility: hidden;
+		-webkit-backface-visibility: hidden;
+		transform: translate3d(0, 0, 0);
+	}
+
+	.orb-1 {
+		--orb-x: -80px;
+		--orb-y: 120px;
+		animation: orb-float 18s ease-in-out 0.5s infinite;
+	}
+	.orb-2 {
+		--orb-x: 140px;
+		--orb-y: -40px;
+		animation: orb-float 22s ease-in-out 1.2s infinite;
+	}
+	.orb-3 {
+		--orb-x: -60px;
+		--orb-y: -120px;
+		animation: orb-float 20s ease-in-out 0.8s infinite;
+	}
+	.orb-4 {
+		--orb-x: 100px;
+		--orb-y: 60px;
+		animation: orb-float 16s ease-in-out 1.8s infinite;
+	}
+
+	@keyframes orb-float {
+		0%,
+		100% {
+			transform: translate3d(calc(var(--orb-x) - 20px), calc(var(--orb-y) - 20px), 0) scale(1);
+		}
+		25% {
+			transform: translate3d(calc(var(--orb-x) + 60px), calc(var(--orb-y) - 80px), 0) scale(1.15);
+		}
+		50% {
+			transform: translate3d(calc(var(--orb-x) + 20px), calc(var(--orb-y) + 20px), 0) scale(0.95);
+		}
+		75% {
+			transform: translate3d(calc(var(--orb-x) - 80px), calc(var(--orb-y) + 60px), 0) scale(1.1);
+		}
+	}
+
+	@media (prefers-reduced-motion: reduce) {
+		.orb {
+			animation: none;
+		}
+	}
+</style>
 
 <div class="relative flex min-h-dvh flex-col items-center p-6 md:p-10">
 	<div class="flex w-full flex-1 flex-col items-center justify-center">
