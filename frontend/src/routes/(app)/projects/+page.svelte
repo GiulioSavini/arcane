@@ -5,6 +5,7 @@
 	import { goto } from '$app/navigation';
 	import { m } from '$lib/paraglide/messages';
 	import { projectService } from '$lib/services/project-service';
+	import { imageService } from '$lib/services/image-service';
 	import { environmentStore } from '$lib/stores/environment.store.svelte';
 	import { queryKeys } from '$lib/query/query-keys';
 	import type { ProjectStatusCounts } from '$lib/types/project.type';
@@ -41,10 +42,34 @@
 	const checkUpdatesMutation = createMutation(() => ({
 		mutationKey: ['projects', 'check-updates', envId],
 		mutationFn: async () => {
-			const allProjects = await projectService.getProjectsForEnvironment(envId, { limit: 1000 });
+			// Refresh update info for all images, then use the image->project usage
+			// map to narrow the redeploy to projects that actually have updates.
+			// This avoids hitting every project (and its registry) when nothing has
+			// changed, which is especially expensive on instances with many projects.
+			await imageService.checkAllImages();
+
+			const images = await imageService.getImagesForEnvironment(envId, { pagination: { page: 1, limit: 10000 } });
+			const projectIdsWithUpdates = new Set<string>();
+			for (const img of images.data) {
+				if (!img.updateInfo?.hasUpdate) continue;
+				for (const user of img.usedBy ?? []) {
+					if (user.type === 'project' && user.id) {
+						projectIdsWithUpdates.add(user.id);
+					}
+				}
+			}
+
+			if (projectIdsWithUpdates.size === 0) {
+				return { updated: 0 };
+			}
+
+			const allProjects = await projectService.getProjectsForEnvironment(envId, { pagination: { page: 1, limit: 1000 } });
+			const projectsToUpdate = allProjects.data.filter((p) => projectIdsWithUpdates.has(p.id));
+
 			const results = await Promise.allSettled(
-				allProjects.data.map(async (proj) => {
-					await projectService.pullProjectImages(proj.id);
+				projectsToUpdate.map(async (proj) => {
+					// deployProject with pullPolicy 'always' already pulls fresh images,
+					// so no separate pullProjectImages call is needed.
 					await projectService.deployProject(proj.id, { pullPolicy: 'always' });
 					return proj.name;
 				})
@@ -54,9 +79,15 @@
 				const succeeded = results.length - failed.length;
 				throw new Error(`${failed.length} project(s) failed to update (${succeeded} succeeded)`);
 			}
+
+			return { updated: results.length };
 		},
-		onSuccess: async () => {
-			toast.success(m.compose_update_success());
+		onSuccess: async (result) => {
+			if (result && result.updated === 0) {
+				toast.success(m.image_update_up_to_date_title());
+			} else {
+				toast.success(m.compose_update_success());
+			}
 			await projectsQuery.refetch();
 		},
 		onError: (error) => {
