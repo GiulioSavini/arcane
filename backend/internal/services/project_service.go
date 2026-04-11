@@ -1894,7 +1894,7 @@ func (s *ProjectService) prepareServiceBuildRequest(
 	// therefore stay as a container path; translating it to the host path
 	// (which is what bind mount sources need) makes `os.Stat` fail because
 	// the host path doesn't exist inside the Arcane container. See #2314.
-	_ = pathMapper
+	// pathMapper is intentionally not consumed here for that reason.
 	contextDir, err := resolveBuildContextInternal(project.WorkingDir, updatedSvc, serviceName)
 	if err != nil {
 		return imagetypes.BuildRequest{}, updatedSvc, updated, err
