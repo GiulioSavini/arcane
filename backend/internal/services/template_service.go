@@ -554,11 +554,12 @@ func (s *TemplateService) loadRemoteTemplates(ctx context.Context) ([]models.Com
 				return nil // Don't fail the whole group if one registry fails
 			}
 
-			mu.Lock()
-			defer mu.Unlock()
 			s.registryMu.Lock()
 			delete(s.registryErrors, reg.ID)
 			s.registryMu.Unlock()
+
+			mu.Lock()
+			defer mu.Unlock()
 			for _, template := range remoteTemplates {
 				template.Registry = cloneRegistry(&reg)
 				template.RegistryID = stringPtr(reg.ID)
