@@ -15,38 +15,52 @@ import (
 	shoutrrrTypes "github.com/nicholas-fedor/shoutrrr/pkg/types"
 )
 
-// BuildGenericURL converts GenericConfig to Shoutrrr URL format for generic webhooks
-func BuildGenericURL(config models.GenericConfig) (string, error) {
+// resolveWebhookURLInternal parses and normalises the configured webhook URL,
+// adding a default scheme when the user omitted one. It is the single source
+// of truth for scheme normalisation and host validation used by both
+// BuildGenericURL and sendGenericDirectInternal.
+func resolveWebhookURLInternal(config models.GenericConfig) (*url.URL, error) {
 	if config.WebhookURL == "" {
-		return "", fmt.Errorf("webhook URL is empty")
+		return nil, fmt.Errorf("webhook URL is empty")
 	}
 
-	// Parse the webhook URL
-	webhookURL, err := url.Parse(config.WebhookURL)
+	parsed, err := url.Parse(config.WebhookURL)
 	if err != nil {
-		return "", fmt.Errorf("invalid webhook URL: %w", err)
+		return nil, fmt.Errorf("invalid webhook URL: %w", err)
 	}
 
 	hasScheme := strings.Contains(config.WebhookURL, "://")
-	if webhookURL.Host == "" && !hasScheme {
-		fallbackScheme := "https"
+	if parsed.Host == "" && !hasScheme {
+		scheme := "https"
 		if config.DisableTLS {
-			fallbackScheme = "http"
+			scheme = "http"
 		}
 		normalized := strings.TrimPrefix(config.WebhookURL, "//")
-		webhookURL, err = url.Parse(fmt.Sprintf("%s://%s", fallbackScheme, normalized))
+		parsed, err = url.Parse(fmt.Sprintf("%s://%s", scheme, normalized))
 		if err != nil {
-			return "", fmt.Errorf("invalid webhook URL: %w", err)
+			return nil, fmt.Errorf("invalid webhook URL: %w", err)
 		}
 	}
 
-	if webhookURL.Host == "" {
-		return "", fmt.Errorf("invalid webhook URL: missing host")
+	if parsed.Host == "" {
+		return nil, fmt.Errorf("invalid webhook URL: missing host")
 	}
 
-	// Build generic service URL
-	// Format: generic://host[:port]/path?params
-	// Shoutrrr's generic service uses HTTP or HTTPS based on the DisableTLS setting.
+	switch strings.ToLower(parsed.Scheme) {
+	case "http", "https":
+	default:
+		return nil, fmt.Errorf("invalid webhook URL scheme: %s", parsed.Scheme)
+	}
+
+	return parsed, nil
+}
+
+// BuildGenericURL converts GenericConfig to Shoutrrr URL format for generic webhooks
+func BuildGenericURL(config models.GenericConfig) (string, error) {
+	webhookURL, err := resolveWebhookURLInternal(config)
+	if err != nil {
+		return "", err
+	}
 
 	// Start from the user's existing query parameters. Shoutrrr's generic
 	// service preserves any query keys it does not recognise, so provider
@@ -82,16 +96,12 @@ func BuildGenericURL(config models.GenericConfig) (string, error) {
 	setDefault("messagekey", config.MessageKey)
 
 	// Determine TLS setting from the webhook URL scheme (http/https) when the
-	// user has not already passed `disabletls` explicitly. If the scheme is
-	// missing here we treat it as a hard error because Shoutrrr needs an
-	// explicit transport.
+	// user has not already passed `disabletls` explicitly.
 	switch strings.ToLower(webhookURL.Scheme) {
 	case "http":
 		setDefault("disabletls", "yes")
 	case "https":
 		setDefault("disabletls", "no")
-	default:
-		return "", fmt.Errorf("invalid webhook URL scheme: %s", webhookURL.Scheme)
 	}
 
 	// Add custom headers as query parameters with @ prefix
@@ -126,7 +136,7 @@ func SendGenericWithTitle(ctx context.Context, config models.GenericConfig, titl
 	// shoutrrr, which preserves the existing behaviour for everyone who does
 	// not set SuccessBodyContains.
 	if config.SuccessBodyContains != "" {
-		return sendGenericDirect(ctx, config, title, message)
+		return sendGenericDirectInternal(ctx, config, title, message)
 	}
 
 	shoutrrrURL, err := BuildGenericURL(config)
@@ -155,11 +165,11 @@ func SendGenericWithTitle(ctx context.Context, config models.GenericConfig, titl
 	return nil
 }
 
-// sendGenericDirect makes the webhook HTTP call directly, giving access to the
-// response body so that provider-level success/failure can be detected even
-// when the HTTP status is always 200.
-func sendGenericDirect(ctx context.Context, config models.GenericConfig, title, message string) error {
-	webhookURL, err := resolveWebhookURL(config)
+// sendGenericDirectInternal makes the webhook HTTP call directly, giving access
+// to the response body so that provider-level success/failure can be detected
+// even when the HTTP status is always 200.
+func sendGenericDirectInternal(ctx context.Context, config models.GenericConfig, title, message string) error {
+	webhookURL, err := resolveWebhookURLInternal(config)
 	if err != nil {
 		return err
 	}
@@ -219,43 +229,9 @@ func sendGenericDirect(ctx context.Context, config models.GenericConfig, title, 
 		return fmt.Errorf("webhook returned HTTP %d: %s", resp.StatusCode, string(respBody))
 	}
 
-	if config.SuccessBodyContains != "" && !strings.Contains(string(respBody), config.SuccessBodyContains) {
+	if !strings.Contains(string(respBody), config.SuccessBodyContains) {
 		return fmt.Errorf("webhook response did not contain expected success indicator %q: %s", config.SuccessBodyContains, string(respBody))
 	}
 
 	return nil
-}
-
-// resolveWebhookURL parses and normalises the configured webhook URL,
-// adding a default scheme when the user omitted one.
-func resolveWebhookURL(config models.GenericConfig) (*url.URL, error) {
-	parsed, err := url.Parse(config.WebhookURL)
-	if err != nil {
-		return nil, fmt.Errorf("invalid webhook URL: %w", err)
-	}
-
-	hasScheme := strings.Contains(config.WebhookURL, "://")
-	if parsed.Host == "" && !hasScheme {
-		scheme := "https"
-		if config.DisableTLS {
-			scheme = "http"
-		}
-		normalized := strings.TrimPrefix(config.WebhookURL, "//")
-		parsed, err = url.Parse(fmt.Sprintf("%s://%s", scheme, normalized))
-		if err != nil {
-			return nil, fmt.Errorf("invalid webhook URL: %w", err)
-		}
-	}
-
-	if parsed.Host == "" {
-		return nil, fmt.Errorf("invalid webhook URL: missing host")
-	}
-
-	switch strings.ToLower(parsed.Scheme) {
-	case "http", "https":
-	default:
-		return nil, fmt.Errorf("invalid webhook URL scheme: %s", parsed.Scheme)
-	}
-
-	return parsed, nil
 }
