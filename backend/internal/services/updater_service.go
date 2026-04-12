@@ -625,7 +625,7 @@ func (s *UpdaterService) UpdateSingleContainer(ctx context.Context, containerID 
 			out.Duration = time.Since(start).String()
 
 			if s.notificationService != nil {
-				if notifErr := s.notificationService.SendContainerUpdateNotification(ctx, containerName, normalizedRef, inspectBefore.Image, s.normalizeRef(normalizedRef)); notifErr != nil {
+				if notifErr := s.notificationService.SendContainerUpdateNotification(ctx, containerName, imageRef, inspectBefore.Image, normalizedRef); notifErr != nil {
 					slog.WarnContext(ctx, "Failed to send container update notification", "containerID", containerID, "containerName", containerName, "imageRef", normalizedRef, "error", notifErr.Error())
 				}
 			}
@@ -659,7 +659,7 @@ func (s *UpdaterService) UpdateSingleContainer(ctx context.Context, containerID 
 		out.Updated++
 
 		if s.notificationService != nil {
-			if notifErr := s.notificationService.SendContainerUpdateNotification(ctx, containerName, normalizedRef, inspectBefore.Image, s.normalizeRef(normalizedRef)); notifErr != nil {
+			if notifErr := s.notificationService.SendContainerUpdateNotification(ctx, containerName, imageRef, inspectBefore.Image, normalizedRef); notifErr != nil {
 				slog.WarnContext(ctx, "Failed to send container update notification", "containerID", containerID, "containerName", containerName, "imageRef", normalizedRef, "error", notifErr.Error())
 			}
 		}
