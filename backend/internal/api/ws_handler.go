@@ -1636,7 +1636,21 @@ func (h *WebSocketHandler) detectGPUs(ctx context.Context) error {
 				slog.InfoContext(ctx, "Using configured GPU type", "type", "intel")
 				return nil
 			}
-			return fmt.Errorf("intel_gpu_top not found but GPU_TYPE set to intel")
+			// intel_gpu_top not in PATH — fall back to sysfs vendor detection so that
+			// the GPU still shows up in the dashboard (e.g. on ARM builds or when the
+			// package isn't installed).
+			if hasIntelGPUInternal() {
+				h.gpuDetectionCache.Lock()
+				h.gpuDetectionCache.detected = true
+				h.gpuDetectionCache.gpuType = "intel"
+				h.gpuDetectionCache.toolPath = ""
+				h.gpuDetectionCache.timestamp = time.Now()
+				h.gpuDetectionCache.Unlock()
+				h.detectionDone = true
+				slog.InfoContext(ctx, "Using configured GPU type via sysfs (intel_gpu_top not found)", "type", "intel")
+				return nil
+			}
+			return fmt.Errorf("intel_gpu_top not found and no Intel GPU detected in sysfs, but GPU_TYPE set to intel")
 
 		default:
 			slog.WarnContext(ctx, "Invalid GPU_TYPE specified, falling back to auto-detection", "gpu_type", h.gpuType)
@@ -1676,6 +1690,20 @@ func (h *WebSocketHandler) detectGPUs(ctx context.Context) error {
 		h.gpuDetectionCache.Unlock()
 		h.detectionDone = true
 		slog.InfoContext(ctx, "Intel GPU detected", "tool", "intel_gpu_top", "path", path)
+		return nil
+	}
+
+	// Last resort: detect Intel GPU via sysfs vendor ID so it shows up even when
+	// intel_gpu_top is absent (e.g. ARM builds, minimal containers).
+	if hasIntelGPUInternal() {
+		h.gpuDetectionCache.Lock()
+		h.gpuDetectionCache.detected = true
+		h.gpuDetectionCache.gpuType = "intel"
+		h.gpuDetectionCache.toolPath = ""
+		h.gpuDetectionCache.timestamp = time.Now()
+		h.gpuDetectionCache.Unlock()
+		h.detectionDone = true
+		slog.InfoContext(ctx, "Intel GPU detected", "method", "sysfs")
 		return nil
 	}
 
@@ -1844,17 +1872,157 @@ func hasAMDGPUInternal() bool {
 	return false
 }
 
-// getIntelStats collects Intel GPU statistics using intel_gpu_top
+// intelGPUTopOutput is the subset of intel_gpu_top JSON we care about.
+// The memory block is only present on discrete GPUs (Intel Arc and later).
+type intelGPUTopOutput struct {
+	Memory *struct {
+		Unit  string `json:"unit"`
+		Local *struct {
+			Total float64 `json:"total"`
+			Free  float64 `json:"free"`
+		} `json:"local"`
+	} `json:"memory"`
+}
+
+// findIntelDRICards returns the /dev/dri/cardN paths for cards whose PCI vendor
+// is Intel (0x8086), as reported by the DRM sysfs.  This handles Proxmox and
+// similar setups where card0 is a VirtIO display adapter and the real GPU is
+// card1 (or higher).
+func findIntelDRICards() []string {
+	entries, err := os.ReadDir(amdGPUSysfsPath)
+	if err != nil {
+		return nil
+	}
+	var cards []string
+	for _, entry := range entries {
+		name := entry.Name()
+		if !strings.HasPrefix(name, "card") || strings.Contains(name, "-") {
+			continue
+		}
+		vendorPath := fmt.Sprintf("%s/%s/device/vendor", amdGPUSysfsPath, name)
+		data, err := os.ReadFile(vendorPath)
+		if err != nil {
+			continue
+		}
+		if strings.TrimSpace(string(data)) == "0x8086" {
+			cards = append(cards, fmt.Sprintf("/dev/dri/%s", name))
+		}
+	}
+	return cards
+}
+
+// hasIntelGPUInternal reports whether at least one Intel GPU is present via DRM sysfs.
+func hasIntelGPUInternal() bool {
+	return len(findIntelDRICards()) > 0
+}
+
+// getIntelStats collects Intel GPU statistics.
+//
+// For each Intel DRI card it runs `intel_gpu_top -d drm:<path>` to get per-GPU
+// stats.  This correctly handles multi-card hosts (e.g. Proxmox with a VirtIO
+// display adapter on card0 and an Arc GPU on card1) by targeting only cards
+// with vendor ID 0x8086 rather than relying on the tool's default device.
+//
+// When intel_gpu_top is not available (ARM builds, minimal containers) the
+// function falls back to sysfs-only enumeration so the GPU still appears in
+// the dashboard, albeit without memory statistics.
 func (h *WebSocketHandler) getIntelStats(ctx context.Context) ([]systemtypes.GPUStats, error) {
-	stats := []systemtypes.GPUStats{
-		{
-			Name:        "Intel GPU",
-			Index:       0,
-			MemoryUsed:  0,
-			MemoryTotal: 0,
-		},
+	h.gpuDetectionCache.RLock()
+	toolPath := h.gpuDetectionCache.toolPath
+	h.gpuDetectionCache.RUnlock()
+
+	intelCards := findIntelDRICards()
+	if len(intelCards) == 0 {
+		return nil, fmt.Errorf("no Intel GPU found in sysfs")
 	}
 
-	slog.DebugContext(ctx, "Intel GPU detected but detailed stats not yet implemented")
+	var stats []systemtypes.GPUStats
+	for i, cardPath := range intelCards {
+		gpuName := h.intelGPUName(cardPath)
+		entry := systemtypes.GPUStats{
+			Name:  gpuName,
+			Index: i,
+		}
+
+		if toolPath != "" {
+			if mem, err := h.intelGPUTopMemory(ctx, toolPath, cardPath); err == nil {
+				entry.MemoryUsed = mem.used
+				entry.MemoryTotal = mem.total
+			} else {
+				slog.DebugContext(ctx, "intel_gpu_top memory query failed", "card", cardPath, "error", err)
+			}
+		}
+
+		stats = append(stats, entry)
+	}
+
+	slog.DebugContext(ctx, "Collected Intel GPU stats", "gpu_count", len(stats))
 	return stats, nil
+}
+
+type intelMemStats struct{ used, total float64 }
+
+// intelGPUTopMemory runs intel_gpu_top for a single card and returns memory stats.
+func (h *WebSocketHandler) intelGPUTopMemory(ctx context.Context, toolPath, cardPath string) (intelMemStats, error) {
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+
+	// -d selects the specific DRI device, -J outputs JSON, -s sets the sample
+	// interval in milliseconds, -c 1 exits after one sample.
+	cmd := exec.CommandContext(ctx, toolPath,
+		"-d", fmt.Sprintf("drm:%s", cardPath),
+		"-J", "-s", "100", "-c", "1")
+	out, err := cmd.Output()
+	if err != nil {
+		return intelMemStats{}, fmt.Errorf("intel_gpu_top: %w", err)
+	}
+
+	var result intelGPUTopOutput
+	// intel_gpu_top may wrap the single record in an array or emit it bare.
+	data := bytes.TrimSpace(out)
+	if len(data) > 0 && data[0] == '[' {
+		var arr []intelGPUTopOutput
+		if err := json.Unmarshal(data, &arr); err != nil || len(arr) == 0 {
+			return intelMemStats{}, fmt.Errorf("parse intel_gpu_top array: %w", err)
+		}
+		result = arr[0]
+	} else {
+		if err := json.Unmarshal(data, &result); err != nil {
+			return intelMemStats{}, fmt.Errorf("parse intel_gpu_top object: %w", err)
+		}
+	}
+
+	if result.Memory == nil || result.Memory.Local == nil {
+		// Integrated GPU or older tool version — no discrete memory info.
+		return intelMemStats{}, fmt.Errorf("no local memory info in intel_gpu_top output")
+	}
+
+	unit := strings.ToLower(strings.TrimSpace(result.Memory.Unit))
+	var scale float64
+	switch unit {
+	case "mib":
+		scale = 1024 * 1024
+	case "gib":
+		scale = 1024 * 1024 * 1024
+	default:
+		scale = 1 // assume bytes
+	}
+
+	total := result.Memory.Local.Total * scale
+	used := (result.Memory.Local.Total - result.Memory.Local.Free) * scale
+	return intelMemStats{used: used, total: total}, nil
+}
+
+// intelGPUName returns a human-readable label for an Intel DRI card.
+// It prefers the DRM card's "label" sysfs attribute, then falls back to the
+// card device name (e.g. "Intel GPU (card1)").
+func (h *WebSocketHandler) intelGPUName(cardPath string) string {
+	cardName := strings.TrimPrefix(cardPath, "/dev/dri/")
+	labelPath := fmt.Sprintf("%s/%s/device/label", amdGPUSysfsPath, cardName)
+	if data, err := os.ReadFile(labelPath); err == nil {
+		if label := strings.TrimSpace(string(data)); label != "" {
+			return label
+		}
+	}
+	return fmt.Sprintf("Intel GPU (%s)", cardName)
 }
