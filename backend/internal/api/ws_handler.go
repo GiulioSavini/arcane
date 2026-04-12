@@ -1888,7 +1888,7 @@ type intelGPUTopOutput struct {
 // is Intel (0x8086), as reported by the DRM sysfs.  This handles Proxmox and
 // similar setups where card0 is a VirtIO display adapter and the real GPU is
 // card1 (or higher).
-func findIntelDRICards() []string {
+func findIntelDRICardsInternal() []string {
 	entries, err := os.ReadDir(amdGPUSysfsPath)
 	if err != nil {
 		return nil
@@ -1913,7 +1913,7 @@ func findIntelDRICards() []string {
 
 // hasIntelGPUInternal reports whether at least one Intel GPU is present via DRM sysfs.
 func hasIntelGPUInternal() bool {
-	return len(findIntelDRICards()) > 0
+	return len(findIntelDRICardsInternal()) > 0
 }
 
 // getIntelStats collects Intel GPU statistics.
@@ -1931,7 +1931,7 @@ func (h *WebSocketHandler) getIntelStats(ctx context.Context) ([]systemtypes.GPU
 	toolPath := h.gpuDetectionCache.toolPath
 	h.gpuDetectionCache.RUnlock()
 
-	intelCards := findIntelDRICards()
+	intelCards := findIntelDRICardsInternal()
 	if len(intelCards) == 0 {
 		return nil, fmt.Errorf("no Intel GPU found in sysfs")
 	}
@@ -1982,8 +1982,11 @@ func (h *WebSocketHandler) intelGPUTopMemory(ctx context.Context, toolPath, card
 	data := bytes.TrimSpace(out)
 	if len(data) > 0 && data[0] == '[' {
 		var arr []intelGPUTopOutput
-		if err := json.Unmarshal(data, &arr); err != nil || len(arr) == 0 {
+		if err := json.Unmarshal(data, &arr); err != nil {
 			return intelMemStats{}, fmt.Errorf("parse intel_gpu_top array: %w", err)
+		}
+		if len(arr) == 0 {
+			return intelMemStats{}, fmt.Errorf("parse intel_gpu_top array: empty output")
 		}
 		result = arr[0]
 	} else {
@@ -2005,6 +2008,7 @@ func (h *WebSocketHandler) intelGPUTopMemory(ctx context.Context, toolPath, card
 	case "gib":
 		scale = 1024 * 1024 * 1024
 	default:
+		slog.WarnContext(ctx, "Unknown intel_gpu_top memory unit, treating as bytes", "unit", unit)
 		scale = 1 // assume bytes
 	}
 
