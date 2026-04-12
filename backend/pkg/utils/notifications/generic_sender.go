@@ -1,8 +1,12 @@
 package notifications
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"net/url"
 	"strings"
 
@@ -108,10 +112,21 @@ func BuildGenericURL(config models.GenericConfig) (string, error) {
 	return shoutrrrURL.String(), nil
 }
 
-// SendGenericWithTitle sends a message with title via Shoutrrr Generic webhook
+// SendGenericWithTitle sends a message with title via Shoutrrr Generic webhook.
+// When config.SuccessBodyContains is set the response body is also inspected —
+// this is necessary for providers (e.g. PushPlus) that always return HTTP 200
+// but embed a success/failure indicator inside the JSON body.
 func SendGenericWithTitle(ctx context.Context, config models.GenericConfig, title, message string) error {
 	if config.WebhookURL == "" {
 		return fmt.Errorf("webhook URL is empty")
+	}
+
+	// When the caller needs response-body validation we make the HTTP request
+	// ourselves so that we can inspect the body.  Otherwise we delegate to
+	// shoutrrr, which preserves the existing behaviour for everyone who does
+	// not set SuccessBodyContains.
+	if config.SuccessBodyContains != "" {
+		return sendGenericDirect(ctx, config, title, message)
 	}
 
 	shoutrrrURL, err := BuildGenericURL(config)
@@ -138,4 +153,109 @@ func SendGenericWithTitle(ctx context.Context, config models.GenericConfig, titl
 		}
 	}
 	return nil
+}
+
+// sendGenericDirect makes the webhook HTTP call directly, giving access to the
+// response body so that provider-level success/failure can be detected even
+// when the HTTP status is always 200.
+func sendGenericDirect(ctx context.Context, config models.GenericConfig, title, message string) error {
+	webhookURL, err := resolveWebhookURL(config)
+	if err != nil {
+		return err
+	}
+
+	// Build JSON payload using the configured message/title keys.
+	msgKey := config.MessageKey
+	if msgKey == "" {
+		msgKey = "message"
+	}
+	titleKey := config.TitleKey
+	if titleKey == "" {
+		titleKey = "title"
+	}
+
+	payload := map[string]string{msgKey: message}
+	if title != "" {
+		payload[titleKey] = title
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("failed to marshal webhook payload: %w", err)
+	}
+
+	method := strings.ToUpper(config.Method)
+	if method == "" {
+		method = http.MethodPost
+	}
+
+	req, err := http.NewRequestWithContext(ctx, method, webhookURL.String(), bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("failed to create webhook request: %w", err)
+	}
+
+	contentType := config.ContentType
+	if contentType == "" {
+		contentType = "application/json"
+	}
+	req.Header.Set("Content-Type", contentType)
+
+	for k, v := range config.CustomHeaders {
+		req.Header.Set(k, v)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to send webhook request: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read webhook response body: %w", err)
+	}
+
+	if resp.StatusCode >= http.StatusBadRequest {
+		return fmt.Errorf("webhook returned HTTP %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	if config.SuccessBodyContains != "" && !strings.Contains(string(respBody), config.SuccessBodyContains) {
+		return fmt.Errorf("webhook response did not contain expected success indicator %q: %s", config.SuccessBodyContains, string(respBody))
+	}
+
+	return nil
+}
+
+// resolveWebhookURL parses and normalises the configured webhook URL,
+// adding a default scheme when the user omitted one.
+func resolveWebhookURL(config models.GenericConfig) (*url.URL, error) {
+	parsed, err := url.Parse(config.WebhookURL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid webhook URL: %w", err)
+	}
+
+	hasScheme := strings.Contains(config.WebhookURL, "://")
+	if parsed.Host == "" && !hasScheme {
+		scheme := "https"
+		if config.DisableTLS {
+			scheme = "http"
+		}
+		normalized := strings.TrimPrefix(config.WebhookURL, "//")
+		parsed, err = url.Parse(fmt.Sprintf("%s://%s", scheme, normalized))
+		if err != nil {
+			return nil, fmt.Errorf("invalid webhook URL: %w", err)
+		}
+	}
+
+	if parsed.Host == "" {
+		return nil, fmt.Errorf("invalid webhook URL: missing host")
+	}
+
+	switch strings.ToLower(parsed.Scheme) {
+	case "http", "https":
+	default:
+		return nil, fmt.Errorf("invalid webhook URL scheme: %s", parsed.Scheme)
+	}
+
+	return parsed, nil
 }
