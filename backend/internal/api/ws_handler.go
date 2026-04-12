@@ -1969,7 +1969,7 @@ func (h *WebSocketHandler) intelGPUTopMemory(ctx context.Context, toolPath, card
 
 	// -d selects the specific DRI device, -J outputs JSON, -s sets the sample
 	// interval in milliseconds, -c 1 exits after one sample.
-	cmd := exec.CommandContext(ctx, toolPath,
+	cmd := exec.CommandContext(ctx, toolPath, //nolint:gosec // toolPath is from exec.LookPath, cardPath from sysfs vendor check
 		"-d", fmt.Sprintf("drm:%s", cardPath),
 		"-J", "-s", "100", "-c", "1")
 	out, err := cmd.Output()
