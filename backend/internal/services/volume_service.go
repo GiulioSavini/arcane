@@ -263,14 +263,15 @@ func buildVolumePruneMetadataInternal(all bool, volumesDeleted int, spaceReclaim
 // --- Volume Browsing & Backup ---
 
 // isBrowsableVolumeInternal returns an error if the volume uses driver options
-// (e.g. type=none) that prevent it from being mounted inside a helper container.
+// that prevent it from being mounted inside a helper container, such as
+// type=none or o=bind (host bind-mounts that require a device path on the host).
 func (s *VolumeService) isBrowsableVolumeInternal(ctx context.Context, volumeName string) error {
 	vol, err := s.GetVolumeByName(ctx, volumeName)
 	if err != nil {
 		return fmt.Errorf("failed to inspect volume: %w", err)
 	}
-	if vol.Options["type"] == "none" {
-		return fmt.Errorf("volume %q uses a custom mount type (type=none) and cannot be browsed", volumeName)
+	if vol.Options["type"] == "none" || strings.Contains(vol.Options["o"], "bind") {
+		return fmt.Errorf("volume %q uses a custom mount configuration and cannot be browsed", volumeName)
 	}
 	return nil
 }
