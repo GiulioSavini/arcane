@@ -389,6 +389,8 @@
 	"containers_mount_label_host": "Host:",
 	"containers_mount_label_source": "Origem:",
 	"containers_no_mounts_configured": "Sem volumes ou montagens configuradas",
+	"containers_inspect_title": "Raw Inspect",
+	"containers_inspect_description": "Full JSON output of docker container inspect",
 	"container": "Contêiner",
 	"container_name_required": "Nome do contêiner é obrigatório",
 	"container_image_required": "Requer imagem",

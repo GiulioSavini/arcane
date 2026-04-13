@@ -23,6 +23,7 @@
 	import ContainerLogsPanel from '../components/ContainerLogsPanel.svelte';
 	import ContainerShell from '../components/ContainerShell.svelte';
 	import ContainerComposePanel from '../components/ContainerComposePanel.svelte';
+	import ContainerInspect from '../components/ContainerInspect.svelte';
 	import ContainerDetailStatsSync from '../components/container-detail-stats-sync.svelte';
 	import IconImage from '$lib/components/icon-image.svelte';
 	import { getArcaneIconUrlFromLabels } from '$lib/utils/arcane-labels';
@@ -211,7 +212,8 @@
 		...(showConfiguration ? [{ value: 'config', label: m.common_configuration(), icon: SettingsIcon }] : []),
 		...(showNetworkTab ? [{ value: 'network', label: m.containers_nav_networks(), icon: NetworksIcon }] : []),
 		...(hasMounts ? [{ value: 'storage', label: m.containers_nav_storage(), icon: VolumesIcon }] : []),
-		...(showComposeTab ? [{ value: 'compose', label: m.tabs_compose(), icon: CodeIcon }] : [])
+		...(showComposeTab ? [{ value: 'compose', label: m.tabs_compose(), icon: CodeIcon }] : []),
+		{ value: 'inspect', label: m.tabs_inspect(), icon: CodeIcon }
 	]);
 
 	const activeTab = $derived.by(() => {
@@ -373,6 +375,10 @@
 					</Tabs.Content>
 				{/if}
 			{/await}
+
+			<Tabs.Content value="inspect" class="h-full">
+				<ContainerInspect {container} />
+			</Tabs.Content>
 		{/snippet}
 	</TabbedPageLayout>
 {:else}
