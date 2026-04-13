@@ -450,11 +450,11 @@ func (s *ApiKeyService) ValidateApiKey(ctx context.Context, rawKey string) (*mod
 				return nil, ErrApiKeyExpired
 			}
 
-			s.markApiKeyUsedAsync(ctx, apiKey.ID)
-
 			if apiKey.UserID == nil {
 				return nil, ErrApiKeyInvalid
 			}
+
+			s.markApiKeyUsedAsync(ctx, apiKey.ID)
 
 			user, err := s.userService.GetUserByID(ctx, *apiKey.UserID)
 			if err != nil {
