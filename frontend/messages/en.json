@@ -1883,7 +1883,6 @@
 	"sidebar_update_available_tooltip": "Update available: {version}",
 	"_comment_version_info": "=== VERSION INFO DIALOG ===",
 	"version_info_title": "About Arcane",
-	"version_info_description": "Application version and build information",
 	"version_info_version": "Version",
 	"version_info_tag": "Image Tag",
 	"version_info_full_commit": "Full Commit Hash",
