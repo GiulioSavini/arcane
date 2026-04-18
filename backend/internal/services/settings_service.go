@@ -772,7 +772,9 @@ func (s *SettingsService) prepareUpdateValues(updates settings.Update, cfg, defa
 		switch key {
 		case "pollingEnabled", "pollingInterval":
 			changedPolling = true
-		case "autoUpdate", "autoUpdateInterval":
+		case "autoUpdate", "autoUpdateInterval",
+			"autoUpdateWindowEnabled", "autoUpdateWindowStart",
+			"autoUpdateWindowEnd", "autoUpdateWindowDays":
 			changedAutoUpdate = true
 		case "scheduledPruneEnabled",
 			"scheduledPruneInterval",

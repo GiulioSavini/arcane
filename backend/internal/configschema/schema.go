@@ -98,6 +98,18 @@ var overrideDocRules = map[string]overrideDocRule{
 	"autoUpdateInterval": {
 		requires: "AUTO_UPDATE=true to have effect at runtime.",
 	},
+	"autoUpdateWindowEnabled": {
+		requires: "AUTO_UPDATE=true and autoUpdateWindowEnabled=true to have effect at runtime.",
+	},
+	"autoUpdateWindowStart": {
+		requires: "autoUpdateWindowEnabled=true to have effect at runtime.",
+	},
+	"autoUpdateWindowEnd": {
+		requires: "autoUpdateWindowEnabled=true to have effect at runtime.",
+	},
+	"autoUpdateWindowDays": {
+		requires: "autoUpdateWindowEnabled=true to have effect at runtime.",
+	},
 	"scheduledPruneInterval": {
 		requires: "SCHEDULED_PRUNE_ENABLED=true to have effect at runtime.",
 	},
