@@ -19,6 +19,7 @@ import (
 	"github.com/getarcaneapp/arcane/backend/pkg/libarcane"
 	"github.com/getarcaneapp/arcane/backend/pkg/libarcane/containerstats"
 	"github.com/getarcaneapp/arcane/backend/pkg/libarcane/timeouts"
+	libupdater "github.com/getarcaneapp/arcane/backend/pkg/libarcane/updater"
 	"github.com/getarcaneapp/arcane/backend/pkg/pagination"
 	"github.com/getarcaneapp/arcane/backend/pkg/projects"
 	containertypes "github.com/getarcaneapp/arcane/types/container"
@@ -458,6 +459,21 @@ func (s *ContainerService) RedeployContainer(ctx context.Context, containerID st
 	imageName := containerInfo.Config.Image
 	wasRunning := containerInfo.State != nil && containerInfo.State.Running
 	apiVersion := libarcane.DetectDockerAPIVersion(ctx, dockerClient)
+
+	// Arcane cannot safely redeploy itself via the compose path: the compose
+	// stop+up sequence would kill the running process before the new container
+	// is ready to serve requests. Use the system upgrade flow instead.
+	if libupdater.IsArcaneContainer(containerInfo.Config.Labels) {
+		projectName := strings.TrimSpace(containerInfo.Config.Labels["com.docker.compose.project"])
+		if projectName != "" {
+			err = errors.New("Arcane cannot redeploy itself when managed as a compose project — use the system upgrade flow (Settings → Updates) instead")
+			s.eventService.LogErrorEvent(ctx, models.EventTypeContainerError, "container", containerID, containerName, user.ID, user.Username, "0", err, models.JSON{
+				"action": "redeploy",
+				"step":   "self_redeploy_blocked",
+			})
+			return "", err
+		}
+	}
 
 	// If this container belongs to a known compose project, redeploy through the
 	// compose-aware path so that compose file changes (healthchecks, env, etc.) and
