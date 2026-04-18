@@ -466,7 +466,7 @@ func (s *ContainerService) RedeployContainer(ctx context.Context, containerID st
 	if libupdater.IsArcaneContainer(containerInfo.Config.Labels) && !libupdater.IsArcaneAgentContainer(containerInfo.Config.Labels) {
 		projectName := strings.TrimSpace(containerInfo.Config.Labels["com.docker.compose.project"])
 		if projectName != "" {
-			err = errors.New("Arcane cannot redeploy itself when managed as a compose project — use the system upgrade flow (Settings → Updates) instead")
+			err = errors.New("arcane cannot redeploy itself when managed as a compose project — use the system upgrade flow (Settings → Updates) instead")
 			s.eventService.LogErrorEvent(ctx, models.EventTypeContainerError, "container", containerID, containerName, user.ID, user.Username, "0", err, models.JSON{
 				"action": "redeploy",
 				"step":   "self_redeploy_blocked",
