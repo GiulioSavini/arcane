@@ -110,7 +110,7 @@ func DeployStack(ctx context.Context, dockerClient *dockerclient.Client, opts St
 		return err
 	}
 
-	if err := ensureSwarmVolumes(ctx, dockerClient, project, stackName, stackLabels); err != nil {
+	if err := ensureSwarmVolumesInternal(ctx, dockerClient, project, stackName, stackLabels); err != nil {
 		return err
 	}
 
@@ -399,11 +399,11 @@ func ensureSwarmConfigs(ctx context.Context, dockerClient *dockerclient.Client, 
 	return result, nil
 }
 
-// ensureSwarmVolumes pre-creates named volumes that carry a driver or
+// ensureSwarmVolumesInternal pre-creates named volumes that carry a driver or
 // driver_opts so that Swarm services pick up the correct volume configuration.
 // Without this step Docker creates a plain local volume on first use and the
 // driver options are silently ignored — the root cause of issue #2376.
-func ensureSwarmVolumes(ctx context.Context, dockerClient *dockerclient.Client, project *composegotypes.Project, stackName string, stackLabels map[string]string) error {
+func ensureSwarmVolumesInternal(ctx context.Context, dockerClient *dockerclient.Client, project *composegotypes.Project, stackName string, stackLabels map[string]string) error {
 	for key, cfg := range project.Volumes {
 		// External volumes must already exist; nothing to create.
 		if cfg.External {
