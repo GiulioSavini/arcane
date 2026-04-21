@@ -210,6 +210,10 @@ func SetupAPI(router *gin.Engine, apiGroup *gin.RouterGroup, cfg *config.Config,
 			Description: "API Key authentication",
 		},
 	}
+	humaConfig.Security = []map[string][]string{
+		{"BearerAuth": {}},
+		{"ApiKeyAuth": {}},
+	}
 
 	// Use custom schema namer to avoid conflicts between types with same name
 	// from different packages (e.g., image.Summary vs env.Summary)
@@ -219,7 +223,7 @@ func SetupAPI(router *gin.Engine, apiGroup *gin.RouterGroup, cfg *config.Config,
 	api := humagin.NewWithGroup(router, apiGroup, humaConfig)
 
 	// Add authentication middleware
-	api.UseMiddleware(middleware.NewAuthBridge(api, svc.Auth, svc.ApiKey, cfg))
+	api.UseMiddleware(middleware.NewAuthBridge(api, svc.Auth, svc.ApiKey, svc.Environment, cfg))
 
 	// Register all Huma handlers
 	registerHandlers(api, svc)
@@ -286,6 +290,10 @@ func SetupAPIForSpec() huma.API {
 			Name:        "X-API-Key",
 			Description: "API Key authentication",
 		},
+	}
+	humaConfig.Security = []map[string][]string{
+		{"BearerAuth": {}},
+		{"ApiKeyAuth": {}},
 	}
 
 	// Use custom schema namer to avoid conflicts between types with same name
@@ -394,7 +402,7 @@ func registerHandlers(api huma.API, svc *Services) {
 	handlers.RegisterTemplates(api, templateSvc, environmentSvc)
 	handlers.RegisterImages(api, dockerSvc, imageSvc, imageUpdateSvc, settingsSvc, buildSvc)
 	handlers.RegisterBuildWorkspaces(api, buildWorkspaceSvc)
-	handlers.RegisterImageUpdates(api, imageUpdateSvc)
+	handlers.RegisterImageUpdates(api, imageUpdateSvc, imageSvc)
 	handlers.RegisterSettings(api, settingsSvc, settingsSearchSvc, environmentSvc, cfg)
 	handlers.RegisterJobSchedules(api, jobScheduleSvc, environmentSvc)
 	handlers.RegisterVolumes(api, dockerSvc, volumeSvc)
