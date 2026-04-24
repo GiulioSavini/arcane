@@ -878,7 +878,7 @@ func convertServiceMounts(volumes []composegotypes.ServiceVolumeConfig, stackNam
 		// Without this, Docker creates a plain local volume and silently
 		// ignores driver/driver_opts — the root cause of issue #2376.
 		if mountType == mount.TypeVolume && source != "" {
-			if volCfg, ok := projectVolumes[source]; ok && !bool(volCfg.External) {
+			if volCfg, ok := projectVolumes[source]; ok && !bool(volCfg.External) && (volCfg.Driver != "" || len(volCfg.DriverOpts) > 0) {
 				source = resolveResourceName(stackName, source, volCfg.Name, volCfg.External)
 			}
 		}
