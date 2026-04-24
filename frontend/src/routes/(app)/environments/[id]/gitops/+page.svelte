@@ -78,9 +78,9 @@
 		});
 	}
 
-	function openCreateSyncDialog(targetType?: string) {
+	function openCreateSyncDialog(targetType?: string | Event) {
 		syncToEdit = null;
-		dialogTargetType = targetType;
+		dialogTargetType = typeof targetType === 'string' ? targetType : undefined;
 		isSyncDialogOpen = true;
 	}
 
@@ -153,7 +153,7 @@
 			id: 'create',
 			action: 'create',
 			label: m.common_add_button({ resource: m.resource_sync_cap() }),
-			onclick: openCreateSyncDialog
+			onclick: () => openCreateSyncDialog()
 		},
 		{
 			id: 'import',
