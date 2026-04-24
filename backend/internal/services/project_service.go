@@ -244,14 +244,18 @@ func buildProjectImagePullPlan(services composetypes.Services) map[string]imageP
 	return plan
 }
 
-func ptrStringEqualInternal(a, b *string) bool {
-	if a == nil && b == nil {
-		return true
+// lookupProjectContainers returns containers matched to a project, trying the
+// normalized directory name first and falling back to the effective compose
+// project name (from COMPOSE_PROJECT_NAME) when it differs.
+func lookupProjectContainers(p models.Project, containersByProject map[string][]container.Summary) []container.Summary {
+	normName := normalizeComposeProjectName(p.Name)
+	if c := containersByProject[normName]; len(c) > 0 {
+		return c
 	}
-	if a == nil || b == nil {
-		return false
+	if p.ComposeProjectName != nil && *p.ComposeProjectName != normName {
+		return containersByProject[*p.ComposeProjectName]
 	}
-	return *a == *b
+	return nil
 }
 
 func normalizeComposeProjectName(name string) string {
@@ -1295,7 +1299,7 @@ func (s *ProjectService) upsertProjectForDir(ctx context.Context, dirName, dirPa
 	} else if serviceCountErr != nil {
 		slog.WarnContext(ctx, "failed to refresh compose service count during project sync", "projectID", existing.ID, "path", dirPath, "error", serviceCountErr)
 	}
-	if !ptrStringEqualInternal(existing.ComposeProjectName, composeProjectName) {
+	if serviceCountErr == nil && !utils.StringPtrEqual(existing.ComposeProjectName, composeProjectName) {
 		updates["compose_project_name"] = composeProjectName
 	}
 	if len(updates) == 0 {
@@ -1466,11 +1470,7 @@ func (s *ProjectService) GetProjectStatusCounts(ctx context.Context) (folderCoun
 
 	// 3. Calculate status for each project
 	for _, p := range projectsList {
-		normName := normalizeComposeProjectName(p.Name)
-		projectContainers := containersByProject[normName]
-		if len(projectContainers) == 0 && p.ComposeProjectName != nil && *p.ComposeProjectName != normName {
-			projectContainers = containersByProject[*p.ComposeProjectName]
-		}
+		projectContainers := lookupProjectContainers(p, containersByProject)
 
 		// Convert to ProjectServiceInfo (minimal needed for calculateProjectStatus)
 		var services []ProjectServiceInfo
@@ -3347,14 +3347,7 @@ func (s *ProjectService) mapProjectToDto(ctx context.Context, projectsDir string
 	resp.IconURL = meta.ProjectIconURL
 	resp.URLs = meta.ProjectURLS
 
-	// Find containers for this project. Try the normalized directory name first,
-	// then fall back to the effective compose project name (from COMPOSE_PROJECT_NAME
-	// in .env) which may differ from the directory name.
-	normName := normalizeComposeProjectName(p.Name)
-	projectContainers := containersByProject[normName]
-	if len(projectContainers) == 0 && p.ComposeProjectName != nil && *p.ComposeProjectName != normName {
-		projectContainers = containersByProject[*p.ComposeProjectName]
-	}
+	projectContainers := lookupProjectContainers(p, containersByProject)
 
 	var services []ProjectServiceInfo
 	runningCount := 0
