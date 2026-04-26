@@ -1726,7 +1726,8 @@ func (s *ProjectService) RedeployProject(ctx context.Context, projectID string, 
 func (s *ProjectService) projectRedeployDisabledInternal(ctx context.Context, proj models.Project) (bool, error) {
 	containers, err := projects.ListGlobalComposeContainers(ctx)
 	if err != nil {
-		return false, fmt.Errorf("failed to inspect project containers before redeploy: %w", err)
+		slog.WarnContext(ctx, "could not list compose containers to check self-redeploy guard; skipping guard", "error", err)
+		return false, nil
 	}
 
 	containersByProject := make(map[string][]container.Summary)

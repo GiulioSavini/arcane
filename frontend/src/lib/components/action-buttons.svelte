@@ -829,6 +829,28 @@
 	}
 </script>
 
+{#snippet RedeployActionButton(size: 'default' | 'icon' = 'default', showLabel = true)}
+	{#if disableRedeploy}
+		<span class="inline-flex" title={m.common_redeploy_disabled_arcane_self()}>
+			<ArcaneButton action="redeploy" {size} {showLabel} disabled />
+		</span>
+	{:else}
+		<ArcaneButton action="redeploy" {size} {showLabel} onclick={() => confirmAction('redeploy')} loading={uiLoading.redeploy} />
+	{/if}
+{/snippet}
+
+{#snippet RedeployMenuItem()}
+	{#if disableRedeploy}
+		<DropdownMenu.Item disabled title={m.common_redeploy_disabled_arcane_self()}>
+			{m.common_redeploy()}
+		</DropdownMenu.Item>
+	{:else}
+		<DropdownMenu.Item onclick={() => confirmAction('redeploy')} disabled={uiLoading.redeploy}>
+			{m.common_redeploy()}
+		</DropdownMenu.Item>
+	{/if}
+{/snippet}
+
 {#if desktopVariant === 'adaptive'}
 	<div>
 		<!-- On xl+ show labels; below xl use icon-only to avoid overflow in constrained headers (sidebar layouts) -->
@@ -888,15 +910,7 @@
 				{/if}
 
 				{#if type === 'container'}
-					{#if !disableRedeploy}
-						<ArcaneButton
-							action="redeploy"
-							size={adaptiveIconOnly ? 'icon' : 'default'}
-							showLabel={!adaptiveIconOnly}
-							onclick={() => confirmAction('redeploy')}
-							loading={uiLoading.redeploy}
-						/>
-					{/if}
+					{@render RedeployActionButton(adaptiveIconOnly ? 'icon' : 'default', !adaptiveIconOnly)}
 					<ArcaneButton
 						action="remove"
 						size={adaptiveIconOnly ? 'icon' : 'default'}
@@ -905,15 +919,7 @@
 						loading={uiLoading.remove}
 					/>
 				{:else}
-					{#if !disableRedeploy}
-						<ArcaneButton
-							action="redeploy"
-							size={adaptiveIconOnly ? 'icon' : 'default'}
-							showLabel={!adaptiveIconOnly}
-							onclick={() => confirmAction('redeploy')}
-							loading={uiLoading.redeploy}
-						/>
-					{/if}
+					{@render RedeployActionButton(adaptiveIconOnly ? 'icon' : 'default', !adaptiveIconOnly)}
 
 					{#if type === 'project'}
 						{#if projectHasBuildDirective}
@@ -1034,20 +1040,12 @@
 							{/if}
 
 							{#if type === 'container'}
-								{#if !disableRedeploy}
-									<DropdownMenu.Item onclick={() => confirmAction('redeploy')} disabled={uiLoading.redeploy}>
-										{m.common_redeploy()}
-									</DropdownMenu.Item>
-								{/if}
+								{@render RedeployMenuItem()}
 								<DropdownMenu.Item onclick={() => confirmAction('remove')} disabled={uiLoading.remove}>
 									{m.common_remove()}
 								</DropdownMenu.Item>
 							{:else}
-								{#if !disableRedeploy}
-									<DropdownMenu.Item onclick={() => confirmAction('redeploy')} disabled={uiLoading.redeploy}>
-										{m.common_redeploy()}
-									</DropdownMenu.Item>
-								{/if}
+								{@render RedeployMenuItem()}
 
 								{#if type === 'project'}
 									{#if projectHasBuildDirective}
@@ -1165,14 +1163,10 @@
 			{/if}
 
 			{#if type === 'container'}
-				{#if !disableRedeploy}
-					<ArcaneButton action="redeploy" onclick={() => confirmAction('redeploy')} loading={uiLoading.redeploy} />
-				{/if}
+				{@render RedeployActionButton()}
 				<ArcaneButton action="remove" onclick={() => confirmAction('remove')} loading={uiLoading.remove} />
 			{:else}
-				{#if !disableRedeploy}
-					<ArcaneButton action="redeploy" onclick={() => confirmAction('redeploy')} loading={uiLoading.redeploy} />
-				{/if}
+				{@render RedeployActionButton()}
 
 				{#if type === 'project'}
 					{#if projectHasBuildDirective}
@@ -1273,20 +1267,12 @@
 						{/if}
 
 						{#if type === 'container'}
-							{#if !disableRedeploy}
-								<DropdownMenu.Item onclick={() => confirmAction('redeploy')} disabled={uiLoading.redeploy}>
-									{m.common_redeploy()}
-								</DropdownMenu.Item>
-							{/if}
+							{@render RedeployMenuItem()}
 							<DropdownMenu.Item onclick={() => confirmAction('remove')} disabled={uiLoading.remove}>
 								{m.common_remove()}
 							</DropdownMenu.Item>
 						{:else}
-							{#if !disableRedeploy}
-								<DropdownMenu.Item onclick={() => confirmAction('redeploy')} disabled={uiLoading.redeploy}>
-									{m.common_redeploy()}
-								</DropdownMenu.Item>
-							{/if}
+							{@render RedeployMenuItem()}
 
 							{#if type === 'project'}
 								{#if projectHasBuildDirective}

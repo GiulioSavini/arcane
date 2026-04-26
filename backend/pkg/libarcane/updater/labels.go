@@ -30,6 +30,8 @@ func ShouldDisableArcaneServerRedeploy(labels map[string]string, containerID, cu
 	}
 
 	if currentErr != nil || strings.TrimSpace(currentContainerID) == "" {
+		// Without a runtime container ID, non-agent Arcane server labels are treated as protected.
+		// This prevents accidental self-redeploy, but native/CI runs can mark other Arcane servers disabled.
 		return true
 	}
 

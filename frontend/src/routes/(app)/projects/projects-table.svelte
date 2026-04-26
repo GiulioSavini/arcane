@@ -172,6 +172,7 @@
 			onClick: handleBulkRedeploy,
 			loading: isBulkLoading.redeploy,
 			disabled: isAnyLoading || hasRedeployDisabledSelection,
+			disabledReason: hasRedeployDisabledSelection ? m.common_redeploy_disabled_arcane_self() : undefined,
 			icon: RedeployIcon
 		}
 	]);
@@ -379,7 +380,12 @@
 					</DropdownMenu.Item>
 				{/if}
 
-				{#if !item.redeployDisabled}
+				{#if item.redeployDisabled}
+					<DropdownMenu.Item disabled title={m.common_redeploy_disabled_arcane_self()}>
+						<RedeployIcon class="size-4 opacity-50" />
+						{m.compose_pull_redeploy()}
+					</DropdownMenu.Item>
+				{:else}
 					<DropdownMenu.Item
 						onclick={() => performProjectAction('redeploy', item.id)}
 						disabled={status === 'redeploying' || isAnyLoading}
