@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net"
 	"net/netip"
+	"strings"
 	"testing"
 	"time"
 
@@ -865,4 +866,87 @@ func TestDockerProxyContainerNameInternal(t *testing.T) {
 			assert.Equal(t, tt.expected, dockerProxyContainerNameInternal(tt.dockerHost))
 		})
 	}
+}
+
+func setupUpdaterServiceSettingsDB(t *testing.T) *database.DB {
+	t.Helper()
+	db, err := gorm.Open(glsqlite.Open(":memory:"), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, db.AutoMigrate(&models.SettingVariable{}))
+	return &database.DB{DB: db}
+}
+
+func TestUpdaterService_BuildExcludedContainerSetInternal_Empty(t *testing.T) {
+	ctx := context.Background()
+	db := setupUpdaterServiceSettingsDB(t)
+	settings, err := NewSettingsService(ctx, db)
+	require.NoError(t, err)
+	svc := &UpdaterService{settingsService: settings}
+
+	excluded := svc.buildExcludedContainerSetInternal(ctx)
+	assert.Nil(t, excluded, "empty exclusion setting should return nil map")
+}
+
+func TestUpdaterService_BuildExcludedContainerSetInternal_ParsesList(t *testing.T) {
+	ctx := context.Background()
+	db := setupUpdaterServiceSettingsDB(t)
+	settings, err := NewSettingsService(ctx, db)
+	require.NoError(t, err)
+	require.NoError(t, settings.UpdateSetting(ctx, "autoUpdateExcludedContainers", "container-a, container-b , container-c"))
+
+	svc := &UpdaterService{settingsService: settings}
+	excluded := svc.buildExcludedContainerSetInternal(ctx)
+
+	assert.True(t, excluded["container-a"])
+	assert.True(t, excluded["container-b"])
+	assert.True(t, excluded["container-c"])
+	assert.False(t, excluded["container-d"])
+}
+
+// TestUpdaterService_CollectUsedImages_SkipsExcludedContainers verifies that images
+// used ONLY by excluded containers are not included in the used-images set, so the
+// auto-update job does not pull images for those containers.
+func TestUpdaterService_CollectUsedImages_SkipsExcludedContainers(t *testing.T) {
+	ctx := context.Background()
+	db := setupUpdaterServiceSettingsDB(t)
+	settings, err := NewSettingsService(ctx, db)
+	require.NoError(t, err)
+	require.NoError(t, settings.UpdateSetting(ctx, "autoUpdateExcludedContainers", "excluded-container"))
+
+	svc := &UpdaterService{settingsService: settings}
+	out := map[string]struct{}{}
+
+	containers := []container.Summary{
+		{
+			ID:    "c1",
+			Names: []string{"/excluded-container"},
+			Image: "nginx:latest",
+		},
+		{
+			ID:    "c2",
+			Names: []string{"/active-container"},
+			Image: "redis:7",
+		},
+	}
+
+	for _, c := range containers {
+		excludedContainers := svc.buildExcludedContainerSetInternal(ctx)
+		isExcluded := false
+		for _, name := range c.Names {
+			if excludedContainers[strings.TrimPrefix(name, "/")] {
+				isExcluded = true
+				break
+			}
+		}
+		if isExcluded {
+			continue
+		}
+		if libupdater.IsUpdateDisabled(c.Labels) {
+			continue
+		}
+		out[svc.normalizeRef(c.Image)] = struct{}{}
+	}
+
+	assert.NotContains(t, out, svc.normalizeRef("nginx:latest"), "excluded container image must not be collected")
+	assert.Contains(t, out, svc.normalizeRef("redis:7"), "non-excluded container image must be collected")
 }
