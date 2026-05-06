@@ -288,7 +288,7 @@ dockers_v2:
       - "ghcr.io/getarcaneapp/arcane"
     tags:
       - "next-static"
-      - "{{.Tag}}"
+      - "{{ .Version }}"
     platforms:
       - linux/amd64
       - linux/arm64
@@ -315,7 +315,7 @@ dockers_v2:
       - "ghcr.io/getarcaneapp/arcane-headless"
     tags:
       - "next-static"
-      - "{{.Tag}}"
+      - "{{ .Version }}"
     platforms:
       - linux/amd64
       - linux/arm64
@@ -342,7 +342,7 @@ dockers_v2:
       - "ghcr.io/getarcaneapp/arcane"
     tags:
       - "next-distroless"
-      - "{{.Tag}}-distroless"
+      - "{{ .Version }}-distroless"
     platforms:
       - linux/amd64
       - linux/arm64
@@ -369,7 +369,7 @@ dockers_v2:
       - "ghcr.io/getarcaneapp/arcane-headless"
     tags:
       - "next-distroless"
-      - "{{.Tag}}-distroless"
+      - "{{ .Version }}-distroless"
     platforms:
       - linux/amd64
       - linux/arm64
@@ -436,7 +436,7 @@ blobs:
         name_template: arcane-cli_darwin_arm64
       - glob: dist/arcane-cli_darwin_arm64_v8.0/arcane-cli_darwin_arm64.sigstore.json
         name_template: arcane-cli_darwin_arm64.sigstore.json
-      - glob: dist/arcane_next-static-*_checksums.txt
+      - glob: dist/arcane_*_checksums.txt
         name_template: arcane-cli_checksums.txt
     include_meta: false
     disable: '{{ if not (index .Env "BUILD_NEXT") }}true{{ end }}'
@@ -473,7 +473,7 @@ blobs:
         name_template: arcane-agent_darwin_amd64.sigstore.json
       - glob: dist/arcane-agent_darwin_arm64_v8.0/arcane-agent_darwin_arm64.sigstore.json
         name_template: arcane-agent_darwin_arm64.sigstore.json
-      - glob: dist/arcane_next-static-*_checksums.txt.sigstore.json
+      - glob: dist/arcane_*_checksums.txt.sigstore.json
         name_template: arcane_checksums.sigstore.json
     include_meta: false
     disable: '{{ if not (index .Env "BUILD_NEXT") }}true{{ end }}'
