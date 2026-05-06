@@ -111,8 +111,7 @@ jobs:
           provenance: true
 
       - name: Sign manager image
-        run: cosign sign --yes --key env://COSIGN_PRIVATE_KEY "${MANAGER_IMAGE_NAME}@${{
-          steps.manager-build.outputs.digest }}"
+        run: cosign sign --yes --key env://COSIGN_PRIVATE_KEY "${MANAGER_IMAGE_NAME}@${{ steps.manager-build.outputs.digest }}"
         env:
           COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
           COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
@@ -158,8 +157,7 @@ jobs:
           provenance: true
 
       - name: Sign agent image
-        run: cosign sign --yes --key env://COSIGN_PRIVATE_KEY "${AGENT_IMAGE_NAME}@${{ steps.agent-build.outputs.digest
-          }}"
+        run: cosign sign --yes --key env://COSIGN_PRIVATE_KEY "${AGENT_IMAGE_NAME}@${{ steps.agent-build.outputs.digest }}"
         env:
           COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
           COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
@@ -196,6 +194,8 @@ jobs:
           MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
           DISCORD_WEBHOOK_ID: ${{ secrets.DISCORD_WEBHOOK_ID }}
           DISCORD_WEBHOOK_TOKEN: ${{ secrets.DISCORD_WEBHOOK_TOKEN }}
+          NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
+          NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
 
       - name: Publish release
         env:

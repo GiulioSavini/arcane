@@ -208,6 +208,7 @@ checksum:
 
 nfpms:
   - id: arcane-cli
+    if: '{{ ne (index .Env "BUILD_NEXT") "true" }}'
     package_name: arcane-cli
     file_name_template: "{{ .ConventionalFileName }}"
     ids:
@@ -224,12 +225,68 @@ nfpms:
       - deb
       - rpm
       - archlinux
+    conflicts:
+      - arcane-cli-next
+    replaces:
+      - arcane-cli-next
     bindir: /usr/bin
     contents:
       - src: ./cli/README.md
         dst: /usr/share/doc/arcane-cli/README.md
       - src: ./LICENSE
         dst: /usr/share/doc/arcane-cli/LICENSE
+
+  - id: arcane-cli-next
+    if: '{{ eq (index .Env "BUILD_NEXT") "true" }}'
+    package_name: arcane-cli-next
+    file_name_template: "{{ .ConventionalFileName }}"
+    ids:
+      - arcane-cli
+    vendor: getarcaneapp
+    homepage: https://getarcane.app
+    maintainer: Kyle Mendell <ksm@ofkm.us>
+    description: |-
+      Arcane CLI - Modern Docker Management, Designed for Everyone.
+      This is the command-line interface for Arcane.
+    license: BSD-3-Clause
+    formats:
+      - apk
+      - deb
+      - rpm
+      - archlinux
+    provides:
+      - arcane-cli
+    conflicts:
+      - arcane-cli
+    replaces:
+      - arcane-cli
+    bindir: /usr/bin
+    contents:
+      - src: ./cli/README.md
+        dst: /usr/share/doc/arcane-cli-next/README.md
+      - src: ./LICENSE
+        dst: /usr/share/doc/arcane-cli-next/LICENSE
+
+publishers:
+  - name: nexus-debian
+    if: '{{ hasSuffix .ArtifactName ".deb" }}'
+    disable: '{{ if not (and (index .Env "NEXUS_USERNAME") (index .Env "NEXUS_PASSWORD")) }}true{{ end }}'
+    dir: "{{ dir .ArtifactPath }}"
+    cmd: >-
+      curl --fail-with-body
+      -u "{{ .Env.NEXUS_USERNAME }}:{{ .Env.NEXUS_PASSWORD }}"
+      --upload-file "{{ .ArtifactName }}"
+      'https://pkgs.getarcane.app/repository/debian/stable/{{- if eq .Arch "amd64" -}}amd64{{- else if eq .Arch "arm64" -}}arm64{{- else if eq .Arch "386" -}}i386{{- else if and (eq .Arch "arm") (eq .Arm "7") -}}armhf{{- else -}}{{ .Arch }}{{- end -}}/{{ .ArtifactName }}'
+
+  - name: nexus-yum
+    if: '{{ hasSuffix .ArtifactName ".rpm" }}'
+    disable: '{{ if not (and (index .Env "NEXUS_USERNAME") (index .Env "NEXUS_PASSWORD")) }}true{{ end }}'
+    dir: "{{ dir .ArtifactPath }}"
+    cmd: >-
+      curl --fail-with-body
+      -u "{{ .Env.NEXUS_USERNAME }}:{{ .Env.NEXUS_PASSWORD }}"
+      --upload-file "{{ .ArtifactName }}"
+      'https://pkgs.getarcane.app/repository/yum/{{- if eq .Arch "amd64" -}}x86_64{{- else if eq .Arch "arm64" -}}aarch64{{- else if eq .Arch "386" -}}i386{{- else if and (eq .Arch "arm") (eq .Arm "7") -}}armhfp{{- else -}}{{ .Arch }}{{- end -}}/{{ .ArtifactName }}'
 
 homebrew_casks:
   - name: arcane-cli
