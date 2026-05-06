@@ -232,12 +232,6 @@ homebrew_casks:
         - zsh
         - fish
         - pwsh
-    hooks:
-      post:
-        install: |
-          if OS.mac?
-            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/arcane-cli"]
-          end
     description: "Arcane CLI - Modern Docker Management, Designed for Everyone."
     homepage: "https://getarcane.app"
     skip_upload: '{{ if eq (index .Env "BUILD_NEXT") "true" }}true{{ end }}'
