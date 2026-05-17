@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -16,12 +17,15 @@ import (
 	"time"
 
 	composetypes "github.com/compose-spec/compose-go/v2/types"
+	composeapi "github.com/docker/compose/v5/pkg/api"
+	"github.com/getarcaneapp/arcane/backend/internal/common"
 	"github.com/getarcaneapp/arcane/backend/internal/config"
-	libupdater "github.com/getarcaneapp/arcane/backend/pkg/libarcane/updater"
+	libupdater "github.com/getarcaneapp/arcane/backend/pkg/libarcane/imageupdate"
 	"github.com/getarcaneapp/arcane/backend/pkg/pagination"
 	"github.com/getarcaneapp/arcane/backend/pkg/projects"
 	buildtypes "github.com/getarcaneapp/arcane/types/builds"
 	imagetypes "github.com/getarcaneapp/arcane/types/image"
+	projecttypes "github.com/getarcaneapp/arcane/types/project"
 	glsqlite "github.com/glebarez/sqlite"
 	"github.com/moby/moby/api/types/container"
 	dockertypesimage "github.com/moby/moby/api/types/image"
@@ -1144,7 +1148,7 @@ services:
 	includePath := filepath.Join(projectPath, "metadata.yaml")
 	assert.NoFileExists(t, includePath)
 
-	details, err := svc.GetProjectDetails(ctx, project.ID)
+	details, err := svc.GetProjectDetails(ctx, project.ID, projecttypes.AllDetails())
 	require.NoError(t, err)
 	require.Len(t, details.IncludeFiles, 1)
 	assert.Equal(t, "metadata.yaml", details.IncludeFiles[0].RelativePath)
@@ -1838,7 +1842,7 @@ func TestProjectService_GetProjectDetails_ReturnsEffectiveEnvContent(t *testing.
 	}
 	require.NoError(t, db.Create(project).Error)
 
-	details, err := svc.GetProjectDetails(ctx, project.ID)
+	details, err := svc.GetProjectDetails(ctx, project.ID, projecttypes.AllDetails())
 	require.NoError(t, err)
 	assert.Equal(t, "BASE=git\nTOKEN=secret\n", details.EnvContent)
 }
@@ -1970,7 +1974,7 @@ func TestProjectService_GetProjectDetails_IncludesUpdateInfo(t *testing.T) {
 		CheckTime:      time.Now().UTC(),
 	}).Error)
 
-	details, err := svc.GetProjectDetails(ctx, projectRecord.ID)
+	details, err := svc.GetProjectDetails(ctx, projectRecord.ID, projecttypes.AllDetails())
 	require.NoError(t, err)
 	require.NotNil(t, details.UpdateInfo)
 	assert.Equal(t, "has_update", details.UpdateInfo.Status)
@@ -1980,6 +1984,133 @@ func TestProjectService_GetProjectDetails_IncludesUpdateInfo(t *testing.T) {
 	assert.Equal(t, 1, details.UpdateInfo.ImagesWithUpdates)
 	assert.Equal(t, []string{"nginx:latest"}, details.UpdateInfo.ImageRefs)
 	assert.Equal(t, []string{"nginx:latest"}, details.UpdateInfo.UpdatedImageRefs)
+}
+
+func TestProjectService_GetProjectDetails_RefreshesRuntimeStatusWithoutRuntimeServices(t *testing.T) {
+	db := setupProjectTestDB(t)
+	ctx := context.Background()
+
+	projectsDir := t.TempDir()
+	t.Setenv("PROJECTS_DIRECTORY", projectsDir)
+
+	settingsService, err := NewSettingsService(ctx, db)
+	require.NoError(t, err)
+	require.NoError(t, settingsService.SetStringSetting(ctx, "projectsDirectory", projectsDir))
+
+	projectPath := createComposeProjectDir(t, projectsDir, "projectA")
+	require.NoError(t, os.WriteFile(filepath.Join(projectPath, "compose.yaml"), []byte("services:\n  server:\n    image: nginx:alpine\n  worker:\n    image: busybox:latest\n"), 0o644))
+
+	server := newProjectRuntimeDockerServerInternal(t, []container.Summary{
+		{
+			ID:     "server-container",
+			Names:  []string{"/projecta-server-1"},
+			Image:  "nginx:alpine",
+			State:  container.StateRunning,
+			Status: "Up 30 seconds (healthy)",
+			Ports: []container.PortSummary{
+				{
+					IP:          netip.MustParseAddr("0.0.0.0"),
+					PrivatePort: 80,
+					PublicPort:  8080,
+					Type:        "tcp",
+				},
+			},
+			Labels: map[string]string{
+				composeapi.ProjectLabel:    "projecta",
+				composeapi.ServiceLabel:    "server",
+				composeapi.ConfigHashLabel: "server-hash",
+				composeapi.WorkingDirLabel: "/host/path/projects/projectA",
+			},
+		},
+		{
+			ID:     "worker-container",
+			Names:  []string{"/projecta-worker-1"},
+			Image:  "busybox:latest",
+			State:  container.StateRunning,
+			Status: "Up 30 seconds",
+			Labels: map[string]string{
+				composeapi.ProjectLabel:    "projecta",
+				composeapi.ServiceLabel:    "worker",
+				composeapi.ConfigHashLabel: "worker-hash",
+				composeapi.WorkingDirLabel: "/host/path/projects/projectA",
+			},
+		},
+	})
+	t.Setenv("DOCKER_HOST", dockerHostFromProjectRuntimeServerURLInternal(t, server.URL))
+
+	projectRecord := &models.Project{
+		BaseModel:    models.BaseModel{ID: "proj-runtime-refresh"},
+		Name:         "projectA",
+		DirName:      ptr("projectA"),
+		Path:         projectPath,
+		Status:       models.ProjectStatusStopped,
+		ServiceCount: 2,
+		RunningCount: 0,
+	}
+	require.NoError(t, db.Create(projectRecord).Error)
+
+	svc := NewProjectService(db, settingsService, nil, nil, nil, nil, config.Load())
+
+	details, err := svc.GetProjectDetails(ctx, projectRecord.ID, projecttypes.DetailsOptions{})
+	require.NoError(t, err)
+	assert.Equal(t, string(models.ProjectStatusRunning), details.Status)
+	assert.Equal(t, 2, details.ServiceCount)
+	assert.Equal(t, 2, details.RunningCount)
+	assert.Empty(t, details.RuntimeServices)
+}
+
+func TestProjectService_GetProjectDetails_PopulatesRuntimeServicesFromComposePs(t *testing.T) {
+	db := setupProjectTestDB(t)
+	ctx := context.Background()
+
+	projectsDir := t.TempDir()
+	t.Setenv("PROJECTS_DIRECTORY", projectsDir)
+
+	settingsService, err := NewSettingsService(ctx, db)
+	require.NoError(t, err)
+	require.NoError(t, settingsService.SetStringSetting(ctx, "projectsDirectory", projectsDir))
+
+	projectPath := createComposeProjectDir(t, projectsDir, "projectA")
+	require.NoError(t, os.WriteFile(filepath.Join(projectPath, "compose.yaml"), []byte("services:\n  server:\n    image: nginx:alpine\n"), 0o644))
+
+	server := newProjectRuntimeDockerServerInternal(t, []container.Summary{
+		{
+			ID:     "server-container",
+			Names:  []string{"/projecta-server-1"},
+			Image:  "nginx:alpine",
+			State:  container.StateRunning,
+			Status: "Up 30 seconds",
+			Labels: map[string]string{
+				composeapi.ProjectLabel:    "projecta",
+				composeapi.ServiceLabel:    "server",
+				composeapi.ConfigHashLabel: "server-hash",
+				composeapi.WorkingDirLabel: "/host/path/projects/projectA",
+			},
+		},
+	})
+	t.Setenv("DOCKER_HOST", dockerHostFromProjectRuntimeServerURLInternal(t, server.URL))
+
+	projectRecord := &models.Project{
+		BaseModel:    models.BaseModel{ID: "proj-runtime-services"},
+		Name:         "projectA",
+		DirName:      ptr("projectA"),
+		Path:         projectPath,
+		Status:       models.ProjectStatusStopped,
+		ServiceCount: 1,
+		RunningCount: 0,
+	}
+	require.NoError(t, db.Create(projectRecord).Error)
+
+	svc := NewProjectService(db, settingsService, nil, nil, nil, nil, config.Load())
+
+	details, err := svc.GetProjectDetails(ctx, projectRecord.ID, projecttypes.DetailsOptions{IncludeRuntimeServices: true})
+	require.NoError(t, err)
+	require.Len(t, details.RuntimeServices, 1)
+	assert.Equal(t, string(models.ProjectStatusRunning), details.Status)
+	assert.Equal(t, "server", details.RuntimeServices[0].Name)
+	assert.Equal(t, "running", details.RuntimeServices[0].Status)
+	assert.Equal(t, "server-container", details.RuntimeServices[0].ContainerID)
+	assert.Equal(t, "projecta-server-1", details.RuntimeServices[0].ContainerName)
 }
 
 func TestProjectService_ListProjects_FiltersByUpdateStatus(t *testing.T) {
@@ -2094,6 +2225,235 @@ func TestProjectService_ListProjects_FiltersByUpdateStatus(t *testing.T) {
 			assert.Equal(t, tt.expected, names)
 		})
 	}
+}
+
+func TestBuildDiscoveredComposeProjectUpdateRowsInternal(t *testing.T) {
+	db := setupProjectTestDB(t)
+	ctx := context.Background()
+	imageService := &ImageService{db: db}
+	now := time.Now().UTC()
+
+	require.NoError(t, db.Create(&models.ImageUpdateRecord{
+		ID:             "sha256:media-image",
+		Repository:     "docker.io/library/nginx",
+		Tag:            "latest",
+		HasUpdate:      true,
+		UpdateType:     models.UpdateTypeDigest,
+		CurrentVersion: "latest",
+		CheckTime:      now,
+	}).Error)
+	require.NoError(t, db.Create(&models.ImageUpdateRecord{
+		ID:             "sha256:known-image",
+		Repository:     "docker.io/library/redis",
+		Tag:            "7",
+		HasUpdate:      true,
+		UpdateType:     models.UpdateTypeDigest,
+		CurrentVersion: "7",
+		CheckTime:      now,
+	}).Error)
+
+	rows := buildDiscoveredComposeProjectUpdateRowsInternal(ctx, []container.Summary{
+		{
+			ID:      "media-web",
+			Names:   []string{"/media-web-1"},
+			Image:   "nginx:latest",
+			ImageID: "sha256:media-image",
+			State:   "running",
+			Labels: map[string]string{
+				"com.docker.compose.project": "media",
+				"com.docker.compose.service": "web",
+			},
+		},
+		{
+			ID:      "known-cache",
+			Image:   "redis:7",
+			ImageID: "sha256:known-image",
+			State:   "running",
+			Labels: map[string]string{
+				"com.docker.compose.project": "known",
+				"com.docker.compose.service": "cache",
+			},
+		},
+		{
+			ID:      "plain-container",
+			Image:   "busybox:latest",
+			ImageID: "sha256:plain-image",
+			State:   "running",
+			Labels:  map[string]string{},
+		},
+	}, map[string]struct{}{"known": {}}, imageService)
+
+	require.Len(t, rows, 1)
+	row := rows[0]
+	assert.Equal(t, "compose:media", row.ID)
+	assert.Equal(t, "media", row.Name)
+	assert.True(t, row.IsDiscovered)
+	assert.Equal(t, string(models.ProjectStatusRunning), row.Status)
+	require.NotNil(t, row.UpdateInfo)
+	assert.True(t, row.UpdateInfo.HasUpdate)
+	assert.Equal(t, []string{"nginx:latest"}, row.UpdateInfo.UpdatedImageRefs)
+	require.Len(t, row.RuntimeServices, 1)
+	assert.Equal(t, "web", row.RuntimeServices[0].Name)
+}
+
+func TestBuildDiscoveredComposeProjectUpdateRowsInternal_FallsBackToImageID(t *testing.T) {
+	db := setupProjectTestDB(t)
+	ctx := context.Background()
+	imageService := &ImageService{db: db}
+
+	require.NoError(t, db.Create(&models.ImageUpdateRecord{
+		ID:             "sha256:media-image",
+		Repository:     "registry.example.test/custom/media",
+		Tag:            "latest",
+		HasUpdate:      true,
+		UpdateType:     models.UpdateTypeDigest,
+		CurrentVersion: "latest",
+		CheckTime:      time.Now().UTC(),
+	}).Error)
+
+	rows := buildDiscoveredComposeProjectUpdateRowsInternal(ctx, []container.Summary{
+		{
+			ID:      "media-web",
+			Image:   "nginx:latest",
+			ImageID: "sha256:media-image",
+			State:   "running",
+			Labels: map[string]string{
+				"com.docker.compose.project": "media",
+				"com.docker.compose.service": "web",
+			},
+		},
+	}, map[string]struct{}{}, imageService)
+
+	require.Len(t, rows, 1)
+	assert.Equal(t, []string{"nginx:latest"}, rows[0].UpdateInfo.UpdatedImageRefs)
+}
+
+func TestProjectService_ListProjects_FiltersArchivedProjects(t *testing.T) {
+	db := setupProjectTestDB(t)
+	ctx := context.Background()
+
+	settingsService, err := NewSettingsService(ctx, db)
+	require.NoError(t, err)
+	projectsRoot := t.TempDir()
+	require.NoError(t, settingsService.SetStringSetting(ctx, "projectsDirectory", projectsRoot))
+
+	activePath := createComposeProjectDir(t, projectsRoot, "active-demo")
+	archivedPath := createComposeProjectDir(t, projectsRoot, "archived-demo")
+	archivedAt := time.Now().UTC()
+
+	require.NoError(t, db.Create(&models.Project{
+		BaseModel: models.BaseModel{ID: "project-active"},
+		Name:      "active-demo",
+		DirName:   ptr("active-demo"),
+		Path:      activePath,
+		Status:    models.ProjectStatusStopped,
+	}).Error)
+	require.NoError(t, db.Create(&models.Project{
+		BaseModel:  models.BaseModel{ID: "project-archived"},
+		Name:       "archived-demo",
+		DirName:    ptr("archived-demo"),
+		Path:       archivedPath,
+		Status:     models.ProjectStatusStopped,
+		IsArchived: true,
+		ArchivedAt: &archivedAt,
+	}).Error)
+
+	svc := NewProjectService(db, settingsService, nil, nil, nil, nil, config.Load())
+
+	items, page, err := svc.ListProjects(ctx, pagination.QueryParams{
+		PaginationParams: pagination.PaginationParams{Limit: -1},
+		SortParams:       pagination.SortParams{Sort: "name", Order: pagination.SortAsc},
+	})
+	require.NoError(t, err)
+	require.EqualValues(t, 1, page.TotalItems)
+	require.Len(t, items, 1)
+	assert.Equal(t, "active-demo", items[0].Name)
+
+	items, page, err = svc.ListProjects(ctx, pagination.QueryParams{
+		Filters:          map[string]string{"archived": "true"},
+		PaginationParams: pagination.PaginationParams{Limit: -1},
+		SortParams:       pagination.SortParams{Sort: "name", Order: pagination.SortAsc},
+	})
+	require.NoError(t, err)
+	require.EqualValues(t, 1, page.TotalItems)
+	require.Len(t, items, 1)
+	assert.Equal(t, "archived-demo", items[0].Name)
+	assert.True(t, items[0].IsArchived)
+
+	items, page, err = svc.ListProjects(ctx, pagination.QueryParams{
+		Filters:          map[string]string{"archived": "all"},
+		PaginationParams: pagination.PaginationParams{Limit: -1},
+		SortParams:       pagination.SortParams{Sort: "name", Order: pagination.SortAsc},
+	})
+	require.NoError(t, err)
+	require.EqualValues(t, 2, page.TotalItems)
+	require.Len(t, items, 2)
+	assert.Equal(t, []string{"active-demo", "archived-demo"}, []string{items[0].Name, items[1].Name})
+}
+
+func TestProjectService_ArchiveProject_RequiresStoppedProject(t *testing.T) {
+	db := setupProjectTestDB(t)
+	ctx := context.Background()
+
+	projectsRoot := t.TempDir()
+	settingsService, err := NewSettingsService(ctx, db)
+	require.NoError(t, err)
+	require.NoError(t, settingsService.SetStringSetting(ctx, "projectsDirectory", projectsRoot))
+
+	projectPath := createComposeProjectDir(t, projectsRoot, "running-demo")
+	require.NoError(t, db.Create(&models.Project{
+		BaseModel:    models.BaseModel{ID: "project-running"},
+		Name:         "running-demo",
+		DirName:      ptr("running-demo"),
+		Path:         projectPath,
+		Status:       models.ProjectStatusRunning,
+		RunningCount: 1,
+	}).Error)
+
+	svc := NewProjectService(db, settingsService, nil, nil, nil, nil, config.Load())
+	err = svc.ArchiveProject(ctx, "project-running", models.User{BaseModel: models.BaseModel{ID: "user-1"}, Username: "tester"})
+	require.Error(t, err)
+	var stoppedErr *common.ProjectMustBeStoppedError
+	assert.ErrorAs(t, err, &stoppedErr)
+
+	var stored models.Project
+	require.NoError(t, db.First(&stored, "id = ?", "project-running").Error)
+	assert.False(t, stored.IsArchived)
+	assert.Nil(t, stored.ArchivedAt)
+}
+
+func TestProjectService_ArchiveProject_TogglesArchiveFlag(t *testing.T) {
+	db := setupProjectTestDB(t)
+	ctx := context.Background()
+
+	projectsRoot := t.TempDir()
+	settingsService, err := NewSettingsService(ctx, db)
+	require.NoError(t, err)
+	require.NoError(t, settingsService.SetStringSetting(ctx, "projectsDirectory", projectsRoot))
+
+	projectPath := createComposeProjectDir(t, projectsRoot, "stopped-demo")
+	require.NoError(t, db.Create(&models.Project{
+		BaseModel: models.BaseModel{ID: "project-stopped"},
+		Name:      "stopped-demo",
+		DirName:   ptr("stopped-demo"),
+		Path:      projectPath,
+		Status:    models.ProjectStatusStopped,
+	}).Error)
+
+	svc := NewProjectService(db, settingsService, nil, nil, nil, nil, config.Load())
+	user := models.User{BaseModel: models.BaseModel{ID: "user-1"}, Username: "tester"}
+
+	require.NoError(t, svc.ArchiveProject(ctx, "project-stopped", user))
+	var stored models.Project
+	require.NoError(t, db.First(&stored, "id = ?", "project-stopped").Error)
+	assert.True(t, stored.IsArchived)
+	assert.NotNil(t, stored.ArchivedAt)
+
+	require.NoError(t, svc.UnarchiveProject(ctx, "project-stopped", user))
+	var unarchived models.Project
+	require.NoError(t, db.First(&unarchived, "id = ?", "project-stopped").Error)
+	assert.False(t, unarchived.IsArchived)
+	assert.Nil(t, unarchived.ArchivedAt)
 }
 
 func TestProjectService_MapProjectToDto_SetsRedeployDisabledFromRuntimeServices(t *testing.T) {
@@ -3074,7 +3434,7 @@ func TestProjectService_GetProjectDetails_UsesGitOpsCustomComposeFilename(t *tes
 	assert.Equal(t, composeContent, composeFromContent)
 	assert.Equal(t, "TZ=UTC\n", envFromContent)
 
-	details, err := svc.GetProjectDetails(ctx, syncProjectID)
+	details, err := svc.GetProjectDetails(ctx, syncProjectID, projecttypes.AllDetails())
 	require.NoError(t, err)
 	assert.Equal(t, "radarr.yaml", details.ComposeFileName)
 	assert.Equal(t, composeContent, details.ComposeContent)
@@ -3138,6 +3498,56 @@ func createComposeProjectDir(t *testing.T, root, name string) string {
 	require.NoError(t, os.WriteFile(filepath.Join(projectPath, "compose.yaml"), []byte("services:\n  app:\n    image: nginx:alpine\n"), 0o644))
 
 	return projectPath
+}
+
+func newProjectRuntimeDockerServerInternal(t *testing.T, containers []container.Summary) *httptest.Server {
+	t.Helper()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/_ping"):
+			_, _ = io.WriteString(w, "OK")
+		case strings.HasSuffix(r.URL.Path, "/version"):
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"ApiVersion":    "1.41",
+				"MinAPIVersion": "1.24",
+				"Version":       "24.0.0",
+			})
+		case strings.HasSuffix(r.URL.Path, "/containers/json"):
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(containers)
+		case strings.Contains(r.URL.Path, "/containers/") && strings.HasSuffix(r.URL.Path, "/json"):
+			containerID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path[strings.LastIndex(r.URL.Path, "/containers/"):], "/containers/"), "/json")
+			for _, c := range containers {
+				if c.ID != containerID {
+					continue
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(container.InspectResponse{
+					ID: c.ID,
+					State: &container.State{
+						Status:  c.State,
+						Running: c.State == container.StateRunning,
+					},
+				})
+				return
+			}
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+	return server
+}
+
+func dockerHostFromProjectRuntimeServerURLInternal(t *testing.T, serverURL string) string {
+	t.Helper()
+
+	parsed, err := url.Parse(serverURL)
+	require.NoError(t, err)
+	return "tcp://" + parsed.Host
 }
 
 //go:fix inline

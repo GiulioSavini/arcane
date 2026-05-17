@@ -12,13 +12,11 @@ WORKDIR /build
 COPY pnpm-lock.yaml pnpm-workspace.yaml package.json ./
 COPY frontend/package.json ./frontend/package.json
 
-RUN --mount=type=cache,id=pnpm,target=/pnpm/store \
-    pnpm fetch
+RUN --mount=type=cache,id=arcane-pnpm-v2,target=/pnpm/store,sharing=locked \
+    pnpm fetch && \
+    pnpm install -r --offline --frozen-lockfile
 
 COPY frontend ./frontend
-
-RUN --mount=type=cache,id=pnpm,target=/pnpm/store \
-    pnpm install -r --offline --frozen-lockfile
 
 ENV BUILD_PATH=dist
 ENV NODE_OPTIONS="--max-old-space-size=4096"
@@ -35,14 +33,15 @@ ARG BUILD_TIME="unknown"
 WORKDIR /build
 
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git tzdata jq \
-&& apt-get clean && rm -rf /var/lib/apt/lists/*
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 COPY go.work ./
 COPY types ./types
 COPY cli ./cli
 COPY backend/go.mod backend/go.sum ./backend/
 WORKDIR /build/backend
-RUN --mount=type=cache,target=/go/pkg/mod go mod download
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod download
 COPY backend ./
 COPY .arcane.json ../arcane.json
 
@@ -72,11 +71,7 @@ ARG VERSION
 ARG REVISION
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl tzdata tar gzip \
-    vainfo clinfo libdrm2 libsystemd0 \
-    && if [ "$TARGETARCH" = "amd64" ]; then \
-        apt-get install -y --no-install-recommends intel-gpu-tools; \
-    fi \
+    && apt-get install -y --no-install-recommends ca-certificates curl tzdata tar gzip libdrm2 \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 ENV GIN_MODE=release

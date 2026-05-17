@@ -17,24 +17,25 @@ import (
 	"github.com/getarcaneapp/arcane/backend/internal/database"
 	"github.com/getarcaneapp/arcane/backend/internal/models"
 	"github.com/getarcaneapp/arcane/backend/pkg/libarcane/crypto"
+	imageupdatecore "github.com/getarcaneapp/arcane/backend/pkg/libarcane/imageupdate"
+	utilsregistry "github.com/getarcaneapp/arcane/backend/pkg/libarcane/registryauth"
 	"github.com/getarcaneapp/arcane/backend/pkg/pagination"
 	"github.com/getarcaneapp/arcane/backend/pkg/utils"
 	"github.com/getarcaneapp/arcane/backend/pkg/utils/cache"
-	utilsdistribution "github.com/getarcaneapp/arcane/backend/pkg/utils/distribution"
-	"github.com/getarcaneapp/arcane/backend/pkg/utils/imagedigest"
 	"github.com/getarcaneapp/arcane/backend/pkg/utils/mapper"
-	utilsregistry "github.com/getarcaneapp/arcane/backend/pkg/utils/registry"
 	"github.com/getarcaneapp/arcane/types/containerregistry"
 	dockerregistry "github.com/moby/moby/api/types/registry"
 	"github.com/moby/moby/client"
 )
 
 const (
-	registryCacheTTL                  = 30 * time.Minute
-	registryTypeGeneric        string = "generic"
-	registryTypeECR            string = "ecr"
-	registryPullCountKeyPrefix        = "container_registry:pulls:"
-	registryRateLimitKeyPrefix        = "container_registry:rate_limits:"
+	registryCacheTTL                    = 30 * time.Minute
+	registryTypeGeneric          string = "generic"
+	registryTypeECR              string = "ecr"
+	registryPullCountKeyPrefix          = "container_registry:pulls:"
+	registryRateLimitKeyPrefix          = "container_registry:rate_limits:"
+	dockerHubRateLimitRepository        = "ratelimitpreview/test"
+	dockerHubRateLimitTag               = "latest"
 )
 
 type RegistryDaemonClient interface {
@@ -59,8 +60,8 @@ type resolvedRegistryCredential struct {
 }
 
 type registryRateLimitCacheEntryInternal struct {
-	RateLimit utilsdistribution.RateLimitInfo `json:"rateLimit"`
-	CheckedAt time.Time                       `json:"checkedAt"`
+	RateLimit imageupdatecore.RateLimitInfo `json:"rateLimit"`
+	CheckedAt time.Time                     `json:"checkedAt"`
 }
 
 type ContainerRegistryService struct {
@@ -79,7 +80,7 @@ func NewContainerRegistryService(db *database.DB, dockerClient registryDaemonGet
 	return &ContainerRegistryService{
 		db:                     db,
 		dockerClient:           dockerClient,
-		distributionHTTPClient: utilsdistribution.NewRegistryHTTPClient(),
+		distributionHTTPClient: imageupdatecore.NewRegistryHTTPClient(),
 		cache:                  make(map[string]*cache.Cache[string]),
 		kvService:              kvService,
 	}
@@ -516,7 +517,7 @@ func (s *ContainerRegistryService) getObservedPullsInternal(ctx context.Context,
 	return value
 }
 
-func (s *ContainerRegistryService) dockerHubCredentialForRegistryInternal(reg models.ContainerRegistry) (*utilsdistribution.Credentials, string, string, error) {
+func (s *ContainerRegistryService) dockerHubCredentialForRegistryInternal(reg models.ContainerRegistry) (*imageupdatecore.Credentials, string, string, error) {
 	if reg.RegistryType != registryTypeGeneric {
 		return nil, "anonymous", "", nil
 	}
@@ -536,21 +537,17 @@ func (s *ContainerRegistryService) dockerHubCredentialForRegistryInternal(reg mo
 		return nil, "anonymous", "", nil
 	}
 
-	return &utilsdistribution.Credentials{
+	return &imageupdatecore.Credentials{
 		Username: username,
 		Token:    token,
 	}, "credential", username, nil
 }
 
-func (s *ContainerRegistryService) fetchDockerHubRateLimitInternal(ctx context.Context, credential *utilsdistribution.Credentials) (*utilsdistribution.RateLimitInfo, error) {
-	if s.distributionHTTPClient == nil {
-		return utilsdistribution.FetchDockerHubRateLimit(ctx, credential)
-	}
-
-	return utilsdistribution.FetchDockerHubRateLimitWithHTTPClient(ctx, credential, s.distributionHTTPClient)
+func (s *ContainerRegistryService) fetchDockerHubRateLimitInternal(ctx context.Context, credential *imageupdatecore.Credentials) (*imageupdatecore.RateLimitInfo, error) {
+	return imageupdatecore.FetchRegistryRateLimit(ctx, "docker.io", dockerHubRateLimitRepository, dockerHubRateLimitTag, credential, s.distributionHTTPClient)
 }
 
-func (s *ContainerRegistryService) getCachedRateLimitInternal(ctx context.Context, registryID string) (*utilsdistribution.RateLimitInfo, time.Time, bool) {
+func (s *ContainerRegistryService) getCachedRateLimitInternal(ctx context.Context, registryID string) (*imageupdatecore.RateLimitInfo, time.Time, bool) {
 	if s.kvService == nil || registryID == "" {
 		return nil, time.Time{}, false
 	}
@@ -576,7 +573,7 @@ func (s *ContainerRegistryService) getCachedRateLimitInternal(ctx context.Contex
 	return &entry.RateLimit, entry.CheckedAt, true
 }
 
-func (s *ContainerRegistryService) setCachedRateLimitInternal(ctx context.Context, registryID string, rateLimit *utilsdistribution.RateLimitInfo, checkedAt time.Time) {
+func (s *ContainerRegistryService) setCachedRateLimitInternal(ctx context.Context, registryID string, rateLimit *imageupdatecore.RateLimitInfo, checkedAt time.Time) {
 	if s.kvService == nil || registryID == "" || rateLimit == nil {
 		return
 	}
@@ -731,7 +728,7 @@ func (s *ContainerRegistryService) GetImageDigest(ctx context.Context, imageRef 
 }
 
 func (s *ContainerRegistryService) inspectImageDigestInternal(ctx context.Context, imageRef string, externalCreds []containerregistry.Credential) (*registryDigestResult, error) {
-	parts, err := normalizeDistributionReferenceInternal(imageRef)
+	parts, err := imageupdatecore.NormalizeReference(imageRef)
 	if err != nil {
 		return nil, err
 	}
@@ -766,9 +763,16 @@ func (s *ContainerRegistryService) inspectImageDigestViaDaemonInternal(ctx conte
 		return nil, err
 	}
 
+	if isDockerHubRegistryInternal(registryHost) {
+		credentials, credErr := s.getMatchingRegistryCredentialsInternal(ctx, registryHost, externalCreds)
+		if credErr == nil && len(credentials) > 0 {
+			return s.inspectImageDigestWithCredentialsInternal(ctx, dockerClient, normalizedRef, registryHost, credentials, nil)
+		}
+	}
+
 	inspectResult, err := dockerClient.DistributionInspect(ctx, normalizedRef, client.DistributionInspectOptions{})
 	if err == nil {
-		digest, normalizeErr := imagedigest.Normalize(inspectResult.Descriptor.Digest.String())
+		digest, normalizeErr := imageupdatecore.NormalizeDigest(inspectResult.Descriptor.Digest.String())
 		if normalizeErr != nil {
 			return nil, fmt.Errorf("distribution inspect returned invalid digest for %s: %w", normalizedRef, normalizeErr)
 		}
@@ -789,7 +793,11 @@ func (s *ContainerRegistryService) inspectImageDigestViaDaemonInternal(ctx conte
 			fmt.Errorf("distribution inspect: anonymous access unauthorized; credential lookup failed: %w", errors.Join(err, credErr))
 	}
 
-	lastErr := err
+	return s.inspectImageDigestWithCredentialsInternal(ctx, dockerClient, normalizedRef, registryHost, credentials, err)
+}
+
+func (s *ContainerRegistryService) inspectImageDigestWithCredentialsInternal(ctx context.Context, dockerClient RegistryDaemonClient, normalizedRef, registryHost string, credentials []resolvedRegistryCredential, previousErr error) (*registryDigestResult, error) {
+	lastErr := previousErr
 	var lastCred resolvedRegistryCredential
 	for _, credential := range credentials {
 		lastCred = credential
@@ -798,11 +806,11 @@ func (s *ContainerRegistryService) inspectImageDigestViaDaemonInternal(ctx conte
 			return nil, fmt.Errorf("encode registry auth header for %s: %w", registryHost, encodeErr)
 		}
 
-		inspectResult, err = dockerClient.DistributionInspect(ctx, normalizedRef, client.DistributionInspectOptions{
+		inspectResult, err := dockerClient.DistributionInspect(ctx, normalizedRef, client.DistributionInspectOptions{
 			EncodedRegistryAuth: authHeader,
 		})
 		if err == nil {
-			digest, normalizeErr := imagedigest.Normalize(inspectResult.Descriptor.Digest.String())
+			digest, normalizeErr := imageupdatecore.NormalizeDigest(inspectResult.Descriptor.Digest.String())
 			if normalizeErr != nil {
 				return nil, fmt.Errorf("distribution inspect returned invalid digest for %s: %w", normalizedRef, normalizeErr)
 			}
@@ -830,6 +838,9 @@ func (s *ContainerRegistryService) inspectImageDigestViaDaemonInternal(ctx conte
 		partial.AuthMethod = "credential"
 		partial.AuthUsername = lastCred.Username
 		partial.UsedCredential = true
+	}
+	if lastErr == nil {
+		return partial, fmt.Errorf("distribution inspect failed for %s: no credentials available", normalizedRef)
 	}
 	return partial, fmt.Errorf("distribution inspect failed for %s: %w", normalizedRef, lastErr)
 }
@@ -1167,12 +1178,8 @@ func (s *ContainerRegistryService) deleteUnsyncedInternal(ctx context.Context, e
 	return nil
 }
 
-func normalizeDistributionReferenceInternal(imageRef string) (*utilsdistribution.Reference, error) {
-	return utilsdistribution.NormalizeReference(imageRef)
-}
-
 func normalizeImageReferenceForDistributionInternal(imageRef string) (string, string, error) {
-	parts, err := normalizeDistributionReferenceInternal(imageRef)
+	parts, err := imageupdatecore.NormalizeReference(imageRef)
 	if err != nil {
 		return "", "", err
 	}
@@ -1213,6 +1220,8 @@ func isUnauthorizedRegistryErrorInternal(err error) bool {
 		"no basic auth credentials",
 		"access denied",
 		"incorrect username or password",
+		"toomanyrequests",
+		"unauthenticated pull rate limit",
 		"status: 401",
 		"status 401",
 		"status: 403",
@@ -1228,34 +1237,28 @@ func isUnauthorizedRegistryErrorInternal(err error) bool {
 	return false
 }
 
+func isDockerHubRegistryInternal(registryHost string) bool {
+	return utilsregistry.NormalizeRegistryForComparison(registryHost) == "docker.io"
+}
+
 func isDistributionFallbackEligibleInternal(err error) bool {
 	if err == nil {
 		return false
 	}
 
-	return utilsdistribution.IsFallbackEligibleDaemonError(err)
+	return imageupdatecore.IsFallbackEligibleDaemonError(err)
 }
 
 func (s *ContainerRegistryService) fetchDigestFromRegistryInternal(ctx context.Context, registryHost, repository, tag string, credential *resolvedRegistryCredential) (string, error) {
-	var distributionCredential *utilsdistribution.Credentials
+	var distributionCredential *imageupdatecore.Credentials
 	if credential != nil {
-		distributionCredential = &utilsdistribution.Credentials{
+		distributionCredential = &imageupdatecore.Credentials{
 			Username: strings.TrimSpace(credential.Username),
 			Token:    strings.TrimSpace(credential.Token),
 		}
 	}
 
-	if s.distributionHTTPClient == nil {
-		return utilsdistribution.FetchDigest(
-			ctx,
-			registryHost,
-			repository,
-			tag,
-			distributionCredential,
-		)
-	}
-
-	return utilsdistribution.FetchDigestWithHTTPClient(
+	return imageupdatecore.FetchDigest(
 		ctx,
 		registryHost,
 		repository,

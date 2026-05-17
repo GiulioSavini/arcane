@@ -12,9 +12,10 @@ import (
 	"time"
 
 	tunnelpb "github.com/getarcaneapp/arcane/backend/pkg/libarcane/edge/proto/tunnel/v1"
-	"github.com/gin-gonic/gin"
+	"github.com/getarcaneapp/arcane/backend/pkg/remenv"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
+	"github.com/labstack/echo/v4"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
@@ -132,15 +133,16 @@ func (s *TunnelServer) SetConfig(cfg *Config) {
 
 // HandleConnect is the WebSocket handler for edge agent connections.
 // This is registered at /api/tunnel/connect.
-func (s *TunnelServer) HandleConnect(c *gin.Context) {
-	ctx := c.Request.Context()
+func (s *TunnelServer) HandleConnect(c echo.Context) error {
+	req := c.Request()
+	ctx := req.Context()
 	callbackCtx := context.WithoutCancel(ctx)
 
 	// Upgrade to WebSocket.
-	conn, err := tunnelUpgrader.Upgrade(c.Writer, c.Request, nil)
+	conn, err := tunnelUpgrader.Upgrade(c.Response().Writer, req, nil)
 	if err != nil {
 		slog.ErrorContext(ctx, "Failed to upgrade edge tunnel connection", "error", err)
-		return
+		return nil
 	}
 
 	tunnelConn := NewTunnelConn(conn)
@@ -148,15 +150,15 @@ func (s *TunnelServer) HandleConnect(c *gin.Context) {
 	if err != nil {
 		slog.WarnContext(ctx, "Failed to receive websocket edge tunnel registration", "error", err)
 		_ = tunnelConn.Close()
-		return
+		return nil
 	}
 	if firstMsg == nil || firstMsg.Type != MessageTypeRegister {
 		slog.WarnContext(ctx, "Websocket edge tunnel missing register message")
 		_ = tunnelConn.Close()
-		return
+		return nil
 	}
 
-	token := tokenFromHeadersInternal(c.Request)
+	token := tokenFromHeadersInternal(req)
 	if token == "" {
 		// Header auth can be unavailable after the WebSocket upgrade path, so
 		// the register message remains a fallback environment lookup claim.
@@ -168,7 +170,7 @@ func (s *TunnelServer) HandleConnect(c *gin.Context) {
 		slog.WarnContext(ctx, "Edge tunnel connection attempt without token")
 		_ = tunnelConn.Send(&TunnelMessage{Type: MessageTypeRegisterResponse, Accepted: false, Error: "agent token required"})
 		_ = tunnelConn.Close()
-		return
+		return nil
 	}
 
 	envID, err := s.resolveEnvironment(ctx, token)
@@ -176,44 +178,43 @@ func (s *TunnelServer) HandleConnect(c *gin.Context) {
 		slog.WarnContext(ctx, "Failed to resolve agent token", "error", err)
 		_ = tunnelConn.Send(&TunnelMessage{Type: MessageTypeRegisterResponse, Accepted: false, Error: "invalid agent token"})
 		_ = tunnelConn.Close()
-		return
+		return nil
 	}
-	if err := s.requireRequestCertificateIdentityInternal(c.Request, envID); err != nil {
+	if err := s.requireRequestCertificateIdentityInternal(req, envID); err != nil {
 		slog.WarnContext(ctx, "Rejected websocket edge tunnel with mismatched client certificate", "environment_id", envID, "error", err)
 		_ = tunnelConn.Send(&TunnelMessage{Type: MessageTypeRegisterResponse, Accepted: false, Error: "client certificate does not match environment"})
 		_ = tunnelConn.Close()
-		return
+		return nil
 	}
 
 	tunnel := NewAgentTunnelWithConn(envID, tunnelConn)
-	s.populateSessionMetadata(tunnel, firstMsg, requestSecurityModeInternal(c.Request))
+	s.populateSessionMetadata(tunnel, firstMsg, requestSecurityModeInternal(req))
 	s.manageConnectedTunnel(ctx, callbackCtx, tunnel)
+	return nil
 }
 
 // HandleMTLSEnroll returns manager-generated edge client certificates for the
 // calling environment when generated edge mTLS is enabled. The response includes
 // private key material, so response-body logging must not be enabled here.
-func (s *TunnelServer) HandleMTLSEnroll(c *gin.Context) {
-	ctx := c.Request.Context()
-	c.Header("Cache-Control", "no-store")
-	c.Header("Pragma", "no-cache")
+func (s *TunnelServer) HandleMTLSEnroll(c echo.Context) error {
+	req := c.Request()
+	ctx := req.Context()
+	c.Response().Header().Set("Cache-Control", "no-store")
+	c.Response().Header().Set("Pragma", "no-cache")
 
 	if s == nil || s.cfg == nil || !shouldUseGeneratedManagerCAInternal(s.cfg) {
-		c.JSON(http.StatusNotFound, gin.H{"error": "edge mTLS enrollment is not available"})
-		return
+		return c.JSON(http.StatusNotFound, map[string]any{"error": "edge mTLS enrollment is not available"})
 	}
 
-	token := tokenFromHeadersInternal(c.Request)
+	token := tokenFromHeadersInternal(req)
 	if token == "" {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "agent token required"})
-		return
+		return c.JSON(http.StatusUnauthorized, map[string]any{"error": "agent token required"})
 	}
 
 	envID, err := s.resolveEnvironment(ctx, token)
 	if err != nil {
 		slog.WarnContext(ctx, "Failed to resolve edge token for mTLS enrollment", "error", err)
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid agent token"})
-		return
+		return c.JSON(http.StatusUnauthorized, map[string]any{"error": "invalid agent token"})
 	}
 
 	envName := ""
@@ -230,51 +231,45 @@ func (s *TunnelServer) HandleMTLSEnroll(c *gin.Context) {
 	previouslyEnrolled, enrollmentLimited, err := managerMTLSEnrollmentStateInternal(s.cfg, envID, now)
 	if err != nil {
 		slog.ErrorContext(ctx, "Failed to read edge mTLS enrollment state", "environment_id", envID, "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read edge mTLS enrollment state"})
-		return
+		return c.JSON(http.StatusInternalServerError, map[string]any{"error": "failed to read edge mTLS enrollment state"})
 	}
 	if enrollmentLimited {
 		cachedAssets, cacheErr := GenerateManagerClientMTLSAssetsWithContext(ctx, s.cfg, envID, envName)
 		if cacheErr == nil && cachedAssets != nil {
-			slog.InfoContext(ctx, "Served cached edge mTLS enrollment during cooldown", "environment_id", envID, "remote_addr", c.ClientIP())
-			c.JSON(http.StatusOK, enrollMTLSResponse{Files: cachedAssets.Files})
-			return
+			slog.InfoContext(ctx, "Served cached edge mTLS enrollment during cooldown", "environment_id", envID, "remote_addr", c.RealIP())
+			return c.JSON(http.StatusOK, enrollMTLSResponse{Files: cachedAssets.Files})
 		}
 		if cacheErr != nil {
 			slog.WarnContext(ctx, "Failed to re-serve cached edge mTLS enrollment during cooldown", "environment_id", envID, "error", cacheErr)
 		}
-		slog.WarnContext(ctx, "Rejected repeated edge mTLS enrollment during cooldown", "environment_id", envID, "remote_addr", c.ClientIP())
-		c.JSON(http.StatusTooManyRequests, gin.H{"error": "edge mTLS enrollment was recently completed; retry later"})
-		return
+		slog.WarnContext(ctx, "Rejected repeated edge mTLS enrollment during cooldown", "environment_id", envID, "remote_addr", c.RealIP())
+		return c.JSON(http.StatusTooManyRequests, map[string]any{"error": "edge mTLS enrollment was recently completed; retry later"})
 	}
 
 	assets, err := GenerateManagerClientMTLSAssetsWithContext(ctx, s.cfg, envID, envName)
 	if err != nil {
 		slog.ErrorContext(ctx, "Failed to generate edge mTLS enrollment assets", "environment_id", envID, "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate edge mTLS assets"})
-		return
+		return c.JSON(http.StatusInternalServerError, map[string]any{"error": "failed to generate edge mTLS assets"})
 	}
 	if assets == nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "edge mTLS enrollment assets unavailable"})
-		return
+		return c.JSON(http.StatusNotFound, map[string]any{"error": "edge mTLS enrollment assets unavailable"})
 	}
 	assets.Reenrolled = previouslyEnrolled
 	if err := recordManagerMTLSEnrollmentInternal(s.cfg, envID, now); err != nil {
 		slog.ErrorContext(ctx, "Failed to record edge mTLS enrollment state", "environment_id", envID, "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to record edge mTLS enrollment state"})
-		return
+		return c.JSON(http.StatusInternalServerError, map[string]any{"error": "failed to record edge mTLS enrollment state"})
 	}
 	if assets.Reenrolled {
-		slog.WarnContext(ctx, "Edge mTLS certificate assets re-enrolled", "environment_id", envID, "remote_addr", c.ClientIP(), "cert_issued", assets.CertIssued)
+		slog.WarnContext(ctx, "Edge mTLS certificate assets re-enrolled", "environment_id", envID, "remote_addr", c.RealIP(), "cert_issued", assets.CertIssued)
 	} else {
-		slog.InfoContext(ctx, "Edge mTLS certificate assets enrolled", "environment_id", envID, "remote_addr", c.ClientIP(), "cert_issued", assets.CertIssued)
+		slog.InfoContext(ctx, "Edge mTLS certificate assets enrolled", "environment_id", envID, "remote_addr", c.RealIP(), "cert_issued", assets.CertIssued)
 	}
 
 	if s.enrollmentCallback != nil {
-		s.enrollmentCallback(context.WithoutCancel(ctx), envID, c.ClientIP(), assets.CertIssued, assets.CAGenerated, assets.Reenrolled)
+		s.enrollmentCallback(context.WithoutCancel(ctx), envID, c.RealIP(), assets.CertIssued, assets.CAGenerated, assets.Reenrolled)
 	}
 
-	c.JSON(http.StatusOK, enrollMTLSResponse{Files: assets.Files})
+	return c.JSON(http.StatusOK, enrollMTLSResponse{Files: assets.Files})
 }
 
 // Connect is the gRPC bidi stream handler for edge agent connections.
@@ -299,7 +294,7 @@ func (s *TunnelServer) Connect(stream grpc.BidiStreamingServer[tunnelpb.AgentMes
 	if !ok || envID == "" {
 		token := strings.TrimSpace(register.GetAgentToken())
 		if token == "" {
-			token = tokenFromMetadata(ctx)
+			token = tokenFromMetadataInternal(ctx)
 		}
 
 		var resolveErr error
@@ -361,7 +356,7 @@ func (s *TunnelServer) resolveEnvironment(ctx context.Context, token string) (st
 	return s.resolver(ctx, token)
 }
 
-func tokenFromMetadata(ctx context.Context) string {
+func tokenFromMetadataInternal(ctx context.Context) string {
 	md, ok := metadata.FromIncomingContext(ctx)
 	if !ok {
 		return ""
@@ -378,19 +373,36 @@ func tokenFromMetadata(ctx context.Context) string {
 			}
 		}
 	}
-	return ""
-}
-
-func tokenFromHeadersInternal(req *http.Request) string {
-	if req == nil {
-		return ""
-	}
-	for _, header := range []string{HeaderAgentToken, HeaderAPIKey} {
-		if token := strings.TrimSpace(req.Header.Get(header)); token != "" {
+	for _, value := range md.Get(strings.ToLower(HeaderAuthorization)) {
+		if token := remenv.ExtractBearerToken(value); token != "" {
 			return token
 		}
 	}
 	return ""
+}
+
+func tokenFromHeadersInternal(req *http.Request) string {
+	token, _ := tokenFromHeadersWithSourceInternal(req)
+	return token
+}
+
+// tokenFromHeadersWithSourceInternal returns the agent token along with the
+// canonical header name that supplied it. Falls back from X-Arcane-Agent-Token
+// to X-API-Key to "Authorization: Bearer <token>" so deployments behind
+// reverse proxies that strip custom X- headers can still authenticate.
+func tokenFromHeadersWithSourceInternal(req *http.Request) (string, string) {
+	if req == nil {
+		return "", ""
+	}
+	for _, header := range []string{HeaderAgentToken, HeaderAPIKey} {
+		if token := strings.TrimSpace(req.Header.Get(header)); token != "" {
+			return token, header
+		}
+	}
+	if token := remenv.ExtractBearerToken(req.Header.Get(HeaderAuthorization)); token != "" {
+		return token, HeaderAuthorization
+	}
+	return "", ""
 }
 
 func (s *TunnelServer) manageConnectedTunnel(ctx context.Context, callbackCtx context.Context, tunnel *AgentTunnel) {
@@ -585,7 +597,7 @@ func (s *TunnelServer) authStreamInterceptorInternal(ctx context.Context) grpc.S
 			return handler(srv, ss)
 		}
 
-		token := tokenFromMetadata(ss.Context())
+		token := tokenFromMetadataInternal(ss.Context())
 		envID, err := s.resolveEnvironment(ss.Context(), token)
 		if err != nil {
 			return status.Error(codes.Unauthenticated, "invalid agent token")

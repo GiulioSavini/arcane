@@ -3,6 +3,7 @@ package services
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"sort"
 	"time"
 
@@ -18,24 +19,24 @@ import (
 
 type JobRunner interface {
 	GetJob(jobID string) (schedulertypes.Job, bool)
+	RescheduleJob(ctx context.Context, job schedulertypes.Job) error
 }
 
 // JobService manages configuration for background job schedules.
 //
 // Intervals are persisted in the existing settings table as individual keys.
-// After updates, the SettingsService cache is reloaded and a callback can be
-// triggered so the running scheduler can reschedule active jobs.
+// After updates, the SettingsService cache is reloaded and active jobs are
+// rescheduled through the configured scheduler.
 //
 // NOTE: This is intentionally separate from SettingsService to keep the API
 // surface job-focused and to centralize schedule validation/rescheduling.
 type JobService struct {
-	db        *database.DB
-	settings  *SettingsService
-	cfg       *config.Config
-	scheduler JobRunner
-	location  *time.Location // Timezone for cron schedule calculations
-
-	OnJobSchedulesChanged func(ctx context.Context, changedKeys []string)
+	db           *database.DB
+	settings     *SettingsService
+	cfg          *config.Config
+	scheduler    JobRunner
+	lifecycleCtx context.Context
+	location     *time.Location // Timezone for cron schedule calculations
 }
 
 func NewJobService(db *database.DB, settings *SettingsService, cfg *config.Config) *JobService {
@@ -47,22 +48,27 @@ func NewJobService(db *database.DB, settings *SettingsService, cfg *config.Confi
 	}
 }
 
-func (s *JobService) SetScheduler(scheduler JobRunner) {
+func (s *JobService) SetScheduler(ctx context.Context, scheduler JobRunner) { //nolint:contextcheck // scheduler jobs must capture the app lifecycle context, not request contexts
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	s.lifecycleCtx = ctx
 	s.scheduler = scheduler
 }
 
 func (s *JobService) GetJobSchedules(ctx context.Context) jobschedule.Config {
 	// Use SettingsService cache for fast reads.
 	return jobschedule.Config{
-		EnvironmentHealthInterval:   s.settings.GetStringSetting(ctx, "environmentHealthInterval", "0 */2 * * * *"),
-		EventCleanupInterval:        s.settings.GetStringSetting(ctx, "eventCleanupInterval", "0 0 */6 * * *"),
-		AutoUpdateInterval:          s.settings.GetStringSetting(ctx, "autoUpdateInterval", "0 0 0 * * *"),
-		DockerClientRefreshInterval: s.settings.GetStringSetting(ctx, "dockerClientRefreshInterval", "*/30 * * * * *"),
-		PollingInterval:             s.settings.GetStringSetting(ctx, "pollingInterval", "0 */15 * * * *"),
-		ScheduledPruneInterval:      s.settings.GetStringSetting(ctx, "scheduledPruneInterval", "0 0 0 * * *"),
-		GitopsSyncInterval:          s.settings.GetStringSetting(ctx, "gitopsSyncInterval", "0 */1 * * * *"),
-		VulnerabilityScanInterval:   s.settings.GetStringSetting(ctx, "vulnerabilityScanInterval", "0 0 0 * * *"),
-		AutoHealInterval:            s.settings.GetStringSetting(ctx, "autoHealInterval", "*/30 * * * * *"),
+		EnvironmentHealthInterval:      s.settings.GetStringSetting(ctx, "environmentHealthInterval", "0 */2 * * * *"),
+		EventCleanupInterval:           s.settings.GetStringSetting(ctx, "eventCleanupInterval", "0 0 */6 * * *"),
+		ExpiredSessionsCleanupInterval: s.settings.GetStringSetting(ctx, "expiredSessionsCleanupInterval", "0 0 0 * * *"),
+		AutoUpdateInterval:             s.settings.GetStringSetting(ctx, "autoUpdateInterval", "0 0 0 * * *"),
+		DockerClientRefreshInterval:    s.settings.GetStringSetting(ctx, "dockerClientRefreshInterval", "*/30 * * * * *"),
+		PollingInterval:                s.settings.GetStringSetting(ctx, "pollingInterval", "0 */15 * * * *"),
+		ScheduledPruneInterval:         s.settings.GetStringSetting(ctx, "scheduledPruneInterval", "0 0 0 * * *"),
+		GitopsSyncInterval:             s.settings.GetStringSetting(ctx, "gitopsSyncInterval", "0 */1 * * * *"),
+		VulnerabilityScanInterval:      s.settings.GetStringSetting(ctx, "vulnerabilityScanInterval", "0 0 0 * * *"),
+		AutoHealInterval:               s.settings.GetStringSetting(ctx, "autoHealInterval", "*/30 * * * * *"),
 	}
 }
 
@@ -83,6 +89,7 @@ func (s *JobService) UpdateJobSchedules(ctx context.Context, updates jobschedule
 	}{
 		{key: "environmentHealthInterval", current: current.EnvironmentHealthInterval, update: updates.EnvironmentHealthInterval},
 		{key: "eventCleanupInterval", current: current.EventCleanupInterval, update: updates.EventCleanupInterval},
+		{key: "expiredSessionsCleanupInterval", current: current.ExpiredSessionsCleanupInterval, update: updates.ExpiredSessionsCleanupInterval},
 		{key: "autoUpdateInterval", current: current.AutoUpdateInterval, update: updates.AutoUpdateInterval},
 		{key: "dockerClientRefreshInterval", current: current.DockerClientRefreshInterval, update: updates.DockerClientRefreshInterval},
 		{key: "pollingInterval", current: current.PollingInterval, update: updates.PollingInterval},
@@ -135,12 +142,60 @@ func (s *JobService) UpdateJobSchedules(ctx context.Context, updates jobschedule
 			return jobschedule.Config{}, fmt.Errorf("failed to reload settings after job schedule update: %w", err)
 		}
 
-		if s.OnJobSchedulesChanged != nil {
-			s.OnJobSchedulesChanged(ctx, changedKeys)
-		}
+		s.RescheduleJobsForSettingKeys(ctx, changedKeys)
 	}
 
 	return s.GetJobSchedules(ctx), nil
+}
+
+func (s *JobService) RescheduleJobsForSettingKeys(ctx context.Context, changedKeys []string) {
+	if s == nil || s.scheduler == nil || len(changedKeys) == 0 {
+		return
+	}
+
+	changed := make(map[string]struct{}, len(changedKeys))
+	for _, key := range changedKeys {
+		changed[key] = struct{}{}
+	}
+
+	for jobID, jobMeta := range meta.GetAllJobMetadata() {
+		if !jobMetadataAffectedBySettingInternal(jobMeta, changed) {
+			continue
+		}
+		if s.cfg != nil && s.cfg.AgentMode && jobMeta.ManagerOnly {
+			slog.DebugContext(ctx, "Skipping manager-only job reschedule in agent mode", "job", jobID)
+			continue
+		}
+
+		job, ok := s.scheduler.GetJob(jobID)
+		if !ok {
+			slog.DebugContext(ctx, "Skipping reschedule for unregistered job", "job", jobID)
+			continue
+		}
+
+		slog.DebugContext(ctx, "Processing job setting change", "job", jobID, "settingsKey", jobMeta.SettingsKey, "enabledKey", jobMeta.EnabledKey)
+		rescheduleCtx := ctx //nolint:contextcheck // fallback only; lifecycle context is preferred so cron jobs outlive HTTP requests
+		if s.lifecycleCtx != nil {
+			rescheduleCtx = s.lifecycleCtx
+		}
+		if err := s.scheduler.RescheduleJob(rescheduleCtx, job); err != nil {
+			slog.WarnContext(ctx, "Failed to reschedule job", "job", jobID, "error", err)
+		}
+	}
+}
+
+func jobMetadataAffectedBySettingInternal(jobMeta meta.JobMetadata, changed map[string]struct{}) bool {
+	if jobMeta.SettingsKey != "" {
+		if _, ok := changed[jobMeta.SettingsKey]; ok {
+			return true
+		}
+	}
+	if jobMeta.EnabledKey != "" {
+		if _, ok := changed[jobMeta.EnabledKey]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *JobService) ListJobs(ctx context.Context) (*jobschedule.JobListResponse, error) {
@@ -226,15 +281,16 @@ func (s *JobService) getJobScheduleInternal(ctx context.Context, meta meta.JobMe
 	}
 
 	defaultSchedules := map[string]string{
-		"environmentHealthInterval":   "0 */2 * * * *",
-		"eventCleanupInterval":        "0 0 */6 * * *",
-		"autoUpdateInterval":          "0 0 0 * * *",
-		"dockerClientRefreshInterval": "*/30 * * * * *",
-		"pollingInterval":             "0 */15 * * * *",
-		"scheduledPruneInterval":      "0 0 0 * * *",
-		"gitopsSyncInterval":          "0 */1 * * * *",
-		"vulnerabilityScanInterval":   "0 0 0 * * *",
-		"autoHealInterval":            "*/30 * * * * *",
+		"environmentHealthInterval":      "0 */2 * * * *",
+		"eventCleanupInterval":           "0 0 */6 * * *",
+		"expiredSessionsCleanupInterval": "0 0 0 * * *",
+		"autoUpdateInterval":             "0 0 0 * * *",
+		"dockerClientRefreshInterval":    "*/30 * * * * *",
+		"pollingInterval":                "0 */15 * * * *",
+		"scheduledPruneInterval":         "0 0 0 * * *",
+		"gitopsSyncInterval":             "0 */1 * * * *",
+		"vulnerabilityScanInterval":      "0 0 0 * * *",
+		"autoHealInterval":               "*/30 * * * * *",
 	}
 
 	defaultSchedule := defaultSchedules[meta.SettingsKey]

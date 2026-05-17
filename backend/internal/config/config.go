@@ -53,8 +53,12 @@ type Config struct {
 	OidcAutoRedirectToProvider bool   `env:"OIDC_AUTO_REDIRECT_TO_PROVIDER" default:"false"`
 	OidcProviderName           string `env:"OIDC_PROVIDER_NAME" default:""`
 	OidcProviderLogoUrl        string `env:"OIDC_PROVIDER_LOGO_URL" default:""`
+	OidcMobileRedirectUris     string `env:"OIDC_MOBILE_REDIRECT_URIS" default:"arcane-mobile://oidc-callback"`
 
+	PUID                    string `env:"PUID" default:""`
+	PGID                    string `env:"PGID" default:""`
 	DockerHost              string `env:"DOCKER_HOST" default:"unix:///var/run/docker.sock"`
+	DockerConfig            string `env:"DOCKER_CONFIG" default:""`
 	ProjectsDirectory       string `env:"PROJECTS_DIRECTORY" default:"/app/data/projects"`
 	ProjectScanMaxDepth     int    `env:"PROJECT_SCAN_MAX_DEPTH" default:"3"`
 	ProjectScanSkipDirs     string `env:"PROJECT_SCAN_SKIP_DIRS" default:".git,node_modules,vendor,.venv,venv,__pycache__,.cache,dist,build,target,.next,.nuxt,.svelte-kit"`
@@ -77,6 +81,8 @@ type Config struct {
 	EdgeMTLSKeyFile         string `env:"EDGE_MTLS_KEY_FILE" default:""`
 	EdgeMTLSServerName      string `env:"EDGE_MTLS_SERVER_NAME" default:""`
 	EdgeMTLSAssetsDir       string `env:"EDGE_MTLS_ASSETS_DIR" default:""`
+
+	TrustedProxies string `env:"TRUSTED_PROXIES" default:""`
 
 	FilePerm   os.FileMode `env:"FILE_PERM" default:"0644"`
 	DirPerm    os.FileMode `env:"DIR_PERM" default:"0755"`

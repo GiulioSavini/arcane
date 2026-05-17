@@ -104,11 +104,27 @@ export class ProjectService extends BaseAPIService {
 	}
 
 	async getProjectForEnvironment(environmentId: string, projectId: string): Promise<Project> {
-		const response = await this.handleResponse<{ project?: Project; success?: boolean }>(
-			this.api.get(`/environments/${environmentId}/projects/${projectId}`)
-		);
+		const basePath = `/environments/${environmentId}/projects/${projectId}`;
+		const [summary, compose, files, runtime, updates] = await Promise.all([
+			this.getProjectSection(basePath),
+			this.getProjectSection(`${basePath}/compose`),
+			this.getProjectSection(`${basePath}/files`),
+			this.getProjectSection(`${basePath}/runtime`),
+			this.getProjectSection(`${basePath}/updates`)
+		]);
 
-		return response.project ? response.project : (response as Project);
+		return {
+			...summary,
+			...compose,
+			...files,
+			...runtime,
+			updateInfo: updates.updateInfo ?? compose.updateInfo ?? summary.updateInfo
+		};
+	}
+
+	private async getProjectSection(path: string): Promise<Project> {
+		const response = await this.handleResponse<{ project?: Project; success?: boolean } | Project>(this.api.get(path));
+		return 'project' in response && response.project ? response.project : (response as Project);
 	}
 
 	async getProjectFile(projectId: string, relativePath: string): Promise<IncludeFile> {
@@ -158,9 +174,19 @@ export class ProjectService extends BaseAPIService {
 		return this.handleResponse(this.api.put(`/environments/${envId}/projects/${projectId}/includes`, payload));
 	}
 
-	async restartProject(projectId: string): Promise<Project> {
+	async restartProject(projectId: string): Promise<void> {
 		const envId = await environmentStore.getCurrentEnvironmentId();
-		return this.handleResponse(this.api.post(`/environments/${envId}/projects/${projectId}/restart`));
+		await this.handleResponse(this.api.post(`/environments/${envId}/projects/${projectId}/restart`));
+	}
+
+	async archiveProject(projectId: string): Promise<void> {
+		const envId = await environmentStore.getCurrentEnvironmentId();
+		await this.handleResponse(this.api.post(`/environments/${envId}/projects/${projectId}/archive`));
+	}
+
+	async unarchiveProject(projectId: string): Promise<void> {
+		const envId = await environmentStore.getCurrentEnvironmentId();
+		await this.handleResponse(this.api.post(`/environments/${envId}/projects/${projectId}/unarchive`));
 	}
 
 	async redeployProject(projectName: string): Promise<Project> {

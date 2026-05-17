@@ -24,19 +24,25 @@ import (
 	"github.com/getarcaneapp/arcane/backend/pkg/libarcane/startup"
 	"github.com/getarcaneapp/arcane/backend/pkg/scheduler"
 	httputils "github.com/getarcaneapp/arcane/backend/pkg/utils/httpx"
-	"golang.org/x/net/http2"
-	"golang.org/x/net/http2/h2c"
 	"google.golang.org/grpc"
 )
 
 func Bootstrap(ctx context.Context) error {
 	_ = godotenv.Load()
-	if err := startup.ApplyRequestedRuntimeIdentity(ctx); err != nil {
+	cfg := config.Load()
+	runtimeIdentityCfg := &startup.RuntimeIdentityConfig{
+		PUID:         cfg.PUID,
+		PGID:         cfg.PGID,
+		DockerHost:   cfg.DockerHost,
+		DockerConfig: cfg.DockerConfig,
+		DatabaseURL:  cfg.DatabaseURL,
+	}
+	if err := startup.ApplyRequestedRuntimeIdentity(ctx, runtimeIdentityCfg); err != nil {
 		return fmt.Errorf("apply runtime identity: %w", err)
 	}
-	cfg := config.Load()
+	cfg.DockerConfig = runtimeIdentityCfg.DockerConfig
 
-	SetupGinLogger(cfg)
+	SetupSlogLogger(cfg)
 	ConfigureGormLogger(cfg)
 	slog.InfoContext(ctx, "Arcane is starting", "version", config.Version)
 
@@ -62,6 +68,7 @@ func Bootstrap(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to initialize services: %w", err)
 	}
+	defer dockerClientService.Close()
 	defer func(ctx context.Context) {
 		baseCtx := context.WithoutCancel(ctx)
 		shutdownCtx, shutdownCancel := context.WithTimeout(baseCtx, 10*time.Second)
@@ -75,7 +82,7 @@ func Bootstrap(ctx context.Context) error {
 
 	cronLocation := cfg.GetLocation()
 	scheduler := scheduler.NewJobScheduler(appCtx, cronLocation)
-	appServices.JobSchedule.SetScheduler(scheduler)
+	appServices.JobSchedule.SetScheduler(appCtx, scheduler)
 	registerJobs(appCtx, scheduler, appServices, cfg)
 
 	router, tunnelServer := setupRouter(appCtx, cfg, appServices)
@@ -153,6 +160,9 @@ func initializeStartupState(appCtx context.Context, cfg *config.Config, appServi
 	if err := appServices.Environment.EnsureLocalEnvironment(appCtx, cfg.AppUrl); err != nil {
 		slog.WarnContext(appCtx, "Failed to ensure local environment", "error", err)
 	}
+	if appServices.Project != nil {
+		go appServices.Project.BackfillProjectImageRefs(appCtx)
+	}
 
 	if !cfg.AgentMode {
 		if err := appServices.Environment.ReconcileEdgeStatusesOnStartup(appCtx); err != nil {
@@ -178,6 +188,7 @@ func initializeStartupState(appCtx context.Context, cfg *config.Config, appServi
 		slog.InfoContext(ctx, "Docker API versions detected", "client_api_version", dockerClient.ClientVersion(), "server_api_version", version.APIVersion, "effective_api_version", effectiveAPIVersion)
 		return nil
 	})
+	go dockerClientService.WatchEvents(appCtx)
 	if appServices.Swarm != nil {
 		if err := appServices.Swarm.SyncSwarmEnabledState(appCtx); err != nil {
 			slog.WarnContext(appCtx, "Failed to persist swarm enabled state", "error", err)
@@ -198,11 +209,16 @@ func initializeStartupState(appCtx context.Context, cfg *config.Config, appServi
 	)
 	startup.CleanupUnknownSettings(appCtx, appServices.Settings)
 
-	// Handle agent auto-pairing with API key.
-	if cfg.AgentMode && cfg.AgentToken != "" && cfg.ManagerApiUrl != "" {
+	// Auto-pair only applies in Edge mode (where the agent's outbound tunnel is the
+	// only path to the manager). Direct mode is passive — the manager dials the agent's
+	// HTTP server on TCP 3553, and the manager-side health-check promotes the env to
+	// Online once reachability is confirmed.
+	if cfg.AgentMode && cfg.EdgeAgent && cfg.AgentToken != "" && cfg.ManagerApiUrl != "" {
 		if err := handleAgentBootstrapPairing(appCtx, cfg, httpClient); err != nil {
 			slog.WarnContext(appCtx, "Failed to auto-pair agent with manager", "error", err)
 		}
+	} else if cfg.AgentMode && !cfg.EdgeAgent {
+		slog.InfoContext(appCtx, "Direct mode active: agent operates as a passive HTTP server; no outbound connection to manager required")
 	}
 }
 
@@ -439,7 +455,7 @@ func configureHTTPProtocolsInternal(useTLS bool, handler http.Handler) (http.Han
 	}
 
 	protocols.SetUnencryptedHTTP2(true)
-	return h2c.NewHandler(handler, &http2.Server{}), &protocols
+	return handler, &protocols
 }
 
 func newHTTPServerInternal(listenAddr string, handler http.Handler, protocols *http.Protocols, useTLS bool, edgeCfg *edge.Config) (*http.Server, error) {

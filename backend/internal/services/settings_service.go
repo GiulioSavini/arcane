@@ -30,8 +30,9 @@ import (
 )
 
 type SettingsService struct {
-	db     *database.DB
-	config atomic.Pointer[models.Settings]
+	db           *database.DB
+	config       atomic.Pointer[models.Settings]
+	envOverrides []settingsEnvOverride
 
 	OnImagePollingSettingsChanged      func(ctx context.Context)
 	OnAutoUpdateSettingsChanged        func(ctx context.Context)
@@ -42,9 +43,20 @@ type SettingsService struct {
 	OnTimeoutSettingsChanged           func(ctx context.Context, timeoutSettings []libarcane.SettingUpdate)
 }
 
+type settingsEnvOverride struct {
+	fieldIndex int
+	key        string
+	envVarName string
+	value      string
+}
+
 func NewSettingsService(ctx context.Context, db *database.DB) (*SettingsService, error) {
 	svc := &SettingsService{
 		db: db,
+	}
+	svc.envOverrides = resolveSettingsEnvOverridesInternal()
+	if len(svc.envOverrides) > 0 {
+		slog.InfoContext(ctx, "settings env overrides loaded", "count", len(svc.envOverrides))
 	}
 
 	err := svc.LoadDatabaseSettings(ctx)
@@ -106,6 +118,7 @@ func DefaultSettingsConfig() *models.Settings {
 		PollingInterval:                 models.SettingVariable{Value: "0 0 * * * *"},
 		DockerClientRefreshInterval:     models.SettingVariable{Value: "*/30 * * * * *"},
 		EventCleanupInterval:            models.SettingVariable{Value: "0 0 */6 * * *"},
+		ExpiredSessionsCleanupInterval:  models.SettingVariable{Value: "0 0 0 * * *"},
 		AutoInjectEnv:                   models.SettingVariable{Value: "false"},
 		PruneMode:                       models.SettingVariable{Value: "dangling"}, //nolint:staticcheck // Legacy prune setting is still seeded for migration compatibility.
 		DefaultDeployPullPolicy:         models.SettingVariable{Value: "missing"},
@@ -168,6 +181,7 @@ func DefaultSettingsConfig() *models.Settings {
 		OidcMergeAccounts:          models.SettingVariable{Value: "false"},
 		OidcProviderName:           models.SettingVariable{Value: ""},
 		OidcProviderLogoUrl:        models.SettingVariable{Value: ""},
+		OidcMobileRedirectUris:     models.SettingVariable{Value: "arcane-mobile://oidc-callback"},
 		MobileNavigationMode:       models.SettingVariable{Value: "floating"},
 		MobileNavigationShowLabels: models.SettingVariable{Value: "true"},
 		SidebarHoverExpansion:      models.SettingVariable{Value: "true"},
@@ -447,8 +461,17 @@ func (s *SettingsService) loadDatabaseConfigFromEnv(ctx context.Context, db *dat
 }
 
 func (s *SettingsService) applyEnvOverrides(ctx context.Context, dest *models.Settings) {
-	rt := reflect.ValueOf(dest).Elem().Type()
+	_ = ctx
 	rv := reflect.ValueOf(dest).Elem()
+
+	for _, override := range s.envOverrides {
+		rv.Field(override.fieldIndex).FieldByName("Value").SetString(override.value)
+	}
+}
+
+func resolveSettingsEnvOverridesInternal() []settingsEnvOverride {
+	rt := reflect.TypeFor[models.Settings]()
+	overrides := make([]settingsEnvOverride, 0)
 
 	for i := range rt.NumField() {
 		field := rt.Field(i)
@@ -466,44 +489,34 @@ func (s *SettingsService) applyEnvOverrides(ctx context.Context, dest *models.Se
 			continue
 		}
 
-		// Check if environment variable is set
 		envVarName := utils.CamelCaseToScreamingSnakeCase(key)
 		if val, ok := os.LookupEnv(envVarName); ok && val != "" {
-			slog.DebugContext(ctx, "applyEnvOverrides: applying env override", "key", key, "env", envVarName)
-			rv.Field(i).FieldByName("Value").SetString(utils.TrimQuotes(val))
+			overrides = append(overrides, settingsEnvOverride{
+				fieldIndex: i,
+				key:        key,
+				envVarName: envVarName,
+				value:      utils.TrimQuotes(val),
+			})
 		}
 	}
+
+	return overrides
 }
 
 // isEnvOverrideActiveInternal returns true when the given setting key has an envOverride tag
 // and its corresponding environment variable is currently set to a non-empty value.
 func (s *SettingsService) isEnvOverrideActiveInternal(key string) bool {
-	rt := reflect.TypeFor[models.Settings]()
-	for field := range rt.Fields() {
-		tagValue := field.Tag.Get("key")
-		if tagValue == "" {
-			continue
+	for _, override := range s.envOverrides {
+		if override.key == key {
+			return true
 		}
-
-		tagParts := strings.Split(tagValue, ",")
-		if len(tagParts) == 0 || tagParts[0] != key {
-			continue
-		}
-
-		if !slices.Contains(tagParts[1:], "envOverride") {
-			return false
-		}
-
-		envVarName := utils.CamelCaseToScreamingSnakeCase(key)
-		val, ok := os.LookupEnv(envVarName)
-		return ok && val != ""
 	}
 
 	return false
 }
 
 func (s *SettingsService) GetSettings(ctx context.Context) (*models.Settings, error) {
-	settings := s.getEffectiveSettingsConfig(ctx)
+	settings := s.getEffectiveSettingsConfigInternal(ctx)
 	return settings, nil
 }
 
@@ -522,7 +535,7 @@ func (s *SettingsService) GetSettingsOrDefaults(ctx context.Context) *models.Set
 	return cfg
 }
 
-func (s *SettingsService) getEffectiveSettingsConfig(ctx context.Context) *models.Settings {
+func (s *SettingsService) getEffectiveSettingsConfigInternal(ctx context.Context) *models.Settings {
 	settings := s.GetSettingsConfig().Clone()
 	s.applyEnvOverrides(ctx, settings)
 	return settings
@@ -656,7 +669,6 @@ func (s *SettingsService) updateSettingValueNoRefreshInternal(ctx context.Contex
 func (s *SettingsService) UpdateSettings(ctx context.Context, updates settings.Update) ([]models.SettingVariable, error) {
 	defaultCfg := s.getDefaultSettings()
 	cfg := s.GetSettingsConfig().Clone()
-	s.applyEnvOverrides(ctx, cfg)
 
 	valuesToUpdate, changedPolling, changedAutoUpdate, changedScheduledPrune, changedVulnerabilityScan, changedAutoHeal, changedTimeouts, err := s.prepareUpdateValues(updates, cfg, defaultCfg)
 	if err != nil {
@@ -1080,7 +1092,7 @@ func (s *SettingsService) setupInstanceID(ctx context.Context) error {
 }
 
 func (s *SettingsService) GetBoolSetting(ctx context.Context, key string, defaultValue bool) bool {
-	cfg := s.getEffectiveSettingsConfig(ctx)
+	cfg := s.getEffectiveSettingsConfigInternal(ctx)
 	val, _, _, err := cfg.FieldByKey(key)
 	if err != nil || val == "" {
 		return defaultValue
@@ -1093,7 +1105,7 @@ func (s *SettingsService) GetBoolSetting(ctx context.Context, key string, defaul
 }
 
 func (s *SettingsService) GetIntSetting(ctx context.Context, key string, defaultValue int) int {
-	cfg := s.getEffectiveSettingsConfig(ctx)
+	cfg := s.getEffectiveSettingsConfigInternal(ctx)
 	val, _, _, err := cfg.FieldByKey(key)
 	if err != nil || val == "" {
 		return defaultValue
@@ -1106,7 +1118,7 @@ func (s *SettingsService) GetIntSetting(ctx context.Context, key string, default
 }
 
 func (s *SettingsService) GetStringSetting(ctx context.Context, key, defaultValue string) string {
-	cfg := s.getEffectiveSettingsConfig(ctx)
+	cfg := s.getEffectiveSettingsConfigInternal(ctx)
 	val, _, _, err := cfg.FieldByKey(key)
 	if err != nil || val == "" {
 		return defaultValue

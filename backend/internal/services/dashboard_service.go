@@ -2,18 +2,18 @@ package services
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/getarcaneapp/arcane/backend/internal/database"
 	"github.com/getarcaneapp/arcane/backend/internal/models"
 	dockerutils "github.com/getarcaneapp/arcane/backend/pkg/dockerutil"
 	"github.com/getarcaneapp/arcane/backend/pkg/libarcane"
-	"github.com/getarcaneapp/arcane/backend/pkg/libarcane/timeouts"
-	libupdater "github.com/getarcaneapp/arcane/backend/pkg/libarcane/updater"
+	libupdater "github.com/getarcaneapp/arcane/backend/pkg/libarcane/imageupdate"
 	"github.com/getarcaneapp/arcane/types/base"
 	containertypes "github.com/getarcaneapp/arcane/types/container"
 	dashboardtypes "github.com/getarcaneapp/arcane/types/dashboard"
@@ -21,8 +21,6 @@ import (
 	imagetypes "github.com/getarcaneapp/arcane/types/image"
 	versiontypes "github.com/getarcaneapp/arcane/types/version"
 	dockercontainer "github.com/moby/moby/api/types/container"
-	dockerimage "github.com/moby/moby/api/types/image"
-	"github.com/moby/moby/client"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -77,34 +75,12 @@ func (s *DashboardService) GetSnapshot(ctx context.Context, options DashboardAct
 		return nil, fmt.Errorf("docker service not available")
 	}
 
-	var (
-		dockerContainers []dockercontainer.Summary
-		dockerImages     []dockerimage.Summary
-	)
-
-	g, groupCtx := errgroup.WithContext(ctx)
-
-	g.Go(func() error {
-		containers, err := s.listDashboardContainersInternal(groupCtx)
-		if err != nil {
-			return fmt.Errorf("failed to load dashboard containers: %w", err)
-		}
-		dockerContainers = containers
-		return nil
-	})
-
-	g.Go(func() error {
-		images, err := s.listDashboardImagesInternal(groupCtx)
-		if err != nil {
-			return fmt.Errorf("failed to load dashboard images: %w", err)
-		}
-		dockerImages = images
-		return nil
-	})
-
-	if err := g.Wait(); err != nil {
+	dockerSnapshot, err := s.dockerService.GetSnapshot(ctx, localEnvironmentID)
+	if err != nil {
 		return nil, err
 	}
+	dockerContainers := dockerSnapshot.Containers
+	dockerImages := dockerSnapshot.Images
 
 	filteredContainers := filterInternalContainers(dockerContainers, false)
 	containerItems := make([]containertypes.Summary, 0, len(filteredContainers))
@@ -328,7 +304,7 @@ func (s *DashboardService) buildActionItemsForSnapshotInternal(
 	ctx context.Context,
 	options DashboardActionItemsOptions,
 	containers []dockercontainer.Summary,
-	_ []dockerimage.Summary,
+	_ any,
 ) (*dashboardtypes.ActionItems, error) {
 	if options.DebugAllGood {
 		return &dashboardtypes.ActionItems{Items: []dashboardtypes.ActionItem{}}, nil
@@ -505,23 +481,16 @@ func (s *DashboardService) getSnapshotForEnvironmentInternal(
 		return s.GetSnapshot(reqCtx, options)
 	}
 
-	respBody, statusCode, err := s.environmentService.ProxyRequest(
+	var response base.ApiResponse[dashboardtypes.Snapshot]
+	if err := s.environmentService.ProxyJSONRequest(
 		reqCtx,
 		env.ID,
-		"GET",
+		http.MethodGet,
 		buildEnvironmentDashboardProxyPathInternal(options),
 		nil,
-	)
-	if err != nil {
+		&response,
+	); err != nil {
 		return nil, fmt.Errorf("failed to proxy dashboard snapshot: %w", err)
-	}
-	if statusCode < 200 || statusCode >= 300 {
-		return nil, fmt.Errorf("unexpected dashboard status code: %d", statusCode)
-	}
-
-	var response base.ApiResponse[dashboardtypes.Snapshot]
-	if err := json.Unmarshal(respBody, &response); err != nil {
-		return nil, fmt.Errorf("failed to decode dashboard snapshot: %w", err)
 	}
 	if !response.Success {
 		return nil, fmt.Errorf("dashboard snapshot request was not successful")
@@ -557,25 +526,16 @@ func (s *DashboardService) getVersionInfoForEnvironmentInternal(
 		return nil
 	}
 
-	respBody, statusCode, err := s.environmentService.ProxyRequest(
+	var versionInfo versiontypes.Info
+	if err := s.environmentService.ProxyJSONRequest(
 		reqCtx,
 		env.ID,
-		"GET",
+		http.MethodGet,
 		"/api/app-version",
 		nil,
-	)
-	if err != nil {
+		&versionInfo,
+	); err != nil {
 		slog.DebugContext(reqCtx, "Failed to fetch environment version info for dashboard", "environment_id", env.ID, "error", err)
-		return nil
-	}
-	if statusCode < 200 || statusCode >= 300 {
-		slog.DebugContext(reqCtx, "Unexpected environment version status code for dashboard", "environment_id", env.ID, "status_code", statusCode)
-		return nil
-	}
-
-	var versionInfo versiontypes.Info
-	if err := json.Unmarshal(respBody, &versionInfo); err != nil {
-		slog.DebugContext(reqCtx, "Failed to decode environment version info for dashboard", "environment_id", env.ID, "error", err)
 		return nil
 	}
 
@@ -657,7 +617,8 @@ func (s *DashboardService) getPendingResourceUpdatesCountInternal(ctx context.Co
 	}
 
 	filteredContainers := filterInternalContainers(containers, false)
-	containerCount, err := s.getPendingContainerUpdatesCountForImageIDsInternal(ctx, collectImageIDs(filteredContainers))
+	standaloneContainers := filterStandaloneDockerContainersInternal(filteredContainers)
+	containerCount, err := s.getPendingContainerUpdatesCountForImageIDsInternal(ctx, collectImageIDs(standaloneContainers))
 	if err != nil {
 		return 0, err
 	}
@@ -668,6 +629,17 @@ func (s *DashboardService) getPendingResourceUpdatesCountInternal(ctx context.Co
 	}
 
 	return containerCount + projectCount, nil
+}
+
+func filterStandaloneDockerContainersInternal(containers []dockercontainer.Summary) []dockercontainer.Summary {
+	filtered := make([]dockercontainer.Summary, 0, len(containers))
+	for _, c := range containers {
+		if strings.TrimSpace(c.Labels["com.docker.compose.project"]) != "" {
+			continue
+		}
+		filtered = append(filtered, c)
+	}
+	return filtered
 }
 
 func (s *DashboardService) getPendingContainerUpdatesCountForImageIDsInternal(ctx context.Context, imageIDs []string) (int, error) {
@@ -723,56 +695,6 @@ func (s *DashboardService) getExpiringAPIKeysCountInternal(ctx context.Context) 
 	}
 
 	return int(count), nil
-}
-
-func (s *DashboardService) listDashboardContainersInternal(ctx context.Context) ([]dockercontainer.Summary, error) {
-	if s.dockerService == nil {
-		return nil, fmt.Errorf("docker service not available")
-	}
-
-	dockerClient, err := s.dockerService.GetClient(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect to Docker: %w", err)
-	}
-
-	apiCtx, cancel := timeouts.WithTimeout(ctx, s.getDockerAPITimeoutSecondsInternal(ctx), timeouts.DefaultDockerAPI)
-	defer cancel()
-
-	containerList, err := dockerClient.ContainerList(apiCtx, client.ContainerListOptions{All: true})
-	if err != nil {
-		return nil, fmt.Errorf("failed to list Docker containers: %w", err)
-	}
-
-	return containerList.Items, nil
-}
-
-func (s *DashboardService) listDashboardImagesInternal(ctx context.Context) ([]dockerimage.Summary, error) {
-	if s.dockerService == nil {
-		return nil, fmt.Errorf("docker service not available")
-	}
-
-	dockerClient, err := s.dockerService.GetClient(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect to Docker: %w", err)
-	}
-
-	apiCtx, cancel := timeouts.WithTimeout(ctx, s.getDockerAPITimeoutSecondsInternal(ctx), timeouts.DefaultDockerAPI)
-	defer cancel()
-
-	imageList, err := dockerClient.ImageList(apiCtx, client.ImageListOptions{All: true})
-	if err != nil {
-		return nil, fmt.Errorf("failed to list Docker images: %w", err)
-	}
-
-	return imageList.Items, nil
-}
-
-func (s *DashboardService) getDockerAPITimeoutSecondsInternal(ctx context.Context) int {
-	if s.settingsService == nil {
-		return 0
-	}
-
-	return s.settingsService.GetIntSetting(ctx, "dockerApiTimeout", 0)
 }
 
 func buildDashboardPaginationResponseInternal(totalItems int, limit int) base.PaginationResponse {

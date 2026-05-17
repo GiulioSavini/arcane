@@ -30,6 +30,7 @@ type Services struct {
 	Port              *services.PortService
 	Swarm             *services.SwarmService
 	ImageUpdate       *services.ImageUpdateService
+	Session           *services.SessionService
 	Auth              *services.AuthService
 	Oidc              *services.OidcService
 	Docker            *services.DockerClientService
@@ -65,9 +66,10 @@ func initializeServices(ctx context.Context, db *database.DB, cfg *config.Config
 	svcs.CustomizeSearch = services.NewCustomizeSearchService()
 	svcs.AppImages = services.NewApplicationImagesService(resources.FS, svcs.Settings)
 	svcs.Font = services.NewFontService(resources.FS)
-	dockerClient := services.NewDockerClientService(db, cfg, svcs.Settings)
+	dockerClient := services.NewDockerClientService(ctx, db, cfg, svcs.Settings)
 	svcs.Docker = dockerClient
 	svcs.User = services.NewUserService(db)
+	svcs.Session = services.NewSessionService(db)
 	svcs.ApiKey = services.NewApiKeyService(db, svcs.User)
 	svcs.ContainerRegistry = services.NewContainerRegistryService(db, func(ctx context.Context) (services.RegistryDaemonClient, error) {
 		return dockerClient.GetClient(ctx)
@@ -83,7 +85,7 @@ func initializeServices(ctx context.Context, db *database.DB, cfg *config.Config
 	svcs.Build = services.NewBuildService(db, svcs.Settings, svcs.Docker, svcs.ContainerRegistry, svcs.GitRepository, svcs.Event)
 	svcs.BuildWorkspace = services.NewBuildWorkspaceService(svcs.Settings)
 	svcs.Project = services.NewProjectService(db, svcs.Settings, svcs.Event, svcs.Image, svcs.Docker, svcs.Build, cfg)
-	svcs.Container = services.NewContainerService(db, svcs.Event, svcs.Docker, svcs.Image, svcs.Settings, svcs.Project)
+	svcs.Container = services.NewContainerService(ctx, db, svcs.Event, svcs.Docker, svcs.Image, svcs.Settings, svcs.Project)
 	svcs.Dashboard = services.NewDashboardService(
 		db,
 		svcs.Docker,
@@ -100,8 +102,8 @@ func initializeServices(ctx context.Context, db *database.DB, cfg *config.Config
 	svcs.Port = services.NewPortService(svcs.Docker)
 	svcs.Swarm = services.NewSwarmService(svcs.Docker, svcs.Settings, svcs.KV, svcs.ContainerRegistry, svcs.Environment)
 	svcs.Template = services.NewTemplateService(ctx, db, httpClient, svcs.Settings)
-	svcs.Auth = services.NewAuthService(svcs.User, svcs.Settings, svcs.Event, cfg.JWTSecret, cfg)
-	svcs.Oidc = services.NewOidcService(svcs.Auth, cfg, httpClient)
+	svcs.Auth = services.NewAuthService(svcs.User, svcs.Settings, svcs.Event, svcs.Session, cfg.JWTSecret, cfg)
+	svcs.Oidc = services.NewOidcService(svcs.Auth, svcs.Settings, cfg, httpClient)
 	svcs.System = services.NewSystemService(db, svcs.Docker, svcs.Container, svcs.Image, svcs.Volume, svcs.Network, svcs.Settings)
 	svcs.SystemUpgrade = services.NewSystemUpgradeService(svcs.Docker, svcs.Version, svcs.Event, svcs.Settings)
 	svcs.Updater = services.NewUpdaterService(db, svcs.Settings, svcs.Docker, svcs.Project, svcs.ImageUpdate, svcs.ContainerRegistry, svcs.Event, svcs.Image, svcs.Notification, svcs.SystemUpgrade)
