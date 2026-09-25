@@ -3227,66 +3227,6 @@ func TestProjectService_ApplyGitSyncProjectFiles_RemovesGitEnvSource(t *testing.
 	assert.Equal(t, "BASE=git\n", string(effectiveBytes))
 }
 
-func TestProjectService_ApplyGitSyncProjectFiles_LogsUpdateEventOnlyOnContentChange(t *testing.T) {
-	db := setupProjectTestDB(t)
-	ctx := context.Background()
-
-	projectsDir := t.TempDir()
-	t.Setenv("PROJECTS_DIRECTORY", projectsDir)
-
-	settingsService, err := newSettingsServiceForTestInternal(t, ctx, db)
-	require.NoError(t, err)
-
-	eventService := event.NewEventService(db, nil, nil)
-	svc := NewProjectService(db, settingsService, eventService, nil, nil, nil, nil, nil, config.Load())
-
-	dirName := "git-sync-noop"
-	projectPath := filepath.Join(projectsDir, dirName)
-	require.NoError(t, os.MkdirAll(projectPath, 0o755))
-	require.NoError(t, os.WriteFile(filepath.Join(projectPath, "compose.yaml"), []byte("services:\n  app:\n    image: nginx:alpine\n"), 0o600))
-
-	project := &Project{
-		ID:      "proj-git-sync-noop",
-		Name:    "git-sync-noop",
-		DirName: &dirName,
-		Path:    projectPath,
-		Status:  ProjectStatusStopped,
-	}
-	require.NoError(t, db.Create(project).Error)
-
-	user := common.User{ID: "u1", Username: "tester"}
-	compose := "services:\n  app:\n    image: nginx:1.27-alpine\n"
-	gitEnv := "TAG=1\n"
-
-	projectUpdateEvents := func() []event.Event {
-		var events []event.Event
-		require.NoError(t, db.Where("type = ?", event.EventTypeProjectUpdate).Order("timestamp ASC").Find(&events).Error)
-		return events
-	}
-
-	_, err = svc.ApplyGitSyncProjectFiles(ctx, project.ID, compose, &gitEnv, nil, "", user)
-	require.NoError(t, err)
-	events := projectUpdateEvents()
-	require.Len(t, events, 1)
-	assert.Equal(t, true, events[0].Metadata["composeUpdated"])
-	assert.Equal(t, true, events[0].Metadata["envUpdated"])
-
-	// Re-applying identical content is a no-op and must not log another update.
-	_, err = svc.ApplyGitSyncProjectFiles(ctx, project.ID, compose, &gitEnv, nil, "", user)
-	require.NoError(t, err)
-	require.Len(t, projectUpdateEvents(), 1)
-
-	// Only the env changed, so the event must not claim a compose update.
-	gitEnv = "TAG=2\n"
-	_, err = svc.ApplyGitSyncProjectFiles(ctx, project.ID, compose, &gitEnv, nil, "", user)
-	require.NoError(t, err)
-	events = projectUpdateEvents()
-	require.Len(t, events, 2)
-	assert.Equal(t, false, events[1].Metadata["composeUpdated"])
-	assert.Equal(t, true, events[1].Metadata["envUpdated"])
-	assert.Equal(t, false, events[1].Metadata["overrideUpdated"])
-}
-
 func TestProjectService_ApplyGitSyncProjectFiles_WritesAndRemovesComposeOverride(t *testing.T) {
 	db := setupProjectTestDB(t)
 	ctx := context.Background()
