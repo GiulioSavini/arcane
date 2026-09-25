@@ -275,6 +275,10 @@ func (s *ProjectService) ApplyGitSyncProjectFiles(ctx context.Context, projectID
 		return nil, err
 	}
 
+	// Snapshot the current content so the update event reflects what the sync
+	// actually changed; an unchanged scheduled sync must not log an update.
+	oldCompose, oldEnv, oldOverride, oldContentErr := s.GetProjectContent(ctx, projectID)
+
 	envUpdate, err := s.prepareGitSyncEnvUpdateInternal(proj.Path, gitEnvContent)
 	if err != nil {
 		return nil, errors.WrapIf(err, "failed to resolve git env state")
@@ -310,13 +314,22 @@ func (s *ProjectService) ApplyGitSyncProjectFiles(ctx context.Context, projectID
 		slog.WarnContext(ctx, "failed to update service counts after git sync", "projectID", proj.ID, "error", err)
 	}
 
+	newCompose, newEnv, newOverride, newContentErr := s.GetProjectContent(ctx, projectID)
+	contentKnown := oldContentErr == nil && newContentErr == nil
+	composeUpdated := !contentKnown || oldCompose != newCompose
+	envUpdated := !contentKnown || oldEnv != newEnv
+	overrideUpdated := !contentKnown || oldOverride != newOverride
+	if !composeUpdated && !envUpdated && !overrideUpdated {
+		return &proj, nil
+	}
+
 	metadata := database.JSON{
 		"action":          "git_sync_update",
 		"projectID":       proj.ID,
 		"projectName":     proj.Name,
-		"composeUpdated":  true,
-		"envUpdated":      gitEnvContent != nil,
-		"overrideUpdated": gitOverrideContent != nil,
+		"composeUpdated":  composeUpdated,
+		"envUpdated":      envUpdated,
+		"overrideUpdated": overrideUpdated,
 	}
 	if gitEnvContent == nil {
 		metadata["envSourceRemoved"] = true
