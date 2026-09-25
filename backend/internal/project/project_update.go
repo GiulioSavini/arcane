@@ -275,9 +275,9 @@ func (s *ProjectService) ApplyGitSyncProjectFiles(ctx context.Context, projectID
 		return nil, err
 	}
 
-	// Snapshot the current content so the update event reflects what the sync
+	// Snapshot the files the sync may touch so the update event reflects what
 	// actually changed; an unchanged scheduled sync must not log an update.
-	oldCompose, oldEnv, oldOverride, oldContentErr := s.GetProjectContent(ctx, projectID)
+	before := snapshotTopLevelFilesInternal(proj.Path)
 
 	envUpdate, err := s.prepareGitSyncEnvUpdateInternal(proj.Path, gitEnvContent)
 	if err != nil {
@@ -314,11 +314,7 @@ func (s *ProjectService) ApplyGitSyncProjectFiles(ctx context.Context, projectID
 		slog.WarnContext(ctx, "failed to update service counts after git sync", "projectID", proj.ID, "error", err)
 	}
 
-	newCompose, newEnv, newOverride, newContentErr := s.GetProjectContent(ctx, projectID)
-	contentKnown := oldContentErr == nil && newContentErr == nil
-	composeUpdated := !contentKnown || oldCompose != newCompose
-	envUpdated := !contentKnown || oldEnv != newEnv
-	overrideUpdated := !contentKnown || oldOverride != newOverride
+	composeUpdated, envUpdated, overrideUpdated := classifyGitSyncFileChangesInternal(before, snapshotTopLevelFilesInternal(proj.Path), gitOverrideFileName)
 	if !composeUpdated && !envUpdated && !overrideUpdated {
 		return &proj, nil
 	}
@@ -337,6 +333,66 @@ func (s *ProjectService) ApplyGitSyncProjectFiles(ctx context.Context, projectID
 	s.logProjectEventInternal(ctx, event.EventTypeProjectUpdate, proj.ID, proj.Name, user, metadata, "could not log git sync project update action")
 
 	return &proj, nil
+}
+
+// snapshotTopLevelFilesInternal maps each top-level file in dir to its content.
+// Unreadable files map to a fixed marker so they only count as changed when
+// they appear or disappear.
+func snapshotTopLevelFilesInternal(dir string) map[string]string {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil
+	}
+	files := make(map[string]string, len(entries))
+	for _, entry := range entries {
+		if !entry.Type().IsRegular() {
+			continue
+		}
+		content, err := os.ReadFile(filepath.Join(dir, entry.Name()))
+		if err != nil {
+			files[entry.Name()] = "\x00unreadable"
+			continue
+		}
+		files[entry.Name()] = string(content)
+	}
+	return files
+}
+
+// classifyGitSyncFileChangesInternal reports which kinds of project files
+// differ between two snapshots. A missing snapshot counts as fully changed.
+func classifyGitSyncFileChangesInternal(before, after map[string]string, overrideFileName string) (composeUpdated, envUpdated, overrideUpdated bool) {
+	if before == nil || after == nil {
+		return true, true, true
+	}
+	envFiles := []string{projects.EffectiveEnvFileName, projects.GitSourceEnvFileName, projects.OverrideEnvFileName}
+	overrideFiles := append(projects.ComposeOverrideFileCandidates(), overrideFileName)
+	for name := range mergedKeysInternal(before, after) {
+		beforeContent, beforeOK := before[name]
+		afterContent, afterOK := after[name]
+		if beforeOK == afterOK && beforeContent == afterContent {
+			continue
+		}
+		switch {
+		case slices.Contains(envFiles, name):
+			envUpdated = true
+		case slices.Contains(overrideFiles, name):
+			overrideUpdated = true
+		default:
+			composeUpdated = true
+		}
+	}
+	return composeUpdated, envUpdated, overrideUpdated
+}
+
+func mergedKeysInternal(a, b map[string]string) map[string]struct{} {
+	keys := make(map[string]struct{}, len(a)+len(b))
+	for k := range a {
+		keys[k] = struct{}{}
+	}
+	for k := range b {
+		keys[k] = struct{}{}
+	}
+	return keys
 }
 
 // applyGitSyncProjectFilesInternal persists the synced env, compose, and
