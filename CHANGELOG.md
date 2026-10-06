@@ -48,6 +48,7 @@
 - relayout login screen ([3226230](https://github.com/getarcaneapp/arcane/commit/32262306cabef7d9809651996243898cda51bdc6) by @kmendell)
 
 **Full Changelog**: https://github.com/getarcaneapp/arcane/compare/v2.14.0...v2.15.0
+
 ## v2.14.0
 
 ### New features
