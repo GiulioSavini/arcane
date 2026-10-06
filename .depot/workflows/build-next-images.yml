@@ -59,7 +59,12 @@ jobs:
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: backend/go.mod
-          cache-dependency-path: backend/go.sum
+          cache: true
+          cache-dependency-path: |
+            go.work
+            go.work.sum
+            */go.mod
+            */go.sum
 
       - name: Capture frontend build versions
         id: frontend-versions

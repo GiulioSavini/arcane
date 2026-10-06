@@ -175,20 +175,16 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Install Frontend Dependencies
-        run: just deps install frontend
-
-      - name: Build Arcane Frontend
-        run: just build single frontend
-
       - name: Setup Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: backend/go.mod
           cache: true
           cache-dependency-path: |
-            backend/go.sum
-            cli/go.sum
+            go.work
+            go.work.sum
+            */go.mod
+            */go.sum
 
       - name: Install envsubst
         run: sudo apt-get update && sudo apt-get install -y gettext-base
