@@ -766,6 +766,23 @@ func (s *Service) deleteRusticBackupsInternal(ctx context.Context, entries []*vo
 	return deleteErr
 }
 
+// PruneLocalRepository frees the space of deleted local volume backups.
+func (s *Service) PruneLocalRepository(ctx context.Context) error {
+	dockerClient, err := s.deps.Docker.GetClient(ctx)
+	if err != nil {
+		return err
+	}
+	repository, err := s.localRusticRepositoryInternal(ctx, dockerClient, false)
+	if err != nil {
+		return err
+	}
+	password, err := s.volumeBackupPasswordInternal(ctx, dockerClient, repository)
+	if err != nil {
+		return err
+	}
+	return s.deps.Engine.PruneRepository(ctx, dockerClient, repository, password)
+}
+
 func (s *Service) forgetLocalSnapshotsInternal(ctx context.Context, dockerClient *client.Client, entries []*volume.Backup) error {
 	if len(entries) == 0 {
 		return nil

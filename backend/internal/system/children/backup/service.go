@@ -763,6 +763,26 @@ func (s *Service) deleteRunsInternal(ctx context.Context, localRuns2 []*backupty
 	return deleteErr
 }
 
+// PruneLocalRepository frees the space of deleted local system backups.
+func (s *Service) PruneLocalRepository(ctx context.Context) error {
+	key, err := s.recoveryKeys.Get(ctx)
+	if errors.Is(err, backup.ErrRecoveryKeyNotConfigured) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	dockerClient, err := s.dockerService.GetClient(ctx)
+	if err != nil {
+		return err
+	}
+	repository, err := s.localRepositoryInternal(ctx, dockerClient, false)
+	if err != nil {
+		return err
+	}
+	return s.engine.PruneRepository(ctx, dockerClient, repository, key)
+}
+
 func (s *Service) forgetLocalSnapshotsInternal(ctx context.Context, dockerClient *client.Client, key string, localRuns []*backuptypes.SystemBackupRun) error {
 	if len(localRuns) == 0 {
 		return nil
