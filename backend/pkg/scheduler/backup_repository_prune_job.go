@@ -12,13 +12,10 @@ import (
 	"github.com/getarcaneapp/arcane/backend/v2/internal/volume"
 )
 
-// BackupRepositoryPruneJobName identifies the daily prune of the local backup
-// repositories.
+// BackupRepositoryPruneJobName identifies the daily prune of the local backup repositories.
 const BackupRepositoryPruneJobName = "backup-repository-prune"
 
-// BackupRepositoryPruneJob frees the disk space deleted backups leave behind.
-// Deleting a backup only marks its data for deletion, and rustic removes
-// marked packs on a later prune once its keep-delete window has passed.
+// BackupRepositoryPruneJob removes packs that deleted backups left marked for deletion.
 // Internal job: no job_metadata entry, invisible in the Jobs UI.
 type BackupRepositoryPruneJob struct {
 	systemService *system.SystemService
@@ -35,20 +32,17 @@ func (j *BackupRepositoryPruneJob) Name() string {
 }
 
 func (j *BackupRepositoryPruneJob) Schedule(_ context.Context) string {
+	// Staggered after the default 03:00 system backup schedule.
 	return "0 15 4 * * *"
 }
 
 func (j *BackupRepositoryPruneJob) Run(ctx context.Context) (schedulertypes.Outcome, error) {
 	var pruneErr error
-	if j.systemService != nil {
-		if err := j.systemService.PruneLocalBackupRepository(ctx); err != nil {
-			pruneErr = errors.Join(pruneErr, fmt.Errorf("prune system backup repository: %w", err))
-		}
+	if err := j.systemService.PruneLocalBackupRepository(ctx); err != nil {
+		pruneErr = fmt.Errorf("prune system backup repository: %w", err)
 	}
-	if j.volumeService != nil {
-		if err := j.volumeService.PruneLocalBackupRepository(ctx); err != nil {
-			pruneErr = errors.Join(pruneErr, fmt.Errorf("prune volume backup repository: %w", err))
-		}
+	if err := j.volumeService.PruneLocalBackupRepository(ctx); err != nil {
+		pruneErr = errors.Join(pruneErr, fmt.Errorf("prune volume backup repository: %w", err))
 	}
 	if pruneErr != nil {
 		slog.ErrorContext(ctx, "Failed to prune local backup repositories", "jobName", BackupRepositoryPruneJobName, "error", pruneErr)

@@ -56,8 +56,7 @@ const (
 	SystemAdmissionScope = "system-backup"
 	RecoveryKeyConfigID  = "system-recovery"
 
-	// rusticRepositoryMissingMessage is how rustic reports a repository that was
-	// never initialized.
+	// rusticRepositoryMissingMessage is how Rustic reports an uninitialized repository.
 	rusticRepositoryMissingMessage = "No repository config file found"
 )
 
@@ -495,12 +494,9 @@ func fullSnapshotIDInternal(id string) bool {
 	return err == nil
 }
 
-// ForgetSnapshots removes the snapshots from the repository and prunes their
-// data in a single pass.
+// ForgetSnapshots removes the snapshots and prunes their data in a single pass;
+// with no IDs it only prunes. An uninitialized repository has nothing to forget.
 func (e *Engine) ForgetSnapshots(ctx context.Context, dockerClient *client.Client, repository Repository, password string, snapshotIDs []string) error {
-	if len(snapshotIDs) == 0 {
-		return errors.New("at least one snapshot ID is required")
-	}
 	requested := make([]string, 0, len(snapshotIDs))
 	for _, id := range snapshotIDs {
 		if !fullSnapshotIDInternal(id) {
@@ -520,6 +516,9 @@ func (e *Engine) ForgetSnapshots(ctx context.Context, dockerClient *client.Clien
 		return err
 	}
 	output, err := e.runContainerInternal(ctx, dockerClient, repository, password, []string{"snapshots", "--json"})
+	if err != nil && strings.Contains(err.Error(), rusticRepositoryMissingMessage) {
+		return nil
+	}
 	if err != nil {
 		return err
 	}
@@ -544,18 +543,6 @@ func (e *Engine) ForgetSnapshots(ctx context.Context, dockerClient *client.Clien
 		command = []string{"prune"}
 	}
 	_, err = e.runContainerInternal(ctx, dockerClient, repository, password, command)
-	return err
-}
-
-// PruneRepository runs a plain prune so packs an earlier forget marked for
-// deletion are removed once rustic's keep-delete window has passed. The delay
-// keeps it safe when another Arcane instance shares the repository. A
-// repository that was never initialized has nothing to prune.
-func (e *Engine) PruneRepository(ctx context.Context, dockerClient *client.Client, repository Repository, password string) error {
-	_, err := e.runInternal(ctx, dockerClient, repository, password, []string{"prune"})
-	if err != nil && strings.Contains(err.Error(), rusticRepositoryMissingMessage) {
-		return nil
-	}
 	return err
 }
 
