@@ -12,7 +12,7 @@ import (
 	"github.com/getarcaneapp/arcane/backend/v2/internal/volume"
 )
 
-// BackupRepositoryPruneJobName identifies the daily prune of the local backup repositories.
+// BackupRepositoryPruneJobName identifies the periodic prune of the local backup repositories.
 const BackupRepositoryPruneJobName = "backup-repository-prune"
 
 // BackupRepositoryPruneJob removes packs that deleted backups left marked for deletion.
@@ -27,15 +27,19 @@ func NewBackupRepositoryPruneJob(systemService *system.SystemService, volumeServ
 	return &BackupRepositoryPruneJob{systemService: systemService, volumeService: volumeService}
 }
 
+// Name returns the job name.
 func (j *BackupRepositoryPruneJob) Name() string {
 	return BackupRepositoryPruneJobName
 }
 
+// Schedule runs the prune twice a day, staggered after the default 03:00
+// system backup schedule. Rustic keeps marked packs for 23 hours, so a daily
+// run could leave deleted data on disk for almost two days.
 func (j *BackupRepositoryPruneJob) Schedule(_ context.Context) string {
-	// Staggered after the default 03:00 system backup schedule.
-	return "0 15 4 * * *"
+	return "0 15 4,16 * * *"
 }
 
+// Run prunes the local system and volume backup repositories.
 func (j *BackupRepositoryPruneJob) Run(ctx context.Context) (schedulertypes.Outcome, error) {
 	var pruneErr error
 	if err := j.systemService.PruneLocalBackupRepository(ctx); err != nil {
@@ -51,6 +55,7 @@ func (j *BackupRepositoryPruneJob) Run(ctx context.Context) (schedulertypes.Outc
 	return schedulertypes.Outcome{Status: schedulertypes.Succeeded}, nil
 }
 
+// Reschedule is a no-op: the schedule is fixed.
 func (j *BackupRepositoryPruneJob) Reschedule(_ context.Context) error {
 	return nil
 }
