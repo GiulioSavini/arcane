@@ -495,7 +495,7 @@ func fullSnapshotIDInternal(id string) bool {
 }
 
 // ForgetSnapshots removes the snapshots and prunes their data in a single pass;
-// with no IDs it only prunes. An uninitialized repository has nothing to forget.
+// with no IDs it only prunes, skipping an uninitialized repository.
 func (e *Engine) ForgetSnapshots(ctx context.Context, dockerClient *client.Client, repository Repository, password string, snapshotIDs []string) error {
 	requested := make([]string, 0, len(snapshotIDs))
 	for _, id := range snapshotIDs {
@@ -516,7 +516,7 @@ func (e *Engine) ForgetSnapshots(ctx context.Context, dockerClient *client.Clien
 		return err
 	}
 	output, err := e.runContainerInternal(ctx, dockerClient, repository, password, []string{"snapshots", "--json"})
-	if err != nil && strings.Contains(err.Error(), rusticRepositoryMissingMessage) {
+	if len(snapshotIDs) == 0 && err != nil && strings.Contains(err.Error(), rusticRepositoryMissingMessage) {
 		return nil
 	}
 	if err != nil {
