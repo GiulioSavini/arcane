@@ -197,6 +197,34 @@
 		};
 	}
 
+	// Caps the shell to the viewport space below its unscrolled position so its bottom stays on screen.
+	function fitToViewport(node: HTMLElement) {
+		let frame = 0;
+		const update = () => {
+			cancelAnimationFrame(frame);
+			frame = requestAnimationFrame(() => {
+				let top = node.getBoundingClientRect().top;
+				let bottomGap = parseFloat(getComputedStyle(node).marginBottom);
+				for (let el = node.parentElement; el; el = el.parentElement) {
+					const style = getComputedStyle(el);
+					top += el.scrollTop;
+					bottomGap += parseFloat(style.paddingBottom) + parseFloat(style.borderBottomWidth) + parseFloat(style.marginBottom);
+				}
+				const available = window.innerHeight - top - bottomGap;
+				node.style.maxHeight = `${Math.max(available, window.innerHeight / 2)}px`;
+			});
+		};
+		const observer = new ResizeObserver(update);
+		for (let el = node.parentElement; el; el = el.parentElement) observer.observe(el);
+		window.addEventListener('resize', update);
+		update();
+		return () => {
+			cancelAnimationFrame(frame);
+			observer.disconnect();
+			window.removeEventListener('resize', update);
+		};
+	}
+
 	function toggleRowExpanded(rowId: string) {
 		const next = new Set(expandedRows);
 		if (next.has(rowId)) {
@@ -784,7 +812,7 @@
 {#if customTableView}
 	{@render customTableView({ table, renderPagination: PaginationSnippet, mobileFieldsForOptions, onToggleMobileField })}
 {:else}
-	<div class={shellClass}>
+	<div {@attach fitToViewport} class={shellClass}>
 		{#if !withoutSearch}
 			<div class={toolbarWrapClass}>
 				<DataTableToolbar
@@ -811,7 +839,7 @@
 				{@attach (node) => restoreScroll(node, 'desktop')}
 				bind:this={desktopScrollEl}
 				data-table-scroll="desktop"
-				class="isolate h-full max-h-dvh min-h-0 flex-1 overflow-auto bg-background"
+				class="isolate h-full min-h-0 flex-1 overflow-auto bg-background"
 			>
 				<ArcaneTableDesktopView
 					{rowIndex}
@@ -842,7 +870,7 @@
 				{@attach (node) => restoreScroll(node, 'mobile')}
 				bind:this={mobileScrollEl}
 				data-table-scroll="mobile"
-				class="isolate block max-h-dvh min-h-0 flex-1 overflow-auto bg-background/80"
+				class="isolate block min-h-0 flex-1 overflow-auto bg-background/80"
 			>
 				{#if unstyled}
 					<div class="divide-y divide-border/40">
