@@ -9,9 +9,9 @@ import (
 	"github.com/getarcaneapp/arcane/types/v2/updater"
 	"github.com/spf13/cobra"
 
-	"github.com/getarcaneapp/arcane/cli/v2/internal/client"
 	"github.com/getarcaneapp/arcane/cli/v2/internal/cmdutil"
 	"github.com/getarcaneapp/arcane/cli/v2/internal/output"
+	"github.com/getarcaneapp/arcane/cli/v2/internal/runtime"
 	"github.com/getarcaneapp/arcane/cli/v2/internal/types"
 )
 
@@ -32,7 +32,7 @@ var statusCmd = &cobra.Command{
 	Short:        "Get updater status",
 	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := client.NewFromConfig()
+		c, err := cmdutil.ClientFromCommand(cmd)
 		if err != nil {
 			return err
 		}
@@ -58,7 +58,7 @@ var runCmd = &cobra.Command{
 	Short:        "Run updater",
 	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := client.NewFromConfig()
+		c, err := cmdutil.ClientFromCommand(cmd)
 		if err != nil {
 			return err
 		}
@@ -69,6 +69,10 @@ var runCmd = &cobra.Command{
 		result, err := c.PostJSON[updater.Result](cmd.Context(), types.UpdaterRun(c.EnvID()), nil)
 		if err != nil {
 			return fmt.Errorf("failed to run updater: %w", err)
+		}
+
+		if app, ok := runtime.From(cmd.Context()); ok && app != nil && app.FleetConfirmed && result.Data.Failed > 0 {
+			return fmt.Errorf("updater failed for %d resources", result.Data.Failed)
 		}
 
 		if jsonOutput {
@@ -107,7 +111,7 @@ var historyCmd = &cobra.Command{
 	Short:        "Get updater history",
 	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := client.NewFromConfig()
+		c, err := cmdutil.ClientFromCommand(cmd)
 		if err != nil {
 			return err
 		}
@@ -142,15 +146,16 @@ var historyCmd = &cobra.Command{
 			}
 		}
 
-		if tableErr := output.Table(headers, rows); tableErr != nil {
+		if tableErr := cmdutil.PrintTable(cmd, headers, rows, cmdutil.TableSummary{Resource: "history entries"}); tableErr != nil {
 			return tableErr
 		}
-		_, _ = fmt.Fprintf(output.Stdout(), "\nTotal: %d history entries\n", len(result.Data))
 		return nil
 	},
 }
 
 func init() {
+	cmdutil.SetScope(cmdutil.ScopeRead, UpdaterCmd)
+	cmdutil.SetScope(cmdutil.ScopeFleet, runCmd)
 	UpdaterCmd.AddCommand(statusCmd)
 	UpdaterCmd.AddCommand(runCmd)
 	UpdaterCmd.AddCommand(historyCmd)

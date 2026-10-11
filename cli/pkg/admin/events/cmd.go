@@ -7,7 +7,6 @@ import (
 	"github.com/getarcaneapp/arcane/types/v2/event"
 	"github.com/spf13/cobra"
 
-	"github.com/getarcaneapp/arcane/cli/v2/internal/client"
 	"github.com/getarcaneapp/arcane/cli/v2/internal/cmdutil"
 	"github.com/getarcaneapp/arcane/cli/v2/internal/output"
 	"github.com/getarcaneapp/arcane/cli/v2/internal/types"
@@ -35,7 +34,7 @@ var listCmd = &cobra.Command{
 	Short:        "List events",
 	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := client.NewFromConfig()
+		c, err := cmdutil.ClientFromCommand(cmd)
 		if err != nil {
 			return err
 		}
@@ -45,37 +44,31 @@ var listCmd = &cobra.Command{
 			endpoint = types.EventsEnvironment(c.EnvID())
 		}
 
-		return cmdutil.RunList(cmd, c, eventListSpecInternal(endpoint))
+		return cmdutil.RunList(cmd, c, cmdutil.ListSpec[event.Event]{
+			Resource: "events",
+			Endpoint: endpoint,
+			Params:   cmdutil.ListParams{Resource: "events", Limit: limitFlag, FallbackDefault: 20, Start: startFlag, All: allFlag},
+			JSON:     jsonOutput,
+			Headers:  []string{"ID", "TYPE", "RESOURCE", "USER", "TIMESTAMP"},
+			Row: func(evt event.Event) []string {
+				resource := ""
+				if evt.ResourceName != nil && evt.ResourceType != nil {
+					resource = fmt.Sprintf("%s (%s)", *evt.ResourceName, *evt.ResourceType)
+				}
+				username := ""
+				if evt.Username != nil {
+					username = *evt.Username
+				}
+				return []string{
+					evt.ID,
+					evt.Type,
+					resource,
+					username,
+					evt.Timestamp.String(),
+				}
+			},
+		})
 	},
-}
-
-// eventListSpecInternal builds the shared list spec for the global and
-// per-environment event list commands, which render identically.
-func eventListSpecInternal(endpoint string) cmdutil.ListSpec[event.Event] {
-	return cmdutil.ListSpec[event.Event]{
-		Resource: "events",
-		Endpoint: endpoint,
-		Params:   cmdutil.ListParams{Resource: "events", Limit: limitFlag, FallbackDefault: 20, Start: startFlag, All: allFlag},
-		JSON:     jsonOutput,
-		Headers:  []string{"ID", "TYPE", "RESOURCE", "USER", "TIMESTAMP"},
-		Row: func(evt event.Event) []string {
-			resource := ""
-			if evt.ResourceName != nil && evt.ResourceType != nil {
-				resource = fmt.Sprintf("%s (%s)", *evt.ResourceName, *evt.ResourceType)
-			}
-			username := ""
-			if evt.Username != nil {
-				username = *evt.Username
-			}
-			return []string{
-				evt.ID,
-				evt.Type,
-				resource,
-				username,
-				evt.Timestamp.String(),
-			}
-		},
-	}
 }
 
 var deleteCmd = &cobra.Command{
@@ -96,7 +89,7 @@ var deleteCmd = &cobra.Command{
 			}
 		}
 
-		c, err := client.NewFromConfig()
+		c, err := cmdutil.ClientFromCommand(cmd)
 		if err != nil {
 			return err
 		}
@@ -115,7 +108,7 @@ var statsCmd = &cobra.Command{
 	Short:        "Show global event counts by severity",
 	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := client.NewFromConfig()
+		c, err := cmdutil.ClientFromCommand(cmd)
 		if err != nil {
 			return err
 		}
@@ -148,6 +141,8 @@ var statsCmd = &cobra.Command{
 }
 
 func init() {
+	cmdutil.SetScope(cmdutil.ScopeRead, listCmd)
+	listCmd.Annotations["arcane:scope-flag"] = "environment"
 	EventsCmd.AddCommand(listCmd)
 	EventsCmd.AddCommand(deleteCmd)
 	EventsCmd.AddCommand(statsCmd)

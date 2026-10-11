@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/getarcaneapp/arcane/types/v2/base"
@@ -66,21 +67,24 @@ var listCmd = &cobra.Command{
 			if item.LastTriggeredAt != nil {
 				lastTriggered = item.LastTriggeredAt.Format(time.RFC3339)
 			}
+			target := item.TargetType
+			if name := cmp.Or(item.TargetName, item.TargetID); name != "" {
+				target += "/" + name
+			}
 			rows[i] = []string{
 				item.ID,
 				item.Name,
 				item.ActionType,
-				webhookTarget(item),
+				target,
 				item.TokenPrefix,
 				enabled,
 				lastTriggered,
 			}
 		}
 
-		if tableErr := output.Table(headers, rows); tableErr != nil {
+		if tableErr := cmdutil.PrintTable(cmd, headers, rows, cmdutil.TableSummary{Resource: "webhooks", Total: int64(len(result.Data)), Paginated: true}); tableErr != nil {
 			return tableErr
 		}
-		output.Showing(len(result.Data), int64(len(result.Data)), "webhooks")
 		return nil
 	},
 }
@@ -218,6 +222,11 @@ var triggerCmd = &cobra.Command{
 }
 
 func init() {
+	cmdutil.SetResource(webhookRef, updateCmd, deleteCmd)
+	cmdutil.SetScope(cmdutil.ScopeResource, WebhooksCmd)
+	cmdutil.SetScope(cmdutil.ScopeRead, listCmd)
+	cmdutil.SetScope(cmdutil.ScopeDestination, createCmd)
+	cmdutil.SetScope(cmdutil.ScopeGlobal, triggerCmd)
 	WebhooksCmd.AddCommand(listCmd)
 	WebhooksCmd.AddCommand(createCmd)
 	WebhooksCmd.AddCommand(updateCmd)
@@ -249,10 +258,12 @@ func init() {
 	triggerCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
 }
 
-func webhookTarget(item webhook.Summary) string {
-	name := cmp.Or(item.TargetName, item.TargetID)
-	if name == "" {
-		return item.TargetType
-	}
-	return fmt.Sprintf("%s/%s", item.TargetType, name)
+var webhookRef = cmdutil.ResourceRef[webhook.Summary, webhook.Summary]{
+	EnvironmentScoped: true,
+	Singular:          "webhook", Plural: "webhooks",
+	IDHint: "the identifier", ListCmd: "arcane-cli webhooks list",
+	GetPath: nil, ListPath: types.Webhooks,
+	Matches: func(item webhook.Summary, lower, original string) bool { return strings.EqualFold(item.ID, original) },
+	Label:   func(item webhook.Summary) string { return item.Name + " (" + item.ID + ")" },
+	Promote: func(item webhook.Summary) *webhook.Summary { return &item },
 }

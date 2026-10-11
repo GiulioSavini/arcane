@@ -2,6 +2,7 @@ package cmdutil
 
 import (
 	"bytes"
+	"cmp"
 	"encoding/json/jsontext"
 	"encoding/json/v2"
 	"errors"
@@ -58,11 +59,7 @@ func DecodeJSON[T any](resp *http.Response, out *T) error {
 	return nil
 }
 
-// ReadJSONBody enforces a successful HTTP status and returns the raw response body.
-// Use it when a command needs both to decode a response and to echo it verbatim,
-// so that fields the CLI does not model — such as the counts and groups objects
-// on the container, volume, network and gitops-sync list endpoints — survive
-// --json output instead of being dropped by a re-marshal.
+// ReadJSONBody enforces HTTP and API success while retaining every response field.
 func ReadJSONBody(resp *http.Response) ([]byte, error) {
 	if err := EnsureSuccessStatus(resp); err != nil {
 		return nil, err
@@ -70,6 +67,13 @@ func ReadJSONBody(resp *http.Response) ([]byte, error) {
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read response: %w", err)
+	}
+	var status struct {
+		Success *bool  `json:"success"`
+		Error   string `json:"error"`
+	}
+	if json.Unmarshal(body, &status) == nil && status.Success != nil && !*status.Success {
+		return nil, fmt.Errorf("API error: %s", cmp.Or(status.Error, "request was not successful"))
 	}
 	return body, nil
 }

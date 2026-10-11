@@ -1,34 +1,4 @@
 // Package cli provides the root command and entry point for the Arcane CLI.
-//
-// The Arcane CLI is the official command-line interface for interacting with
-// Arcane servers. It provides commands for managing containers, images,
-// configuration, and more.
-//
-// # Getting Started
-//
-// Configure the CLI with your server URL and API key:
-//
-//	arcane config set server-url https://your-server.com api-key YOUR_API_KEY
-//
-// # Global Flags
-//
-// The following flags are available on all commands:
-//
-//	--log-level string   Log level (debug, info, warn, error, fatal) (default "info")
-//	--json               Output in JSON format
-//	-v, --version        Print version information
-//
-// # Command Groups
-//
-//   - admin: Administration & platform management
-//   - auth: Authentication operations
-//   - config: Manage CLI configuration
-//   - containers: Manage containers
-//   - images: Manage Docker images and updates
-//   - jobs: Manage background jobs
-//   - generate: Generate secrets and tokens
-//   - variables: Manage global variables
-//   - version: Display version information
 package cli
 
 import (
@@ -46,6 +16,7 @@ import (
 	"charm.land/lipgloss/v2"
 	"github.com/spf13/cobra"
 
+	"github.com/getarcaneapp/arcane/cli/v2/internal/cmdutil"
 	"github.com/getarcaneapp/arcane/cli/v2/internal/config"
 	"github.com/getarcaneapp/arcane/cli/v2/internal/logger"
 	"github.com/getarcaneapp/arcane/cli/v2/internal/output"
@@ -102,20 +73,19 @@ var rootCmd = &cobra.Command{
 			}
 		}
 
+		outputMode = cmp.Or(strings.ToLower(strings.TrimSpace(outputMode)), string(runtimectx.OutputModeText))
 		if globalJSON && !cmd.Flags().Changed("output") {
 			outputMode = string(runtimectx.OutputModeJSON)
 		}
-		outputMode = strings.ToLower(strings.TrimSpace(outputMode))
-		if outputMode == "" {
-			outputMode = string(runtimectx.OutputModeText)
-		}
-		if outputMode != string(runtimectx.OutputModeText) && outputMode != string(runtimectx.OutputModeJSON) {
-			return fmt.Errorf("invalid --output value %q (expected text or json)", outputMode)
-		}
-		if outputMode == string(runtimectx.OutputModeJSON) {
+		runtimeMode := runtimectx.OutputMode(outputMode)
+		switch runtimeMode {
+		case runtimectx.OutputModeJSON:
 			if flag := cmd.Flags().Lookup("json"); flag != nil && !flag.Changed {
 				_ = cmd.Flags().Set("json", "true")
 			}
+		case runtimectx.OutputModeText:
+		default:
+			return fmt.Errorf("invalid --output value %q (expected text or json)", outputMode)
 		}
 
 		// Load config to check for log level setting
@@ -126,17 +96,15 @@ var rootCmd = &cobra.Command{
 			logLevel = cfg.LogLevel
 		}
 
-		jsonMode := outputMode == string(runtimectx.OutputModeJSON)
-		if flag := cmd.Flags().Lookup("json"); flag != nil {
-			localJSON, _ := cmd.Flags().GetBool("json")
-			jsonMode = jsonMode || localJSON
+		if localJSON, _ := cmd.Flags().GetBool("json"); localJSON {
+			runtimeMode = runtimectx.OutputModeJSON
 		}
-		output.Configure(cmd.OutOrStdout(), cmd.ErrOrStderr(), jsonMode, noColorOutput, cmd.Short)
+		output.Configure(cmd.OutOrStdout(), cmd.ErrOrStderr(), runtimeMode == runtimectx.OutputModeJSON, noColorOutput, cmd.Short)
 		logger.Setup(cmd.ErrOrStderr(), logLevel, logJSONOutput)
 
 		app, err := runtimectx.New(runtimectx.Options{
 			EnvOverride:    envOverride,
-			OutputMode:     runtimectx.OutputMode(outputMode),
+			OutputMode:     runtimeMode,
 			AssumeYes:      assumeYes,
 			NoColor:        noColorOutput,
 			RequestTimeout: requestTimeout,
@@ -174,7 +142,23 @@ func Execute() {
 	if err := fang.Execute(
 		ctx,
 		rootCmd,
-		fang.WithColorSchemeFunc(arcaneFangColorSchemeInternal),
+		fang.WithColorSchemeFunc(func(c lipgloss.LightDarkFunc) fang.ColorScheme {
+			scheme := fang.DefaultColorScheme(c)
+			scheme.Base = c(lipgloss.Color("#1f2937"), lipgloss.Color("#e5e7eb"))
+			scheme.Title = c(lipgloss.Color("#6d28d9"), lipgloss.Color("#a78bfa"))
+			scheme.Description = scheme.Base
+			scheme.Codeblock = c(lipgloss.Color("#f5f3ff"), lipgloss.Color("#241b35"))
+			scheme.Program = scheme.Title
+			scheme.Command = c(lipgloss.Color("#7c3aed"), lipgloss.Color("#c4b5fd"))
+			scheme.DimmedArgument = c(lipgloss.Color("#64748b"), lipgloss.Color("#94a3b8"))
+			scheme.Comment = c(lipgloss.Color("#64748b"), lipgloss.Color("#cbd5e1"))
+			scheme.Flag = scheme.Title
+			scheme.FlagDefault = c(lipgloss.Color("#64748b"), lipgloss.Color("#cbd5e1"))
+			scheme.Argument = scheme.Base
+			scheme.Help = scheme.Base
+			scheme.Dash = scheme.Base
+			return scheme
+		}),
 		fang.WithErrorHandler(func(w io.Writer, _ fang.Styles, err error) { output.WriteError(w, err) }),
 		fang.WithVersion(config.Version),
 		fang.WithCommit(config.Revision),
@@ -191,27 +175,9 @@ func RootCommand() *cobra.Command {
 	return rootCmd
 }
 
-func arcaneFangColorSchemeInternal(c lipgloss.LightDarkFunc) fang.ColorScheme {
-	scheme := fang.DefaultColorScheme(c)
-	scheme.Base = c(lipgloss.Color("#1f2937"), lipgloss.Color("#e5e7eb"))
-	scheme.Title = c(lipgloss.Color("#6d28d9"), lipgloss.Color("#a78bfa"))
-	scheme.Description = scheme.Base
-	scheme.Codeblock = c(lipgloss.Color("#f5f3ff"), lipgloss.Color("#241b35"))
-	scheme.Program = scheme.Title
-	scheme.Command = c(lipgloss.Color("#7c3aed"), lipgloss.Color("#c4b5fd"))
-	scheme.DimmedArgument = c(lipgloss.Color("#64748b"), lipgloss.Color("#94a3b8"))
-	scheme.Comment = c(lipgloss.Color("#64748b"), lipgloss.Color("#cbd5e1"))
-	scheme.Flag = scheme.Title
-	scheme.FlagDefault = c(lipgloss.Color("#64748b"), lipgloss.Color("#cbd5e1"))
-	scheme.Argument = scheme.Base
-	scheme.Help = scheme.Base
-	scheme.Dash = scheme.Base
-	return scheme
-}
-
-func instrumentCommandTreeInternal(cmd *cobra.Command) {
+func instrumentCommandTree(cmd *cobra.Command) {
 	for _, child := range cmd.Commands() {
-		instrumentCommandTreeInternal(child)
+		instrumentCommandTree(child)
 	}
 
 	if cmd.RunE == nil && cmd.Run == nil {
@@ -232,7 +198,7 @@ func instrumentCommandTreeInternal(cmd *cobra.Command) {
 		originalRunE := cmd.RunE
 		cmd.RunE = func(command *cobra.Command, args []string) error {
 			logger.GetLogger().Debug(action, "command", command.CommandPath(), "arg_count", len(args))
-			return originalRunE(command, args)
+			return cmdutil.RunScoped(command, args, originalRunE)
 		}
 	}
 
@@ -284,5 +250,5 @@ func init() {
 	rootCmd.AddCommand(activities.ActivitiesCmd)
 	rootCmd.AddCommand(webhooks.WebhooksCmd)
 
-	instrumentCommandTreeInternal(rootCmd)
+	instrumentCommandTree(rootCmd)
 }

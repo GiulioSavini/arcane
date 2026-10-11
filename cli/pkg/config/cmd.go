@@ -52,11 +52,16 @@ var configShowCmd = &cobra.Command{
 		output.KeyValue("API key", maskAPIKey(cfg.APIKey))
 		output.KeyValue("JWT token", maskAPIKey(cfg.JWTToken))
 		output.KeyValue("Refresh token", maskAPIKey(cfg.RefreshToken))
+		output.KeyValue("Previews: all environments", strconv.FormatBool(cfg.Previews.AllEnvironments))
 		output.KeyValue("Environment", cmp.Or(cfg.DefaultEnvironment, "0 (local)"))
 		output.KeyValue("Federated audience", cmp.Or(cfg.FederatedAudience, "(not set)"))
 		output.KeyValue("Log level", cmp.Or(cfg.LogLevel, "info (default)"))
 		output.KeyValue("Update channel", cmp.Or(cfg.CLIUpdateChannel, "(auto)"))
-		output.KeyValue("Pagination limit", cmp.Or(intToString(cfg.Pagination.Default.Limit), "(not set)"))
+		paginationLimit := "(not set)"
+		if cfg.Pagination.Default.Limit > 0 {
+			paginationLimit = strconv.Itoa(cfg.Pagination.Default.Limit)
+		}
+		output.KeyValue("Pagination limit", paginationLimit)
 		output.Header("Pagination resources")
 		printed := 0
 		for _, resource := range types.KnownPaginatedResources {
@@ -109,6 +114,7 @@ Preferred syntax (key/value pairs):
 Examples:
 	arcane config set server-url http://localhost:3553
 	arcane config set api-key arc_xxxxxxxxxxxxx
+	arcane config set previews.allEnvironments true
 	arcane config set pagination.default.limit 25
 	arcane config set pagination.resources.images.limit 100
 	arcane config set server-url http://localhost:3553 api-key arc_xxxxxxxxxxxxx
@@ -131,11 +137,43 @@ Legacy flag syntax (flags shown below) is still supported:
 		}
 		updated = updated || updatedByArgs
 
-		updatedByFlags, err := applyConfigSetFlags(cmd, cfg)
-		if err != nil {
-			return err
+		for _, flag := range []struct{ key, value string }{
+			{"server-url", setServerURL},
+			{"api-key", setAPIKey},
+			{"jwt-token", setJWTToken},
+			{"environment", setEnvironment},
+			{"federated-audience", setFederatedAudience},
+			{"log-level", setLogLevel},
+		} {
+			if flag.value != "" {
+				if _, setErr := applyConfigSetArg(cfg, flag.key, flag.value); setErr != nil {
+					return setErr
+				}
+				updated = true
+			}
 		}
-		updated = updated || updatedByFlags
+		if cmd.Flags().Changed("default-limit") {
+			if setDefaultLimit < 0 {
+				return errors.New("--default-limit must be >= 0")
+			}
+			if _, setErr := applyConfigSetArg(cfg, "default-limit", strconv.Itoa(setDefaultLimit)); setErr != nil {
+				return setErr
+			}
+			updated = true
+		}
+		for _, pair := range setResourceLimit {
+			_, limit, ok := parseResourceLimitPair(pair)
+			if !ok {
+				return fmt.Errorf("invalid --resource-limit %q (expected resource=number, resources: %s)", pair, strings.Join(types.KnownPaginatedResources, ", "))
+			}
+			if limit < 0 {
+				return fmt.Errorf("invalid --resource-limit %q (limit must be >= 0)", pair)
+			}
+			if _, setErr := applyConfigSetArg(cfg, "resource-limit", pair); setErr != nil {
+				return setErr
+			}
+			updated = true
+		}
 
 		if !updated {
 			return errors.New("no configuration values provided. Use `arcane config set <key> <value>` (e.g. `arcane config set server-url " +
@@ -317,84 +355,6 @@ func parseResourceLimitPair(pair string) (resource string, limit int, ok bool) {
 	return resource, parsed, true
 }
 
-func applyConfigSetFlags(cmd *cobra.Command, cfg *types.Config) (bool, error) {
-	updated := false
-
-	if setServerURL != "" {
-		cfg.ServerURL = setServerURL
-		_, _ = fmt.Fprintf(output.Stdout(), "Set server_url = %s\n", setServerURL)
-		updated = true
-	}
-
-	if setAPIKey != "" {
-		cfg.APIKey = setAPIKey
-		// If switching to API key auth, clear any existing JWT token.
-		cfg.JWTToken = ""
-		cfg.RefreshToken = ""
-		_, _ = fmt.Fprintf(output.Stdout(), "Set api_key = %s\n", maskAPIKey(setAPIKey))
-		updated = true
-	}
-
-	if setJWTToken != "" {
-		cfg.JWTToken = setJWTToken
-		// If switching to JWT auth, clear any existing API key.
-		cfg.APIKey = ""
-		cfg.RefreshToken = ""
-		_, _ = fmt.Fprintf(output.Stdout(), "Set jwt_token = %s\n", maskAPIKey(setJWTToken))
-		updated = true
-	}
-
-	if setEnvironment != "" {
-		cfg.DefaultEnvironment = setEnvironment
-		_, _ = fmt.Fprintf(output.Stdout(), "Set default_environment = %s\n", setEnvironment)
-		updated = true
-	}
-
-	if setFederatedAudience != "" {
-		cfg.FederatedAudience = setFederatedAudience
-		_, _ = fmt.Fprintf(output.Stdout(), "Set federated_audience = %s\n", setFederatedAudience)
-		updated = true
-	}
-
-	if setLogLevel != "" {
-		cfg.LogLevel = setLogLevel
-		_, _ = fmt.Fprintf(output.Stdout(), "Set log_level = %s\n", setLogLevel)
-		updated = true
-	}
-
-	if cmd.Flags().Changed("default-limit") {
-		if setDefaultLimit < 0 {
-			return false, errors.New("--default-limit must be >= 0")
-		}
-		cfg.SetDefaultLimit(setDefaultLimit)
-		if setDefaultLimit == 0 {
-			_, _ = fmt.Fprintln(output.Stdout(), "Cleared pagination.default.limit")
-		} else {
-			_, _ = fmt.Fprintf(output.Stdout(), "Set pagination.default.limit = %d\n", setDefaultLimit)
-		}
-		updated = true
-	}
-
-	for _, pair := range setResourceLimit {
-		resource, limit, ok := parseResourceLimitPair(pair)
-		if !ok {
-			return false, fmt.Errorf("invalid --resource-limit %q (expected resource=number, resources: %s)", pair, strings.Join(types.KnownPaginatedResources, ", "))
-		}
-		if limit < 0 {
-			return false, fmt.Errorf("invalid --resource-limit %q (limit must be >= 0)", pair)
-		}
-		cfg.SetResourceLimit(resource, limit)
-		if limit == 0 {
-			_, _ = fmt.Fprintf(output.Stdout(), "Cleared pagination.resources.%s.limit\n", resource)
-		} else {
-			_, _ = fmt.Fprintf(output.Stdout(), "Set pagination.resources.%s.limit = %d\n", resource, limit)
-		}
-		updated = true
-	}
-
-	return updated, nil
-}
-
 func applyConfigSetArgs(cfg *types.Config, args []string) (bool, error) {
 	if len(args) == 0 {
 		return false, nil
@@ -415,7 +375,7 @@ func applyConfigSetArgs(cfg *types.Config, args []string) (bool, error) {
 }
 
 func applyConfigSetArg(cfg *types.Config, key, value string) (bool, error) {
-	normalized := normalizeConfigKey(key)
+	normalized := strings.ReplaceAll(strings.ToLower(strings.TrimSpace(key)), " ", "")
 	switch normalized {
 	case "server-url", "server", "serverurl", "server_url":
 		cfg.ServerURL = value
@@ -434,6 +394,14 @@ func applyConfigSetArg(cfg *types.Config, key, value string) (bool, error) {
 		cfg.APIKey = ""
 		cfg.RefreshToken = ""
 		_, _ = fmt.Fprintf(output.Stdout(), "Set jwt_token = %s\n", maskAPIKey(value))
+		return true, nil
+	case "previews.allenvironments":
+		enabled, err := strconv.ParseBool(value)
+		if err != nil {
+			return false, fmt.Errorf("invalid previews.allEnvironments value %q (expected true or false)", value)
+		}
+		cfg.Previews.AllEnvironments = enabled
+		_, _ = fmt.Fprintf(output.Stdout(), "Set previews.allEnvironments = %t\n", enabled)
 		return true, nil
 	case "environment", "default-environment", "default_environment":
 		cfg.DefaultEnvironment = value
@@ -499,7 +467,7 @@ func applyConfigSetArg(cfg *types.Config, key, value string) (bool, error) {
 
 func applyResourceLimitByKey(cfg *types.Config, key, resourceValue, limitValue string) (bool, error) {
 	resource := types.NormalizePaginatedResource(resourceValue)
-	if resource == "" || !isKnownPaginatedResource(resource) {
+	if resource == "" || !slices.Contains(types.KnownPaginatedResources, resource) {
 		return false, fmt.Errorf("invalid resource %q for key %q (supported resources: %s)", resourceValue, key, strings.Join(types.KnownPaginatedResources, ", "))
 	}
 	limit, err := parseLimitValue(key, limitValue)
@@ -515,10 +483,6 @@ func applyResourceLimitByKey(cfg *types.Config, key, resourceValue, limitValue s
 	return true, nil
 }
 
-func isKnownPaginatedResource(resource string) bool {
-	return slices.Contains(types.KnownPaginatedResources, resource)
-}
-
 func parseLimitValue(key, value string) (int, error) {
 	parsed, err := strconv.Atoi(strings.TrimSpace(value))
 	if err != nil {
@@ -528,17 +492,4 @@ func parseLimitValue(key, value string) (int, error) {
 		return 0, fmt.Errorf("invalid value %q for key %q (must be >= 0)", value, key)
 	}
 	return parsed, nil
-}
-
-func normalizeConfigKey(key string) string {
-	k := strings.ToLower(strings.TrimSpace(key))
-	k = strings.ReplaceAll(k, " ", "")
-	return k
-}
-
-func intToString(v int) string {
-	if v <= 0 {
-		return ""
-	}
-	return strconv.Itoa(v)
 }

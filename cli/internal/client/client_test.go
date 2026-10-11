@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -45,8 +47,6 @@ func TestClient_UsesAPIKeyHeader(t *testing.T) {
 }
 
 func TestClient_UsesBearerTokenHeader(t *testing.T) {
-	t.Parallel()
-
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got := r.Header.Get("Authorization"); got != "Bearer header.payload.sig" {
 			w.WriteHeader(http.StatusUnauthorized)
@@ -60,21 +60,33 @@ func TestClient_UsesBearerTokenHeader(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	cfg := &types.Config{ServerURL: srv.URL, JWTToken: "header.payload.sig"}
-	c, err := New(cfg)
+	for _, source := range []string{"config", "environment"} {
+		t.Run(source, func(t *testing.T) {
+			cfg := &types.Config{ServerURL: srv.URL, JWTToken: "header.payload.sig"}
+			if source == "environment" {
+				t.Setenv("ARCANE_TOKEN", "header.payload.sig")
+				cfg.APIKey, cfg.JWTToken, cfg.RefreshToken = "arc_test_key", "", "saved-refresh"
+			}
+			c, err := New(cfg)
 
-	require.NoError(t, err,
-		"New() error: %v", err)
+			require.NoError(t, err,
+				"New() error: %v", err)
 
-	resp, err := c.Get(t.Context(), "/api/version")
+			resp, err := c.Get(t.Context(), "/api/version")
 
-	require.NoError(t, err,
-		"Get() error: %v", err)
+			require.NoError(t, err,
+				"Get() error: %v", err)
 
-	_ = resp.Body.Close()
+			_ = resp.Body.Close()
 
-	require.Equal(t, http.StatusOK, resp.StatusCode,
-		"unexpected status: %d", resp.StatusCode)
+			require.Equal(t, http.StatusOK, resp.StatusCode,
+				"unexpected status: %d", resp.StatusCode)
+			if source == "environment" {
+				require.Equal(t, "saved-refresh", cfg.RefreshToken)
+				require.Empty(t, c.refreshToken)
+			}
+		})
+	}
 }
 
 func TestClient_NewUnauthenticated_DoesNotSendAuthHeaders(t *testing.T) {
@@ -148,4 +160,134 @@ func TestClient_Request_DoesNotDoubleMarshalBytes(t *testing.T) {
 
 	require.Equal(t, http.StatusOK, resp.StatusCode,
 		"unexpected status: %d", resp.StatusCode)
+}
+
+func TestClient_RetriesIdempotentRequests(t *testing.T) {
+	t.Parallel()
+
+	var attempts atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		current := attempts.Add(1)
+		if current == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`{"error":"temporary"}`))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"success":true,"data":{"value":"ok"}}`))
+	}))
+	defer srv.Close()
+
+	cfg := &types.Config{ServerURL: srv.URL, APIKey: "arc_test_key"}
+	c, err := New(cfg)
+
+	require.NoError(t, err,
+		"New() error: %v", err)
+
+	c.SetRetryPolicy(3, 1*time.Millisecond, 2*time.Millisecond)
+
+	resp, err := c.Get(t.Context(), "/api/version")
+
+	require.NoError(t, err,
+		"Get() error: %v", err)
+
+	_ = resp.Body.Close()
+	{
+		got := attempts.Load()
+		require.Equal(t, int32(2), got,
+			"expected 2 attempts, got %d", got)
+	}
+}
+
+func TestClient_DoesNotRetryNonIdempotentRequests(t *testing.T) {
+	t.Parallel()
+
+	var attempts atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts.Add(1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"error":"temporary"}`))
+	}))
+	defer srv.Close()
+
+	cfg := &types.Config{ServerURL: srv.URL, APIKey: "arc_test_key"}
+	c, err := New(cfg)
+
+	require.NoError(t, err,
+		"New() error: %v", err)
+
+	c.SetRetryPolicy(3, 1*time.Millisecond, 2*time.Millisecond)
+
+	resp, err := c.Post(t.Context(), "/api/version", map[string]any{"a": 1})
+
+	require.NoError(t, err,
+		"Post() returned transport error: %v", err)
+
+	_ = resp.Body.Close()
+	{
+		got := attempts.Load()
+		require.Equal(t, int32(1), got,
+			"expected 1 attempt, got %d", got)
+	}
+}
+
+func TestClient_DoJSON_StrictStatus(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"success":false,"error":"unauthorized"}`))
+	}))
+	defer srv.Close()
+
+	cfg := &types.Config{ServerURL: srv.URL, APIKey: "arc_test_key"}
+	c, err := New(cfg)
+
+	require.NoError(t, err,
+		"New() error: %v", err)
+
+	{
+		_, requestErr := c.DoJSON[map[string]any](t.Context(), http.MethodGet, "/api/version", nil)
+		require.Error(t, requestErr,
+			"expected strict status error")
+	}
+}
+
+func TestDecodeResponseStrict_RequiresSuccessEnvelope(t *testing.T) {
+	t.Parallel()
+
+	rec := httptest.NewRecorder()
+	rec.Code = http.StatusOK
+	rec.Body.WriteString(`{"success":false,"error":"not ok"}`)
+
+	resp := rec.Result()
+	{
+		_, err := decodeResponseStrict[map[string]any](resp)
+		require.Error(t, err,
+			"expected envelope failure")
+	}
+}
+
+func TestClient_DoRaw_Success(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true})
+	}))
+	defer srv.Close()
+
+	cfg := &types.Config{ServerURL: srv.URL, APIKey: "arc_test_key"}
+	c, err := New(cfg)
+
+	require.NoError(t, err,
+		"New() error: %v", err)
+
+	b, err := c.DoRaw(t.Context(), http.MethodGet, "/api/version", nil)
+
+	require.NoError(t, err,
+		"DoRaw() error: %v", err)
+
+	require.NotEmpty(t, b,
+		"expected response payload")
 }

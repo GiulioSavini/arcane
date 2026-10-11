@@ -8,7 +8,6 @@ import (
 	"github.com/getarcaneapp/arcane/types/v2/gitops"
 	"github.com/spf13/cobra"
 
-	"github.com/getarcaneapp/arcane/cli/v2/internal/client"
 	"github.com/getarcaneapp/arcane/cli/v2/internal/cmdutil"
 	"github.com/getarcaneapp/arcane/cli/v2/internal/output"
 	"github.com/getarcaneapp/arcane/cli/v2/internal/prompt"
@@ -48,7 +47,7 @@ var listCmd = &cobra.Command{
 	Short:        "List GitOps syncs",
 	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := client.NewFromConfig()
+		c, err := cmdutil.ClientFromCommand(cmd)
 		if err != nil {
 			return err
 		}
@@ -90,7 +89,7 @@ var createCmd = &cobra.Command{
 	Short:        "Create a new GitOps sync",
 	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := client.NewFromConfig()
+		c, err := cmdutil.ClientFromCommand(cmd)
 		if err != nil {
 			return err
 		}
@@ -135,7 +134,7 @@ var getCmd = &cobra.Command{
 	Args:         cobra.ExactArgs(1),
 	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := client.NewFromConfig()
+		c, err := cmdutil.ClientFromCommand(cmd)
 		if err != nil {
 			return err
 		}
@@ -185,7 +184,7 @@ var updateCmd = &cobra.Command{
 	Args:         cobra.ExactArgs(1),
 	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := client.NewFromConfig()
+		c, err := cmdutil.ClientFromCommand(cmd)
 		if err != nil {
 			return err
 		}
@@ -240,7 +239,7 @@ var deleteCmd = &cobra.Command{
 	Args:         cobra.ExactArgs(1),
 	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := client.NewFromConfig()
+		c, err := cmdutil.ClientFromCommand(cmd)
 		if err != nil {
 			return err
 		}
@@ -285,7 +284,7 @@ var statusCmd = &cobra.Command{
 	Args:         cobra.ExactArgs(1),
 	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := client.NewFromConfig()
+		c, err := cmdutil.ClientFromCommand(cmd)
 		if err != nil {
 			return err
 		}
@@ -332,7 +331,7 @@ var syncCmd = &cobra.Command{
 	Args:         cobra.ExactArgs(1),
 	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := client.NewFromConfig()
+		c, err := cmdutil.ClientFromCommand(cmd)
 		if err != nil {
 			return err
 		}
@@ -370,7 +369,7 @@ var filesCmd = &cobra.Command{
 	Args:         cobra.ExactArgs(1),
 	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := client.NewFromConfig()
+		c, err := cmdutil.ClientFromCommand(cmd)
 		if err != nil {
 			return err
 		}
@@ -407,7 +406,7 @@ var importCmd = &cobra.Command{
 	Short:        "Import a GitOps sync configuration",
 	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := client.NewFromConfig()
+		c, err := cmdutil.ClientFromCommand(cmd)
 		if err != nil {
 			return err
 		}
@@ -452,6 +451,9 @@ var importCmd = &cobra.Command{
 }
 
 func init() {
+	cmdutil.SetScope(cmdutil.ScopeResource, GitopsCmd)
+	cmdutil.SetScope(cmdutil.ScopeRead, listCmd)
+	cmdutil.SetScope(cmdutil.ScopeDestination, createCmd, importCmd)
 	GitopsCmd.AddCommand(listCmd)
 	GitopsCmd.AddCommand(createCmd)
 	GitopsCmd.AddCommand(getCmd)
@@ -525,13 +527,26 @@ func init() {
 }
 
 var gitopsSyncRef = cmdutil.ResourceRef[gitops.GitOpsSync, gitops.GitOpsSync]{
-	Singular: "gitops sync",
-	Plural:   "gitops syncs",
-	IDHint:   "the sync ID",
-	ListCmd:  "arcane gitops list",
-	GetPath:  types.GitOpsSync,
-	ListPath: types.GitOpsSyncs,
-	Matches:  gitOpsSyncMatches,
+	EnvironmentScoped: true,
+	Singular:          "gitops sync",
+	Plural:            "gitops syncs",
+	IDHint:            "the sync ID",
+	ListCmd:           "arcane gitops list",
+	GetPath:           types.GitOpsSync,
+	ListPath:          types.GitOpsSyncs,
+	Matches: func(item gitops.GitOpsSync, identifierLower, original string) bool {
+		idLower := strings.ToLower(item.ID)
+		if idLower == identifierLower || (len(identifierLower) >= 4 && strings.HasPrefix(idLower, identifierLower)) {
+			return true
+		}
+		if strings.Contains(idLower, identifierLower) {
+			return true
+		}
+		if strings.Contains(strings.ToLower(item.Name), identifierLower) {
+			return true
+		}
+		return strings.EqualFold(item.Name, original)
+	},
 	Label: func(match gitops.GitOpsSync) string {
 		lastStatus := "-"
 		if match.LastSyncStatus != nil {
@@ -540,20 +555,6 @@ var gitopsSyncRef = cmdutil.ResourceRef[gitops.GitOpsSync, gitops.GitOpsSync]{
 		return fmt.Sprintf("%s (%s, %s)", match.Name, match.ID, lastStatus)
 	},
 	Promote: func(match gitops.GitOpsSync) *gitops.GitOpsSync { return &match },
-}
-
-func gitOpsSyncMatches(item gitops.GitOpsSync, identifierLower, original string) bool {
-	idLower := strings.ToLower(item.ID)
-	if idLower == identifierLower || (len(identifierLower) >= 4 && strings.HasPrefix(idLower, identifierLower)) {
-		return true
-	}
-	if strings.Contains(idLower, identifierLower) {
-		return true
-	}
-	if strings.Contains(strings.ToLower(item.Name), identifierLower) {
-		return true
-	}
-	return strings.EqualFold(item.Name, original)
 }
 
 func flattenFileTree(nodes []gitops.FileTreeNode, depth int) [][]string {

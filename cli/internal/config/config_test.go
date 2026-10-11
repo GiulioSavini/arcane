@@ -12,7 +12,7 @@ import (
 	"github.com/getarcaneapp/arcane/cli/v2/internal/types"
 )
 
-func setTempConfigPathInternal(t *testing.T) string {
+func setTempConfigPath(t *testing.T) string {
 	t.Helper()
 
 	path := filepath.Join(t.TempDir(), "arcanecli.yml")
@@ -33,7 +33,7 @@ func setTempConfigPathInternal(t *testing.T) string {
 }
 
 func TestLoadReturnsDefaultsWhenFileMissing(t *testing.T) {
-	path := setTempConfigPathInternal(t)
+	path := setTempConfigPath(t)
 	{
 		_, err := os.Stat(path)
 		require.True(t, os.IsNotExist(err),
@@ -48,6 +48,7 @@ func TestLoadReturnsDefaultsWhenFileMissing(t *testing.T) {
 	require.Equal(t, "http://localhost:3552", cfg.ServerURL,
 		"ServerURL=%q, want %q", cfg.ServerURL, "http://localhost:3552")
 
+	require.False(t, cfg.Previews.AllEnvironments)
 	require.Equal(t, "0", cfg.DefaultEnvironment,
 		"DefaultEnvironment=%q, want %q", cfg.DefaultEnvironment, "0")
 
@@ -68,10 +69,11 @@ func TestLoadReturnsDefaultsWhenFileMissing(t *testing.T) {
 func TestSaveAndLoadRoundTripPagination(t *testing.T) {
 	for _, filename := range []string{"arcanecli.yml", "custom.json", "config"} {
 		t.Run(filename, func(t *testing.T) {
-			path := filepath.Join(filepath.Dir(setTempConfigPathInternal(t)), "nested", filename)
+			path := filepath.Join(filepath.Dir(setTempConfigPath(t)), "nested", filename)
 			require.NoError(t, SetConfigPath(path))
 
 			cfg := DefaultConfig()
+			cfg.Previews.AllEnvironments = true
 			cfg.APIKey = "k_test"
 			cfg.JWTToken = "jwt_test"
 			cfg.RefreshToken = "refresh_test"
@@ -100,6 +102,7 @@ func TestSaveAndLoadRoundTripPagination(t *testing.T) {
 			require.Contains(t, text, "gitops-syncs:")
 			require.NotContains(t, text, "GitOps:")
 
+			require.Contains(t, text, "previews:\n    allEnvironments: true")
 			require.Contains(t, text, "pagination:",
 				"expected saved YAML to include pagination block:\n%s", text)
 
@@ -124,12 +127,13 @@ func TestSaveAndLoadRoundTripPagination(t *testing.T) {
 			cfg.SetResourceLimit("images", 99)
 			cached, cacheErr := Load()
 			require.NoError(t, cacheErr)
+			require.True(t, cached.Previews.AllEnvironments)
 			require.Equal(t, "k_test", cached.APIKey)
 			require.Equal(t, 17, cached.LimitFor("images"))
 			require.Equal(t, 8, cached.LimitFor("gitops-syncs"))
 			require.NotContains(t, cached.Pagination.Resources, "GitOps")
 			require.NotContains(t, cached.Pagination.Resources, "volumes")
-			invalidateCacheInternal()
+			invalidateCache()
 			loaded, err := Load()
 
 			require.NoError(t, err,
@@ -152,6 +156,7 @@ func TestSaveAndLoadRoundTripPagination(t *testing.T) {
 
 			require.Equal(t, "next", loaded.CLIUpdateChannel,
 				"CLIUpdateChannel=%q, want next", loaded.CLIUpdateChannel)
+			require.True(t, loaded.Previews.AllEnvironments)
 			require.Equal(t, "k_test", loaded.APIKey)
 			require.Equal(t, "jwt_test", loaded.JWTToken)
 			require.Equal(t, "refresh_test", loaded.RefreshToken)
@@ -169,7 +174,7 @@ func TestSaveAndLoadRoundTripPagination(t *testing.T) {
 			}))
 			omittedRaw, omittedErr := os.ReadFile(path)
 			require.NoError(t, omittedErr)
-			require.Equal(t, "server_url: https://short.test\n", string(omittedRaw))
+			require.Equal(t, "server_url: https://short.test\npreviews:\n    allEnvironments: false\n", string(omittedRaw))
 			securedInfo, securedErr := os.Stat(path)
 			require.NoError(t, securedErr)
 			require.Equal(t, os.FileMode(0o600), securedInfo.Mode().Perm())
@@ -178,7 +183,7 @@ func TestSaveAndLoadRoundTripPagination(t *testing.T) {
 }
 
 func TestLoadCanonicalPaginationBlock(t *testing.T) {
-	path := setTempConfigPathInternal(t)
+	path := setTempConfigPath(t)
 	content := `
 server_url: https://api.arcane.test
 api_key: k_123
@@ -284,7 +289,7 @@ pagination:
 		{name: "quoted limit", content: "pagination:\n  default:\n    limit: \"13\"\n", errorText: "failed to parse config file"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			fixturePath := setTempConfigPathInternal(t)
+			fixturePath := setTempConfigPath(t)
 			require.NoError(t, os.WriteFile(fixturePath, []byte(tc.content), 0o600))
 			loaded, loadErr := Load()
 			if tc.errorText != "" {
@@ -308,7 +313,7 @@ pagination:
 }
 
 func TestInitDefaultFileCreatesTemplate(t *testing.T) {
-	path := setTempConfigPathInternal(t)
+	path := setTempConfigPath(t)
 	path = filepath.Join(filepath.Dir(path), "template.json")
 	require.NoError(t, SetConfigPath(path))
 	_, initialErr := Load()
@@ -328,6 +333,7 @@ func TestInitDefaultFileCreatesTemplate(t *testing.T) {
 		"failed to read config file: %v", err)
 
 	text := string(raw)
+	require.Contains(t, text, "previews:\n    allEnvironments: false")
 	var values map[string]any
 	require.NoError(t, yaml.Unmarshal(raw, &values))
 	for _, key := range []string{"api_key", "jwt_token", "refresh_token", "federated_audience"} {
@@ -378,7 +384,7 @@ func TestInitDefaultFileCreatesTemplate(t *testing.T) {
 }
 
 func TestInitDefaultFileDoesNotOverwriteExistingFile(t *testing.T) {
-	path := setTempConfigPathInternal(t)
+	path := setTempConfigPath(t)
 	original := "server_url: https://custom.arcane.example\napi_key: custom\n"
 	{
 		err := os.WriteFile(path, []byte(original), 0o600)
@@ -394,7 +400,7 @@ func TestInitDefaultFileDoesNotOverwriteExistingFile(t *testing.T) {
 	require.False(t, created,
 		"InitDefaultFile() created = true, want false")
 	// The writer must also refuse an existing file after the initial path check.
-	require.ErrorIs(t, writeConfigInternal(path, DefaultConfig(), true), os.ErrExist)
+	require.ErrorIs(t, writeConfig(path, DefaultConfig(), true), os.ErrExist)
 	entries, readDirErr := os.ReadDir(filepath.Dir(path))
 	require.NoError(t, readDirErr)
 	require.Len(t, entries, 1)
@@ -409,7 +415,7 @@ func TestInitDefaultFileDoesNotOverwriteExistingFile(t *testing.T) {
 }
 
 func TestBackupFileMovesConfig(t *testing.T) {
-	path := setTempConfigPathInternal(t)
+	path := setTempConfigPath(t)
 	original := "server_url: https://backup.arcane.example\napi_key: abc123\n"
 	{
 		err := os.WriteFile(path, []byte(original), 0o600)
@@ -444,7 +450,7 @@ func TestBackupFileMovesConfig(t *testing.T) {
 }
 
 func TestBackupFileNoConfig(t *testing.T) {
-	path := setTempConfigPathInternal(t)
+	path := setTempConfigPath(t)
 	{
 		_, err := os.Stat(path)
 		require.True(t, os.IsNotExist(err),
@@ -464,7 +470,7 @@ func TestBackupFileNoConfig(t *testing.T) {
 }
 
 func TestBackupFileRotatesExistingBak(t *testing.T) {
-	path := setTempConfigPathInternal(t)
+	path := setTempConfigPath(t)
 	backupPath := path + ".bak"
 	{
 

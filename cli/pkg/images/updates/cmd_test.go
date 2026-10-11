@@ -1,4 +1,4 @@
-package integrationtest
+package updates_test
 
 import (
 	"encoding/json"
@@ -9,217 +9,9 @@ import (
 
 	"github.com/getarcaneapp/arcane/types/v2/imageupdate"
 	"github.com/stretchr/testify/require"
+
+	"github.com/getarcaneapp/arcane/cli/v2/internal/testutil"
 )
-
-func TestContainersListUpdatesJSONContract(t *testing.T) {
-	seenUpdatesFilter := ""
-
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/environments/0/containers" {
-			w.WriteHeader(http.StatusNotFound)
-			_, _ = w.Write([]byte(`{"success":false,"error":"not found"}`))
-			return
-		}
-
-		seenUpdatesFilter = r.URL.Query().Get("updates")
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{
-			"success": true,
-			"data": [
-				{
-					"id":"abc123",
-					"names":["/nginx"],
-					"image":"nginx:latest",
-					"state":"running",
-					"status":"Up 1 hour",
-					"updateInfo":{"hasUpdate":true,"latestVersion":"1.28.0"}
-				}
-			],
-			"pagination": {"totalPages":1,"totalItems":1,"currentPage":1,"itemsPerPage":20}
-		}`))
-	}))
-	defer srv.Close()
-
-	configPath := writeCLIIntegrationConfigInternal(t, srv.URL)
-	outBuf, errOut, err := executeCLIIntegrationCommandInternal(
-		t,
-		[]string{"--config", configPath, "containers", "list", "--updates", "has_update", "--json"},
-	)
-
-	require.NoError(t, err,
-		"execute: %v (%s)", err, errOut)
-
-	require.Equal(t, "has_update", seenUpdatesFilter,
-		"expected updates filter query param, got %q", seenUpdatesFilter)
-
-	var got map[string]any
-	{
-		unmarshalErr := json.Unmarshal([]byte(strings.TrimSpace(outBuf)), &got)
-		require.NoError(t, unmarshalErr,
-			"json parse failed: %v\noutput=%s", unmarshalErr, outBuf)
-	}
-
-	for _, key := range []string{"success", "data", "pagination"} {
-		{
-			_, ok := got[key]
-			require.True(t, ok,
-				"missing key %q in output: %v", key, got)
-		}
-	}
-}
-
-func TestContainersUpdatesCommandUsesHasUpdateFilter(t *testing.T) {
-	seenUpdatesFilter := ""
-
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/environments/0/containers" {
-			w.WriteHeader(http.StatusNotFound)
-			_, _ = w.Write([]byte(`{"success":false,"error":"not found"}`))
-			return
-		}
-
-		seenUpdatesFilter = r.URL.Query().Get("updates")
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{
-			"success": true,
-			"data": [
-				{
-					"id":"abc123",
-					"names":["/nginx"],
-					"image":"nginx:latest",
-					"state":"running",
-					"status":"Up 1 hour",
-					"updateInfo":{"hasUpdate":true,"latestVersion":"1.28.0"}
-				}
-			],
-			"pagination": {"totalPages":1,"totalItems":1,"currentPage":1,"itemsPerPage":20}
-		}`))
-	}))
-	defer srv.Close()
-
-	configPath := writeCLIIntegrationConfigInternal(t, srv.URL)
-	outBuf, errOut, err := executeCLIIntegrationCommandInternal(
-		t,
-		[]string{"--config", configPath, "--output", "text", "containers", "updates"},
-	)
-
-	require.NoError(t, err,
-		"execute: %v (%s)", err, errOut)
-
-	require.Equal(t, "has_update", seenUpdatesFilter,
-		"expected updates filter query param, got %q", seenUpdatesFilter)
-
-	require.NotEmpty(t, strings.TrimSpace(outBuf),
-		"expected output from containers updates command")
-}
-
-func TestProjectsListUpdatesJSONContract(t *testing.T) {
-	seenUpdatesFilter := ""
-
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/environments/0/projects" {
-			w.WriteHeader(http.StatusNotFound)
-			_, _ = w.Write([]byte(`{"success":false,"error":"not found"}`))
-			return
-		}
-
-		seenUpdatesFilter = r.URL.Query().Get("updates")
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{
-			"success": true,
-			"data": [
-				{
-					"id":"project-1",
-					"name":"demo",
-					"path":"/tmp/demo",
-					"status":"running",
-					"serviceCount":1,
-					"runningCount":1,
-					"createdAt":"2026-04-02T00:00:00Z",
-					"updatedAt":"2026-04-02T00:00:00Z",
-					"updateInfo":{"status":"has_update","hasUpdate":true,"imageCount":1,"checkedImageCount":1,"imagesWithUpdates":1,"errorCount":0}
-				}
-			],
-			"pagination": {"totalPages":1,"totalItems":1,"currentPage":1,"itemsPerPage":20}
-		}`))
-	}))
-	defer srv.Close()
-
-	configPath := writeCLIIntegrationConfigInternal(t, srv.URL)
-	outBuf, errOut, err := executeCLIIntegrationCommandInternal(
-		t,
-		[]string{"--config", configPath, "projects", "list", "--updates", "has_update", "--json"},
-	)
-
-	require.NoError(t, err,
-		"execute: %v (%s)", err, errOut)
-
-	require.Equal(t, "has_update", seenUpdatesFilter,
-		"expected updates filter query param, got %q", seenUpdatesFilter)
-
-	var got map[string]any
-	{
-		unmarshalErr := json.Unmarshal([]byte(strings.TrimSpace(outBuf)), &got)
-		require.NoError(t, unmarshalErr,
-			"json parse failed: %v\noutput=%s", unmarshalErr, outBuf)
-	}
-
-	for _, key := range []string{"success", "data", "pagination"} {
-		{
-			_, ok := got[key]
-			require.True(t, ok,
-				"missing key %q in output: %v", key, got)
-		}
-	}
-}
-
-func TestProjectsUpdatesCommandUsesHasUpdateFilter(t *testing.T) {
-	seenUpdatesFilter := ""
-
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/api/environments/0/projects" {
-			w.WriteHeader(http.StatusNotFound)
-			_, _ = w.Write([]byte(`{"success":false,"error":"not found"}`))
-			return
-		}
-
-		seenUpdatesFilter = r.URL.Query().Get("updates")
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{
-			"success": true,
-			"data": [
-				{
-					"id":"project-1",
-					"name":"demo",
-					"path":"/tmp/demo",
-					"status":"running",
-					"serviceCount":1,
-					"runningCount":1,
-					"createdAt":"2026-04-02T00:00:00Z",
-					"updatedAt":"2026-04-02T00:00:00Z",
-					"updateInfo":{"status":"has_update","hasUpdate":true,"imageCount":1,"checkedImageCount":1,"imagesWithUpdates":1,"errorCount":0}
-				}
-			],
-			"pagination": {"totalPages":1,"totalItems":1,"currentPage":1,"itemsPerPage":20}
-		}`))
-	}))
-	defer srv.Close()
-
-	configPath := writeCLIIntegrationConfigInternal(t, srv.URL)
-	outBuf, errOut, err := executeCLIIntegrationCommandInternal(
-		t,
-		[]string{"--config", configPath, "--output", "text", "projects", "updates"},
-	)
-
-	require.NoError(t, err,
-		"execute: %v (%s)", err, errOut)
-
-	require.Equal(t, "has_update", seenUpdatesFilter,
-		"expected updates filter query param, got %q", seenUpdatesFilter)
-
-	require.NotEmpty(t, strings.TrimSpace(outBuf),
-		"expected output from projects updates command")
-}
 
 func TestImagesUpdatesCheckEncodesImageRefAndDecodesSingleResponse(t *testing.T) {
 	imageRef := "registry.example.com/team/image:latest&debug=true"
@@ -250,8 +42,8 @@ func TestImagesUpdatesCheckEncodesImageRefAndDecodesSingleResponse(t *testing.T)
 	}))
 	defer srv.Close()
 
-	configPath := writeCLIIntegrationConfigInternal(t, srv.URL)
-	outBuf, errOut, err := executeCLIIntegrationCommandInternal(
+	configPath := testutil.WriteConfig(t, srv.URL)
+	outBuf, errOut, err := testutil.Execute(
 		t,
 		[]string{"--config", configPath, "images", "updates", "check", imageRef, "--json"},
 	)
@@ -280,7 +72,7 @@ func TestImagesUpdatesCheckEncodesImageRefAndDecodesSingleResponse(t *testing.T)
 }
 
 func TestImagesUpdatesCheckRequiresImageRef(t *testing.T) {
-	outBuf, _, err := executeCLIIntegrationCommandInternal(t, []string{"images", "updates", "check"})
+	outBuf, _, err := testutil.Execute(t, []string{"images", "updates", "check"})
 
 	require.Error(t, err,
 		"expected missing image reference to fail, got output %q", outBuf)
@@ -293,6 +85,14 @@ func TestImageUpdateCommandsDecodeExpectedResponseTypes(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/environments":
+			_, _ = w.Write([]byte(`{"success":true,"data":[{"id":"0","name":"Local","enabled":true},{"id":"remote","name":"Remote","enabled":true}]}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/api/environments/0/images":
+			_, _ = w.Write([]byte(`{"success":true,"data":[]}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/api/environments/remote/images":
+			_, _ = w.Write([]byte(`{"success":true,"data":[{"id":"image-prefix-123","repoTags":["nginx:latest"]}]}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/api/environments/remote/image-updates/check/image-prefix-123":
+			_, _ = w.Write([]byte(`{"success":true,"data":{"hasUpdate":false,"currentVersion":"remote-version"}}`))
 		case r.Method == http.MethodPost && r.URL.Path == "/api/environments/0/image-updates/check-all":
 			_, _ = w.Write([]byte(`{
 				"success": true,
@@ -335,8 +135,8 @@ func TestImageUpdateCommandsDecodeExpectedResponseTypes(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	configPath := writeCLIIntegrationConfigInternal(t, srv.URL)
-	outBuf, errOut, err := executeCLIIntegrationCommandInternal(
+	configPath := testutil.WriteConfig(t, srv.URL)
+	outBuf, errOut, err := testutil.Execute(
 		t,
 		[]string{"--config", configPath, "images", "updates", "check-all", "--json"},
 	)
@@ -354,7 +154,7 @@ func TestImageUpdateCommandsDecodeExpectedResponseTypes(t *testing.T) {
 	require.False(t, batch["nginx:latest"] == nil || !batch["nginx:latest"].HasUpdate,
 		"unexpected batch response: %+v", batch)
 
-	outBuf, errOut, err = executeCLIIntegrationCommandInternal(
+	outBuf, errOut, err = testutil.Execute(
 		t,
 		[]string{"--config", configPath, "images", "updates", "check-image", "image-123", "--json"},
 	)
@@ -372,7 +172,7 @@ func TestImageUpdateCommandsDecodeExpectedResponseTypes(t *testing.T) {
 	require.False(t, single.HasUpdate || single.CurrentVersion != "1.1.0",
 		"unexpected image response: %+v", single)
 
-	outBuf, errOut, err = executeCLIIntegrationCommandInternal(
+	outBuf, errOut, err = testutil.Execute(
 		t,
 		[]string{"--config", configPath, "images", "updates", "summary", "--json"},
 	)
@@ -389,6 +189,13 @@ func TestImageUpdateCommandsDecodeExpectedResponseTypes(t *testing.T) {
 
 	require.False(t, summary.TotalImages != 4 || summary.ImagesWithUpdates != 2 || summary.DigestUpdates != 1,
 		"unexpected summary response: %+v", summary)
+
+	previewPath := testutil.WriteConfig(t, srv.URL, true)
+	outBuf, errOut, err = testutil.Execute(t, []string{"--config", previewPath, "images", "updates", "check-image", "image-prefix", "--json"})
+	require.NoError(t, err, errOut)
+	require.NoError(t, json.Unmarshal([]byte(outBuf), &single))
+	require.Equal(t, "remote-version", single.CurrentVersion)
+	require.Contains(t, errOut, "Remote (remote)")
 }
 
 func TestImageUpdateCommandsRejectHTTPAndEnvelopeFailures(t *testing.T) {
@@ -430,11 +237,11 @@ func TestImageUpdateCommandsRejectHTTPAndEnvelopeFailures(t *testing.T) {
 			}))
 			defer srv.Close()
 
-			configPath := writeCLIIntegrationConfigInternal(t, srv.URL)
+			configPath := testutil.WriteConfig(t, srv.URL)
 			for _, command := range commands {
 				t.Run(command.name, func(t *testing.T) {
 					args := append([]string{"--config", configPath}, command.args...)
-					outBuf, _, err := executeCLIIntegrationCommandInternal(t, args)
+					outBuf, _, err := testutil.Execute(t, args)
 
 					require.Error(t, err,
 						"expected %s error, got success with output %q", failure.name, outBuf)

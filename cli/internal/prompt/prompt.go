@@ -32,7 +32,11 @@ func Select(label string, options []string) (int, error) {
 		items[i] = selectItem{index: i, title: option}
 	}
 
-	model := newSelectModel(items)
+	model := selectModel{list: list.New(items, list.NewDefaultDelegate(), 0, 0), choice: -1}
+	model.list.Title = ""
+	model.list.SetShowStatusBar(false)
+	model.list.SetFilteringEnabled(true)
+	model.list.SetShowHelp(true)
 	program := tea.NewProgram(model)
 	finalModel, err := program.Run()
 	if err != nil {
@@ -53,20 +57,13 @@ func Select(label string, options []string) (int, error) {
 		return -1, errors.New("selection out of range")
 	}
 
-	clearScreenAndShowSelection(label, options[result.choice])
-	return result.choice, nil
-}
-
-func clearScreenAndShowSelection(label, selected string) {
-	// Clear visible terminal content and place cursor at top-left.
-	fmt.Print("\033[H\033[2J")
-
+	_, _ = fmt.Fprint(output.Stderr(), "\033[H\033[2J")
 	if label == "" {
-		fmt.Printf("Selected: %s\n\n", selected)
-		return
+		_, _ = fmt.Fprintf(output.Stderr(), "Selected: %s\n\n", options[result.choice])
+	} else {
+		_, _ = fmt.Fprintf(output.Stderr(), "Selected %s: %s\n\n", label, options[result.choice])
 	}
-
-	fmt.Printf("Selected %s: %s\n\n", label, selected)
+	return result.choice, nil
 }
 
 type selectItem struct {
@@ -82,16 +79,6 @@ type selectModel struct {
 	list     list.Model
 	choice   int
 	canceled bool
-}
-
-func newSelectModel(items []list.Item) selectModel {
-	delegate := list.NewDefaultDelegate()
-	model := selectModel{list: list.New(items, delegate, 0, 0), choice: -1}
-	model.list.Title = ""
-	model.list.SetShowStatusBar(false)
-	model.list.SetFilteringEnabled(true)
-	model.list.SetShowHelp(true)
-	return model
 }
 
 func (m selectModel) Init() tea.Cmd {

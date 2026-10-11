@@ -78,6 +78,11 @@ func NormalizePaginatedResource(resource string) string {
 }
 
 // Config holds the CLI configuration for connecting to an Arcane server.
+// PreviewsConfig contains optional CLI preview features.
+type PreviewsConfig struct {
+	AllEnvironments bool `yaml:"allEnvironments"`
+}
+
 // It is persisted to disk as YAML and loaded on each CLI invocation.
 type Config struct {
 	// ServerURL is the base URL of the Arcane server (e.g., http://localhost:3552)
@@ -88,6 +93,8 @@ type Config struct {
 	JWTToken string `yaml:"jwt_token,omitempty"`
 	// RefreshToken is the refresh token for obtaining new access tokens
 	RefreshToken string `yaml:"refresh_token,omitempty"`
+	// Previews contains optional CLI preview features.
+	Previews PreviewsConfig `yaml:"previews"`
 	// DefaultEnvironment is the default environment ID to use
 	DefaultEnvironment string `yaml:"default_environment,omitempty"`
 	// FederatedAudience is the default token audience for `arcane-cli auth federated`
@@ -114,9 +121,7 @@ func (c *Config) ValidateServerURL() error {
 	return nil
 }
 
-// Validate checks if the configuration has all required fields set.
-// It returns an error with instructions if ServerURL or APIKey is missing.
-// This should be called before using the config to make API requests.
+// Validate requires a configured server URL and either an API key or JWT token.
 func (c *Config) Validate() error {
 	if err := c.ValidateServerURL(); err != nil {
 		return err
@@ -127,9 +132,7 @@ func (c *Config) Validate() error {
 	return nil
 }
 
-// IsConfigured returns true if both ServerURL and APIKey are set.
-// This is a quick check to determine if the CLI has been configured
-// without triggering validation errors.
+// IsConfigured reports whether the server URL and authentication are configured.
 func (c *Config) IsConfigured() bool {
 	return c.ServerURL != "" && c.HasAuth()
 }

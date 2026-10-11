@@ -13,9 +13,7 @@ import (
 	"github.com/getarcaneapp/arcane/cli/v2/internal/output"
 )
 
-// ListSpec describes one standard list command: fetch a paginated endpoint,
-// echo the raw body for --json (so unmodeled fields like counts and groups
-// survive, see ReadJSONBody), otherwise render a table.
+// ListSpec describes a paginated list with raw JSON passthrough or table rendering.
 type ListSpec[T any] struct {
 	// Resource names the collection in error messages and the trailing
 	// "Showing x of y <resource>" line.
@@ -73,10 +71,9 @@ func RunList[T any](cmd *cobra.Command, c *client.Client, spec ListSpec[T]) erro
 		rows[i] = spec.Row(item)
 	}
 
-	if tableErr := output.Table(spec.Headers, rows); tableErr != nil {
+	if tableErr := PrintTable(cmd, spec.Headers, rows, TableSummary{Resource: spec.Resource, Total: result.Pagination.TotalItems, Paginated: true}); tableErr != nil {
 		return tableErr
 	}
-	output.Showing(len(result.Data), result.Pagination.TotalItems, spec.Resource)
 	return nil
 }
 

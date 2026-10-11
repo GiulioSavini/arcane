@@ -2,9 +2,11 @@ package volumes
 
 import (
 	"bytes"
+	"cmp"
 	"encoding/json/v2"
 	"errors"
 	"fmt"
+	"mime"
 	"mime/multipart"
 	"net/http"
 	"net/url"
@@ -191,11 +193,22 @@ var workspaceDownloadCmd = &cobra.Command{
 			outputFile = args[2]
 		}
 		if outputFile == "" {
-			outputFile = downloadFilename(resp, path.Base(args[1]))
+			outputFile = path.Base(args[1])
+			if _, params, parseErr := mime.ParseMediaType(resp.Header.Get("Content-Disposition")); parseErr == nil {
+				outputFile = cmp.Or(params["filename"], outputFile)
+			}
 		}
 
-		if writeResponseToFileErr := writeResponseToFileInternal(cmd.Context(), resp.Body, resp.ContentLength, outputFile, !cmdutil.JSONOutputEnabled(cmd)); writeResponseToFileErr != nil {
-			return writeResponseToFileErr
+		file, openErr := os.OpenFile(outputFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+		if openErr != nil {
+			return fmt.Errorf("failed to create file %s: %w", outputFile, openErr)
+		}
+		if _, copyErr := output.Copy(cmd.Context(), file, resp.Body, resp.ContentLength, "Downloading backup", !cmdutil.JSONOutputEnabled(cmd)); copyErr != nil {
+			_ = file.Close()
+			return fmt.Errorf("failed to write file %s: %w", outputFile, copyErr)
+		}
+		if closeErr := file.Close(); closeErr != nil {
+			return fmt.Errorf("failed to write file %s: %w", outputFile, closeErr)
 		}
 
 		output.Success("File downloaded to %s", outputFile)

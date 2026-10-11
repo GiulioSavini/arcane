@@ -4,13 +4,16 @@ import (
 	"cmp"
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/getarcaneapp/arcane/types/v2/environment"
+
 	"github.com/getarcaneapp/arcane/cli/v2/internal/client"
 	"github.com/getarcaneapp/arcane/cli/v2/internal/config"
-	clitypes "github.com/getarcaneapp/arcane/cli/v2/internal/types"
+	"github.com/getarcaneapp/arcane/cli/v2/internal/types"
 )
 
 type contextKey string
@@ -35,12 +38,13 @@ type Options struct {
 }
 
 type AppContext struct {
-	cfg            *clitypes.Config
-	envOverride    string
-	outputMode     OutputMode
-	assumeYes      bool
-	noColor        bool
-	requestTimeout time.Duration
+	Options
+	FleetConfirmed   bool
+	cfg              *types.Config
+	selectedEnv      string
+	environmentsOnce sync.Once
+	environments     []environment.Environment
+	environmentsErr  error
 
 	clientOnce sync.Once
 	clientErr  error
@@ -64,14 +68,9 @@ func New(opts Options) (*AppContext, error) {
 		return nil, fmt.Errorf("invalid output mode %q (expected text or json)", mode)
 	}
 
-	return &AppContext{
-		cfg:            cfg,
-		envOverride:    strings.TrimSpace(opts.EnvOverride),
-		outputMode:     mode,
-		assumeYes:      opts.AssumeYes,
-		noColor:        opts.NoColor,
-		requestTimeout: opts.RequestTimeout,
-	}, nil
+	opts.OutputMode = mode
+	opts.EnvOverride = strings.TrimSpace(opts.EnvOverride)
+	return &AppContext{Options: opts, cfg: cfg}, nil
 }
 
 func From(ctx context.Context) (*AppContext, bool) {
@@ -82,7 +81,7 @@ func From(ctx context.Context) (*AppContext, bool) {
 	return app, ok && app != nil
 }
 
-func (a *AppContext) Config() *clitypes.Config {
+func (a *AppContext) Config() *types.Config {
 	if a == nil || a.cfg == nil {
 		return nil
 	}
@@ -90,8 +89,8 @@ func (a *AppContext) Config() *clitypes.Config {
 	if copyCfg == nil {
 		return nil
 	}
-	if a.envOverride != "" {
-		copyCfg.DefaultEnvironment = a.envOverride
+	if id := cmp.Or(a.selectedEnv, a.EnvOverride); id != "" {
+		copyCfg.DefaultEnvironment = id
 	}
 	return copyCfg
 }
@@ -100,8 +99,8 @@ func (a *AppContext) EnvID() string {
 	if a == nil {
 		return ""
 	}
-	if a.envOverride != "" {
-		return a.envOverride
+	if id := cmp.Or(a.selectedEnv, a.EnvOverride); id != "" {
+		return id
 	}
 	if a.cfg != nil {
 		return a.cfg.DefaultEnvironment
@@ -109,30 +108,8 @@ func (a *AppContext) EnvID() string {
 	return ""
 }
 
-func (a *AppContext) OutputMode() OutputMode {
-	if a == nil {
-		return OutputModeText
-	}
-	return a.outputMode
-}
-
 func (a *AppContext) IsJSON() bool {
-	return a.OutputMode() == OutputModeJSON
-}
-
-func (a *AppContext) AssumeYes() bool {
-	return a != nil && a.assumeYes
-}
-
-func (a *AppContext) NoColor() bool {
-	return a != nil && a.noColor
-}
-
-func (a *AppContext) RequestTimeout() time.Duration {
-	if a == nil {
-		return 0
-	}
-	return a.requestTimeout
+	return a != nil && a.OutputMode == OutputModeJSON
 }
 
 func (a *AppContext) Client() (*client.Client, error) {
@@ -145,8 +122,8 @@ func (a *AppContext) Client() (*client.Client, error) {
 		if a.clientErr != nil {
 			return
 		}
-		if a.requestTimeout > 0 {
-			a.client.SetTimeout(a.requestTimeout)
+		if a.RequestTimeout > 0 {
+			a.client.SetTimeout(a.RequestTimeout)
 		}
 	})
 	return a.client, a.clientErr
@@ -162,9 +139,43 @@ func (a *AppContext) UnauthClient() (*client.Client, error) {
 		if a.unauthClientErr != nil {
 			return
 		}
-		if a.requestTimeout > 0 {
-			a.unauthClient.SetTimeout(a.requestTimeout)
+		if a.RequestTimeout > 0 {
+			a.unauthClient.SetTimeout(a.RequestTimeout)
 		}
 	})
 	return a.unauthClient, a.unauthClientErr
+}
+
+// PreviewEnabled reports whether this command still needs an environment scope.
+func (a *AppContext) PreviewEnabled() bool {
+	return a != nil && a.cfg.Previews.AllEnvironments && a.EnvOverride == "" && a.selectedEnv == ""
+}
+
+// SelectEnvironment pins subsequent requests without changing persisted configuration.
+func (a *AppContext) SelectEnvironment(id string) {
+	a.selectedEnv = id
+	if a.client != nil {
+		a.client.SetEnvironment(cmp.Or(id, a.EnvOverride, a.cfg.DefaultEnvironment, "0"))
+	}
+}
+
+// Environments loads the complete visible, enabled environment list once per invocation.
+func (a *AppContext) Environments(ctx context.Context) ([]environment.Environment, error) {
+	a.environmentsOnce.Do(func() {
+		c, err := a.Client()
+		if err != nil {
+			a.environmentsErr = err
+			return
+		}
+		response, err := c.GetJSON[[]environment.Environment](ctx, types.Environments()+"?limit=-1")
+		if err != nil {
+			a.environmentsErr = fmt.Errorf("failed to discover environments: %w", err)
+			return
+		}
+		a.environments = slices.DeleteFunc(response.Data, func(env environment.Environment) bool { return !env.Enabled })
+		slices.SortFunc(a.environments, func(left, right environment.Environment) int {
+			return cmp.Or(cmp.Compare(strings.ToLower(cmp.Or(left.Name, left.ID)), strings.ToLower(cmp.Or(right.Name, right.ID))), cmp.Compare(left.ID, right.ID))
+		})
+	})
+	return a.environments, a.environmentsErr
 }

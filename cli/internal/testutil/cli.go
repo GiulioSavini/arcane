@@ -1,10 +1,11 @@
-package integrationtest
+package testutil
 
 import (
 	"io"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -13,12 +14,13 @@ import (
 	"github.com/spf13/pflag"
 	"github.com/stretchr/testify/require"
 
-	clipkg "github.com/getarcaneapp/arcane/cli/v2/pkg"
+	"github.com/getarcaneapp/arcane/cli/v2/pkg"
 )
 
-var stdoutCaptureMuInternal sync.Mutex
+var stdoutCaptureMu sync.Mutex
 
-func writeCLIIntegrationConfigInternal(t *testing.T, serverURL string) string {
+// WriteConfig writes isolated configuration for command tests.
+func WriteConfig(t *testing.T, serverURL string, preview ...bool) string {
 	t.Helper()
 
 	tempDir := t.TempDir()
@@ -27,6 +29,7 @@ func writeCLIIntegrationConfigInternal(t *testing.T, serverURL string) string {
 		"server_url: " + serverURL,
 		"api_key: arc_test_key",
 		"default_environment: \"0\"",
+		"previews:\n  allEnvironments: " + strconv.FormatBool(len(preview) > 0 && preview[0]),
 		"log_level: info",
 		"",
 	}, "\n")
@@ -39,17 +42,18 @@ func writeCLIIntegrationConfigInternal(t *testing.T, serverURL string) string {
 	return configPath
 }
 
-func executeCLIIntegrationCommandInternal(t *testing.T, args []string) (string, string, error) {
+// Execute runs the root command with isolated flags and captures its output.
+func Execute(t *testing.T, args []string) (string, string, error) {
 	t.Helper()
 
-	root := clipkg.RootCommand()
-	resetCommandFlagsInternal(t, root)
+	root := cli.RootCommand()
+	resetCommandFlags(t, root)
 	errOut := &strings.Builder{}
 	root.SetErr(errOut)
 	root.SetArgs(args)
 
-	stdoutCaptureMuInternal.Lock()
-	defer stdoutCaptureMuInternal.Unlock()
+	stdoutCaptureMu.Lock()
+	defer stdoutCaptureMu.Unlock()
 
 	stdout := os.Stdout
 	reader, writer, err := os.Pipe()
@@ -79,42 +83,24 @@ func executeCLIIntegrationCommandInternal(t *testing.T, args []string) (string, 
 	return outBuf, errOut.String(), runErr
 }
 
-func resetCommandFlagsInternal(t *testing.T, root *cobra.Command) {
+func resetCommandFlags(t *testing.T, root *cobra.Command) {
 	t.Helper()
 
 	if root == nil {
 		return
 	}
 
-	resetFlagSetInternal(t, root.PersistentFlags())
-	resetFlagSetInternal(t, root.Flags())
-	for _, cmd := range root.Commands() {
-		resetCommandFlagsInternal(t, cmd)
-	}
-}
-
-func resetFlagSetInternal(t *testing.T, flagSet *pflag.FlagSet) {
-	t.Helper()
-
-	if flagSet == nil {
-		return
-	}
-
-	flagSet.VisitAll(func(flag *pflag.Flag) {
-		defValue := flag.DefValue
-		switch flag.Value.Type() {
-		case "stringSlice", "stringArray":
-			if defValue == "[]" {
+	for _, flagSet := range []*pflag.FlagSet{root.PersistentFlags(), root.Flags()} {
+		flagSet.VisitAll(func(flag *pflag.Flag) {
+			defValue := flag.DefValue
+			if (flag.Value.Type() == "stringSlice" || flag.Value.Type() == "stringArray") && defValue == "[]" {
 				defValue = ""
 			}
-		}
-		{
-
-			err := flag.Value.Set(defValue)
-			require.NoError(t, err,
-				"reset flag %s: %v", flag.Name, err)
-		}
-
-		flag.Changed = false
-	})
+			require.NoError(t, flag.Value.Set(defValue), "reset flag %s", flag.Name)
+			flag.Changed = false
+		})
+	}
+	for _, cmd := range root.Commands() {
+		resetCommandFlags(t, cmd)
+	}
 }

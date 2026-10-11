@@ -1,25 +1,4 @@
-// Package client provides an HTTP client for communicating with the Arcane API.
-//
-// The client handles authentication, request construction, and response parsing
-// for all API calls. It supports JSON request/response bodies as well as raw
-// multipart uploads.
-//
-// # Creating a Client
-//
-// The recommended way to create a client is from the CLI configuration:
-//
-//	c, err := client.NewFromConfig()
-//	if err != nil {
-//	    return err
-//	}
-//
-// # Making Requests
-//
-// The client provides convenience methods for common HTTP methods:
-//
-//	resp, err := c.Get(ctx, "/api/images")
-//	resp, err := c.Post(ctx, "/api/images/pull", body)
-//	resp, err := c.Delete(ctx, "/api/images/abc123")
+// Package client provides authenticated HTTP transport for the Arcane API.
 package client
 
 import (
@@ -36,6 +15,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -63,10 +43,7 @@ var retryableStatusCodes = map[int]struct{}{
 	http.StatusGatewayTimeout:     {},
 }
 
-// Client is an HTTP client for the Arcane API.
-// It handles authentication via API tokens and provides methods for making
-// HTTP requests to various API endpoints. The client automatically includes
-// authentication headers and handles JSON serialization.
+// Client provides authenticated requests, token refresh, and response decoding for the Arcane API.
 type Client struct {
 	baseURL       string
 	baseURLParsed *url.URL
@@ -80,11 +57,14 @@ type Client struct {
 	maxBackoff    time.Duration
 }
 
-// New creates a new API client from the provided configuration.
-// It validates the configuration and returns an error if required fields
-// (ServerURL, APIKey) are missing. The client is initialized with a default
-// 30-second timeout and the configured environment ID.
+// New validates configuration and creates an authenticated client with the configured environment and a ten-minute timeout.
 func New(cfg *types.Config) (*Client, error) {
+	cfg = cfg.Clone()
+	if token := strings.TrimSpace(os.Getenv("ARCANE_TOKEN")); token != "" {
+		cfg.JWTToken = token
+		cfg.APIKey = ""
+		cfg.RefreshToken = ""
+	}
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
@@ -94,6 +74,10 @@ func New(cfg *types.Config) (*Client, error) {
 	}
 
 	envID := cmp.Or(cfg.DefaultEnvironment, defaultEnvID)
+	httpClient := &http.Client{Timeout: defaultTimeout}
+	if transport, ok := http.DefaultTransport.(*http.Transport); ok {
+		httpClient.Transport = transport.Clone()
+	}
 
 	return &Client{
 		baseURL:       cfg.ServerURL,
@@ -102,7 +86,7 @@ func New(cfg *types.Config) (*Client, error) {
 		jwtToken:      cfg.JWTToken,
 		refreshToken:  cfg.RefreshToken,
 		envID:         envID,
-		httpClient:    newHTTPClientInternal(),
+		httpClient:    httpClient,
 		maxAttempts:   3,
 		baseBackoff:   150 * time.Millisecond,
 		maxBackoff:    2 * time.Second,
@@ -112,6 +96,10 @@ func New(cfg *types.Config) (*Client, error) {
 // NewUnauthenticated creates a client that can call unauthenticated endpoints
 // (e.g. /api/auth/login). It only validates that server_url is configured.
 func NewUnauthenticated(cfg *types.Config) (*Client, error) {
+	cfg = cfg.Clone()
+	if strings.TrimSpace(os.Getenv("ARCANE_TOKEN")) != "" {
+		cfg.RefreshToken = ""
+	}
 	if err := cfg.ValidateServerURL(); err != nil {
 		return nil, err
 	}
@@ -121,36 +109,24 @@ func NewUnauthenticated(cfg *types.Config) (*Client, error) {
 	}
 
 	envID := cmp.Or(cfg.DefaultEnvironment, defaultEnvID)
+	httpClient := &http.Client{Timeout: defaultTimeout}
+	if transport, ok := http.DefaultTransport.(*http.Transport); ok {
+		httpClient.Transport = transport.Clone()
+	}
 
 	return &Client{
 		baseURL:       cfg.ServerURL,
 		baseURLParsed: parsedURL,
 		envID:         envID,
 		refreshToken:  cfg.RefreshToken,
-		httpClient:    newHTTPClientInternal(),
+		httpClient:    httpClient,
 		maxAttempts:   3,
 		baseBackoff:   150 * time.Millisecond,
 		maxBackoff:    2 * time.Second,
 	}, nil
 }
 
-func newHTTPClientInternal() *http.Client {
-	transport, ok := http.DefaultTransport.(*http.Transport)
-	if ok {
-		return &http.Client{
-			Timeout:   defaultTimeout,
-			Transport: transport.Clone(),
-		}
-	}
-
-	return &http.Client{
-		Timeout: defaultTimeout,
-	}
-}
-
-// NewFromConfig loads the CLI configuration from disk and creates a new client.
-// This is the recommended way to create a client in CLI commands.
-// It returns an error if the configuration cannot be loaded or is invalid.
+// NewFromConfig loads persisted configuration and applies invocation overrides before creating a client.
 func NewFromConfig() (*Client, error) {
 	cfg, err := config.Load()
 	if err != nil {
@@ -159,11 +135,6 @@ func NewFromConfig() (*Client, error) {
 	state := runstate.Get()
 	if strings.TrimSpace(state.EnvOverride) != "" {
 		cfg.DefaultEnvironment = strings.TrimSpace(state.EnvOverride)
-	}
-	if token := strings.TrimSpace(os.Getenv("ARCANE_TOKEN")); token != "" {
-		cfg.JWTToken = token
-		cfg.APIKey = ""
-		cfg.RefreshToken = ""
 	}
 	c, err := New(cfg)
 	if err != nil {
@@ -185,11 +156,6 @@ func NewFromConfigUnauthenticated() (*Client, error) {
 	if strings.TrimSpace(state.EnvOverride) != "" {
 		cfg.DefaultEnvironment = strings.TrimSpace(state.EnvOverride)
 	}
-	if token := strings.TrimSpace(os.Getenv("ARCANE_TOKEN")); token != "" {
-		cfg.JWTToken = token
-		cfg.APIKey = ""
-		cfg.RefreshToken = ""
-	}
 	c, err := NewUnauthenticated(cfg)
 	if err != nil {
 		return nil, err
@@ -200,9 +166,7 @@ func NewFromConfigUnauthenticated() (*Client, error) {
 	return c, nil
 }
 
-// SetEnvironment changes the environment ID for subsequent requests.
-// This allows switching between different Arcane environments without
-// creating a new client instance.
+// SetEnvironment changes the environment ID for subsequent requests on this client.
 func (c *Client) SetEnvironment(envID string) {
 	c.envID = envID
 }
@@ -228,20 +192,14 @@ func (c *Client) EnvID() string {
 	return c.envID
 }
 
-// APIResponse wraps the standard Arcane API response format.
-// All API responses include a Success field indicating whether the request
-// succeeded, a Data field containing the response payload, and an optional
-// Error field with error details on failure.
+// APIResponse wraps the Arcane success, data, and error response fields.
 type APIResponse[T any] struct {
 	Success bool   `json:"success"`
 	Data    T      `json:"data"`
 	Error   string `json:"error,omitempty"`
 }
 
-// Request makes an HTTP request to the API with JSON body serialization.
-// It constructs the full URL from the base URL and path, serializes the body
-// as JSON (if provided), and includes authentication headers. The caller is
-// responsible for closing the response body.
+// Request sends JSON or raw reader bodies with authentication; streaming bodies skip retries and token refresh.
 func (c *Client) Request(ctx context.Context, method, path string, body any, headers ...http.Header) (*http.Response, error) {
 	loading := output.StartLoading(ctx)
 	defer loading.Stop()
@@ -288,13 +246,10 @@ func (c *Client) Request(ctx context.Context, method, path string, body any, hea
 		}
 	}
 
-	return c.doRequestInternal(ctx, method, fullURL, bodyBytes, true, headers...)
+	return c.doRequest(ctx, method, fullURL, bodyBytes, true, headers...)
 }
 
-// RequestRaw makes an HTTP request with a raw body and custom headers.
-// Unlike Request, this method does not serialize the body as JSON, making it
-// suitable for multipart form uploads and other non-JSON content types.
-// Custom headers can be provided to set Content-Type and other headers.
+// RequestRaw sends a streaming body with custom headers, without JSON encoding or automatic replay.
 func (c *Client) RequestRaw(ctx context.Context, method, path string, body io.Reader, headers map[string]string) (*http.Response, error) {
 	loading := output.StartLoading(ctx)
 	defer loading.Stop()
@@ -347,7 +302,7 @@ func (c *Client) resolveURL(path string) (string, error) {
 	return c.baseURLParsed.ResolveReference(rel).String(), nil
 }
 
-func (c *Client) doRequestInternal(ctx context.Context, method, fullURL string, bodyBytes []byte, allowRefresh bool, headers ...http.Header) (*http.Response, error) {
+func (c *Client) doRequest(ctx context.Context, method, fullURL string, bodyBytes []byte, allowRefresh bool, headers ...http.Header) (*http.Response, error) {
 	attempts := max(c.maxAttempts, 1)
 
 	for attempt := 1; attempt <= attempts; attempt++ {
@@ -411,7 +366,7 @@ func (c *Client) doRequestInternal(ctx context.Context, method, fullURL string, 
 }
 
 func (c *Client) shouldRetry(method string, status int, err error) bool {
-	if !isIdempotentMethod(method) {
+	if !slices.Contains([]string{http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodPut, http.MethodDelete}, method) {
 		return false
 	}
 	if err != nil {
@@ -450,15 +405,6 @@ func (c *Client) waitRetry(ctx context.Context, attempt int) error {
 		return ctx.Err()
 	case <-timer.C:
 		return nil
-	}
-}
-
-func isIdempotentMethod(method string) bool {
-	switch method {
-	case http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodPut, http.MethodDelete:
-		return true
-	default:
-		return false
 	}
 }
 
@@ -569,16 +515,12 @@ func (c *Client) Delete(ctx context.Context, path string) (*http.Response, error
 	return c.Request(ctx, http.MethodDelete, path, nil)
 }
 
-// DeleteWithBody makes a DELETE request to the specified path with a JSON body.
-// A handful of Arcane delete endpoints — project destroy, for one — take options
-// in the request body rather than as query parameters.
+// DeleteWithBody sends a DELETE request with a JSON options body.
 func (c *Client) DeleteWithBody(ctx context.Context, path string, body any) (*http.Response, error) {
 	return c.Request(ctx, http.MethodDelete, path, body)
 }
 
-// DoJSON performs a request and decodes the response JSON, enforcing a
-// successful HTTP status. Unlike GetJSON/PostJSON it does not require the
-// standard API envelope or its Success flag.
+// DoJSON enforces HTTP success and decodes a response without requiring the standard API envelope.
 func (c *Client) DoJSON[T any](ctx context.Context, method, path string, body any, headers ...http.Header) (T, error) {
 	loading := output.StartLoading(ctx)
 	defer loading.Stop()
@@ -610,7 +552,7 @@ func (c *Client) GetJSON[T any](ctx context.Context, path string) (*APIResponse[
 		return nil, err
 	}
 	defer func() { _ = resp.Body.Close() }()
-	return decodeResponseStrictInternal[T](resp)
+	return decodeResponseStrict[T](resp)
 }
 
 // PostJSON performs a POST with a JSON body and decodes the standard API
@@ -623,7 +565,7 @@ func (c *Client) PostJSON[T any](ctx context.Context, path string, body any) (*A
 		return nil, err
 	}
 	defer func() { _ = resp.Body.Close() }()
-	return decodeResponseStrictInternal[T](resp)
+	return decodeResponseStrict[T](resp)
 }
 
 // DoRaw performs a request and returns the response payload when status is 2xx.
@@ -658,7 +600,7 @@ func (c *Client) PutJSON[T any](ctx context.Context, path string, body any) (*AP
 		return nil, err
 	}
 	defer func() { _ = resp.Body.Close() }()
-	return decodeResponseStrictInternal[T](resp)
+	return decodeResponseStrict[T](resp)
 }
 
 // DeleteJSON performs a DELETE and decodes the standard API envelope,
@@ -671,14 +613,11 @@ func (c *Client) DeleteJSON[T any](ctx context.Context, path string) (*APIRespon
 		return nil, err
 	}
 	defer func() { _ = resp.Body.Close() }()
-	return decodeResponseStrictInternal[T](resp)
+	return decodeResponseStrict[T](resp)
 }
 
-// decodeResponseStrictInternal decodes an API response into the given type and
-// enforces HTTP and API success. If the response indicates failure
-// (Success=false) or carries a non-2xx status code, an error is returned with
-// the message from the API. The caller owns the response body.
-func decodeResponseStrictInternal[T any](resp *http.Response) (*APIResponse[T], error) {
+// decodeResponseStrict enforces HTTP and API success while decoding the response. The caller owns the response body.
+func decodeResponseStrict[T any](resp *http.Response) (*APIResponse[T], error) {
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBody))
 		return nil, fmt.Errorf("request failed with status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
@@ -704,9 +643,7 @@ func decodeResponseStrictInternal[T any](resp *http.Response) (*APIResponse[T], 
 	return &result, nil
 }
 
-// TestConnection tests the API connection by making a request to the version endpoint.
-// It returns nil if the connection is successful, or an error describing the failure.
-// This is useful for verifying configuration before making other API calls.
+// TestConnection checks the API version endpoint and returns transport or status failures.
 func (c *Client) TestConnection(ctx context.Context) error {
 	resp, err := c.Get(ctx, "/api/version")
 	if err != nil {

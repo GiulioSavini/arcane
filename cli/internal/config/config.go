@@ -1,23 +1,4 @@
-// Package config handles CLI configuration loading and persistence.
-//
-// Configuration is stored in a YAML file at ~/.config/arcanecli.yml.
-// This package provides functions to load, save, and access configuration
-// values including the server URL, API key, and default environment.
-//
-// # Configuration File
-//
-// The configuration file uses the following format:
-//
-//	server_url: https://your-server.com
-//	api_key: your-api-key
-//	default_environment: "0"
-//	log_level: info
-//
-// # Version Information
-//
-// Version and Revision variables are set at build time via ldflags:
-//
-//	go build -ldflags "-X github.com/getarcaneapp/arcane/cli/v2/internal/config.Version=1.0.0"
+// Package config loads and persists CLI configuration in ~/.config/arcanecli.yml.
 package config
 
 import (
@@ -55,7 +36,7 @@ var configCache = hot.NewHotCache[string, *types.Config](hot.LRU, 4).
 	WithCopyOnWrite((*types.Config).Clone).
 	Build()
 
-func normalizeConfigInternal(cfg *types.Config) *types.Config {
+func normalizeConfig(cfg *types.Config) *types.Config {
 	if cfg == nil {
 		return DefaultConfig()
 	}
@@ -71,15 +52,11 @@ func normalizeConfigInternal(cfg *types.Config) *types.Config {
 	return normalized
 }
 
-func invalidateCacheInternal() {
+func invalidateCache() {
 	configCache.Purge()
 }
 
-// DefaultConfig returns a Config with sensible default values.
-// The defaults are:
-//   - ServerURL: http://localhost:3552
-//   - DefaultEnvironment: "0"
-//   - LogLevel: "info"
+// DefaultConfig uses localhost:3552, local environment "0", and info logging.
 func DefaultConfig() *types.Config {
 	return &types.Config{
 		ServerURL:          "http://localhost:3552",
@@ -88,9 +65,7 @@ func DefaultConfig() *types.Config {
 	}
 }
 
-// ConfigPath returns the absolute path to the configuration file.
-// The config file is located at ~/.config/arcanecli.yml.
-// Returns an error if the user's home directory cannot be determined.
+// ConfigPath resolves the active config path, defaulting to ~/.config/arcanecli.yml.
 func ConfigPath() (string, error) {
 	if customConfigPath != "" {
 		return customConfigPath, nil
@@ -109,7 +84,7 @@ func ConfigPath() (string, error) {
 func SetConfigPath(path string) error {
 	if strings.TrimSpace(path) == "" {
 		customConfigPath = ""
-		invalidateCacheInternal()
+		invalidateCache()
 		return nil
 	}
 
@@ -129,13 +104,11 @@ func SetConfigPath(path string) error {
 	}
 
 	customConfigPath = absPath
-	invalidateCacheInternal()
+	invalidateCache()
 	return nil
 }
 
-// Load reads the configuration from disk and returns it.
-// If the config file does not exist, default values are returned.
-// Returns an error if the file exists but cannot be read or parsed.
+// Load reads configuration, using defaults when the file does not exist.
 func Load() (*types.Config, error) {
 	path, err := ConfigPath()
 	if err != nil {
@@ -159,23 +132,21 @@ func Load() (*types.Config, error) {
 	if parseErr := yaml.Unmarshal(data, cfg); parseErr != nil {
 		return nil, fmt.Errorf("failed to parse config file: %w", parseErr)
 	}
-	normalized := normalizeConfigInternal(cfg)
+	normalized := normalizeConfig(cfg)
 
 	configCache.Set(path, normalized)
 
 	return normalized, nil
 }
 
-// Save writes the configuration to disk.
-// The config directory is created if it does not exist.
-// The file is created with 0600 permissions for security.
+// Save writes configuration with mode 0600, creating its directory when needed.
 func Save(c *types.Config) error {
 	path, err := ConfigPath()
 	if err != nil {
 		return err
 	}
 
-	cfg := normalizeConfigInternal(c)
+	cfg := normalizeConfig(c)
 	cfg.Pagination.Default.Limit = max(0, cfg.Pagination.Default.Limit)
 	resources := cfg.Pagination.Resources
 	cfg.Pagination.Resources = make(map[string]types.PaginationResourceConfig, len(resources))
@@ -185,7 +156,7 @@ func Save(c *types.Config) error {
 		}
 	}
 
-	if writeErr := writeConfigInternal(path, cfg, false); writeErr != nil {
+	if writeErr := writeConfig(path, cfg, false); writeErr != nil {
 		return writeErr
 	}
 
@@ -194,9 +165,7 @@ func Save(c *types.Config) error {
 	return nil
 }
 
-// InitDefaultFile creates a default config file with credential placeholders.
-// It returns true when a file is created, or false when an
-// existing file is left unchanged.
+// InitDefaultFile creates a template with credential placeholders and returns false if the file already exists.
 func InitDefaultFile() (bool, error) {
 	path, err := ConfigPath()
 	if err != nil {
@@ -233,18 +202,18 @@ func InitDefaultFile() (bool, error) {
 		)
 	}
 
-	if writeErr := writeConfigInternal(path, &template, true); writeErr != nil {
+	if writeErr := writeConfig(path, &template, true); writeErr != nil {
 		if errors.Is(writeErr, os.ErrExist) {
 			return false, nil
 		}
 		return false, writeErr
 	}
 
-	invalidateCacheInternal()
+	invalidateCache()
 	return true, nil
 }
 
-func writeConfigInternal(path string, cfg any, exclusive bool) (err error) {
+func writeConfig(path string, cfg any, exclusive bool) (err error) {
 	data, marshalErr := yaml.Marshal(cfg)
 	if marshalErr != nil {
 		return fmt.Errorf("failed to marshal config: %w", marshalErr)
@@ -277,9 +246,7 @@ func writeConfigInternal(path string, cfg any, exclusive bool) (err error) {
 	return nil
 }
 
-// BackupFile moves the active config file to a .bak path and removes the
-// original file from its previous location. If no config file exists, it
-// returns moved=false and no error.
+// BackupFile moves the active config to .bak, returning moved=false when no config exists.
 func BackupFile() (backupPath string, moved bool, err error) {
 	path, err := ConfigPath()
 	if err != nil {
@@ -315,6 +282,6 @@ func BackupFile() (backupPath string, moved bool, err error) {
 		return "", false, fmt.Errorf("failed to move config to backup: %w", backupConfigErr)
 	}
 
-	invalidateCacheInternal()
+	invalidateCache()
 	return backupPath, true, nil
 }

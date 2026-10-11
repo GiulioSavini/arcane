@@ -7,7 +7,7 @@ import (
 
 	"github.com/getarcaneapp/arcane/cli/v2/internal/client"
 	"github.com/getarcaneapp/arcane/cli/v2/internal/output"
-	runtimectx "github.com/getarcaneapp/arcane/cli/v2/internal/runtime"
+	"github.com/getarcaneapp/arcane/cli/v2/internal/runtime"
 )
 
 // ClientFromCommand returns a configured authenticated client for the command.
@@ -15,7 +15,7 @@ func ClientFromCommand(cmd *cobra.Command) (*client.Client, error) {
 	if cmd == nil {
 		return nil, errors.New("nil command")
 	}
-	if app, ok := runtimectx.From(cmd.Context()); ok {
+	if app, ok := runtime.From(cmd.Context()); ok {
 		return app.Client()
 	}
 	return client.NewFromConfig()
@@ -26,7 +26,7 @@ func UnauthClientFromCommand(cmd *cobra.Command) (*client.Client, error) {
 	if cmd == nil {
 		return nil, errors.New("nil command")
 	}
-	if app, ok := runtimectx.From(cmd.Context()); ok {
+	if app, ok := runtime.From(cmd.Context()); ok {
 		return app.UnauthClient()
 	}
 	return client.NewFromConfigUnauthenticated()
@@ -41,7 +41,7 @@ func JSONOutputEnabled(cmd *cobra.Command) bool {
 		val, err := cmd.Flags().GetBool("json")
 		return err == nil && val
 	}
-	if app, ok := runtimectx.From(cmd.Context()); ok {
+	if app, ok := runtime.From(cmd.Context()); ok {
 		return app.IsJSON()
 	}
 	return false
@@ -52,15 +52,16 @@ func AssumeYes(cmd *cobra.Command) bool {
 	if cmd == nil {
 		return false
 	}
-	if app, ok := runtimectx.From(cmd.Context()); ok {
-		return app.AssumeYes()
+	if app, ok := runtime.From(cmd.Context()); ok {
+		return app.AssumeYes
 	}
 	return false
 }
 
 // Confirm prompts the user unless --yes is enabled.
 func Confirm(cmd *cobra.Command, prompt string) (bool, error) {
-	if AssumeYes(cmd) {
+	app, _ := runtime.From(cmd.Context())
+	if AssumeYes(cmd) || app != nil && app.FleetConfirmed {
 		return true, nil
 	}
 

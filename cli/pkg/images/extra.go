@@ -60,10 +60,9 @@ var imagesSearchCmd = &cobra.Command{
 			rows = append(rows, []string{item.Name, truncateCell(item.Description, 60), strconv.Itoa(item.StarCount), official})
 		}
 
-		if tableErr := output.Table(headers, rows); tableErr != nil {
+		if tableErr := cmdutil.PrintTable(cmd, headers, rows, cmdutil.TableSummary{Resource: "results", Total: int64(len(result.Data)), Paginated: true}); tableErr != nil {
 			return tableErr
 		}
-		output.Showing(len(result.Data), int64(len(result.Data)), "results")
 
 		return nil
 	},
@@ -126,7 +125,7 @@ var imagesHistoryCmd = &cobra.Command{
 			rows = append(rows, []string{created, truncateCell(item.CreatedBy, 60), output.Bytes(item.Size), truncateCell(item.Comment, 30)})
 		}
 
-		return output.Table(headers, rows)
+		return cmdutil.PrintTable(cmd, headers, rows)
 	},
 }
 
@@ -151,7 +150,10 @@ var imagesTagCmd = &cobra.Command{
 		}
 		imageID := resolved.ID
 
-		repository, tag := splitImageRef(args[1])
+		repository, tag := strings.TrimSpace(args[1]), ""
+		if index := strings.LastIndex(repository, ":"); index > 0 && !strings.Contains(repository[index+1:], "/") {
+			repository, tag = repository[:index], repository[index+1:]
+		}
 		if repository == "" {
 			return errors.New("target repository is required")
 		}
@@ -212,7 +214,8 @@ var imagesExportCmd = &cobra.Command{
 		}
 		imageID := resolved.ID
 
-		outputFile := exportFileName(args[0])
+		name := strings.NewReplacer("/", "_", ":", "_", "@", "_").Replace(strings.TrimSpace(args[0]))
+		outputFile := cmp.Or(strings.Trim(name, "._-"), "image") + ".tar"
 		if len(args) == 2 {
 			outputFile = args[1]
 		}
@@ -350,7 +353,7 @@ var imagesAttestationsCmd = &cobra.Command{
 			rows = append(rows, []string{att.PredicateType, att.Platform, truncateCell(att.Digest, 19), output.Bytes(att.Size)})
 		}
 		_, _ = fmt.Fprintln(output.Stdout())
-		if tableErr := output.Table(headers, rows); tableErr != nil {
+		if tableErr := cmdutil.PrintTable(cmd, headers, rows); tableErr != nil {
 			return tableErr
 		}
 
@@ -522,12 +525,20 @@ var imagesBuildsCmd = &cobra.Command{
 			JSON:     cmdutil.JSONOutputEnabled(cmd),
 			Headers:  []string{"ID", "IMAGE", "STATUS", "STARTED", "DURATION"},
 			Row: func(record image.BuildRecord) []string {
+				label := truncateCell(record.ContextDir, 40)
+				if len(record.Tags) > 0 {
+					label = record.Tags[0]
+				}
+				duration := ""
+				if record.DurationMs != nil {
+					duration = (time.Duration(*record.DurationMs) * time.Millisecond).Round(time.Second).String()
+				}
 				return []string{
 					record.ID,
-					buildImageLabel(record),
+					label,
 					output.TintStatus(record.Status),
 					record.CreatedAt.Format(time.RFC3339),
-					buildDurationLabel(record.DurationMs),
+					duration,
 				}
 			},
 		})
@@ -598,7 +609,11 @@ var imagesBuildsGetCmd = &cobra.Command{
 		if record.CompletedAt != nil {
 			output.KeyValue("Completed", record.CompletedAt.Format(time.RFC3339))
 		}
-		output.KeyValue("Duration", buildDurationLabel(record.DurationMs))
+		duration := ""
+		if record.DurationMs != nil {
+			duration = (time.Duration(*record.DurationMs) * time.Millisecond).Round(time.Second).String()
+		}
+		output.KeyValue("Duration", duration)
 		if record.Digest != nil && *record.Digest != "" {
 			output.KeyValue("Digest", *record.Digest)
 		}
@@ -618,39 +633,6 @@ var imagesBuildsGetCmd = &cobra.Command{
 	},
 }
 
-func buildImageLabel(record image.BuildRecord) string {
-	if len(record.Tags) > 0 {
-		return record.Tags[0]
-	}
-	return truncateCell(record.ContextDir, 40)
-}
-
-func buildDurationLabel(durationMs *int64) string {
-	if durationMs == nil {
-		return ""
-	}
-	return (time.Duration(*durationMs) * time.Millisecond).Round(time.Second).String()
-}
-
-// splitImageRef splits an image reference into repository and tag. The tag is
-// only split off when the text after the final colon contains no slash, so
-// registry ports (registry:5000/repo) stay part of the repository.
-func splitImageRef(ref string) (string, string) {
-	ref = strings.TrimSpace(ref)
-	if idx := strings.LastIndex(ref, ":"); idx > 0 && !strings.Contains(ref[idx+1:], "/") {
-		return ref[:idx], ref[idx+1:]
-	}
-	return ref, ""
-}
-
-// exportFileName mirrors the server's default export filename for an image
-// reference, replacing separators with underscores.
-func exportFileName(imageName string) string {
-	name := strings.NewReplacer("/", "_", ":", "_", "@", "_").Replace(strings.TrimSpace(imageName))
-	name = cmp.Or(strings.Trim(name, "._-"), "image")
-	return name + ".tar"
-}
-
 func truncateCell(value string, limit int) string {
 	value = strings.ReplaceAll(value, "\n", " ")
 	if limit > 3 && len(value) > limit {
@@ -660,6 +642,10 @@ func truncateCell(value string, limit int) string {
 }
 
 func init() {
+	cmdutil.SetResource(buildRef, imagesBuildsGetCmd)
+	cmdutil.SetResource(ImageRef, imagesAttestationsCmd)
+	cmdutil.SetScope(cmdutil.ScopeRead, imagesSearchCmd, imagesBuildsCmd)
+	cmdutil.SetScope(cmdutil.ScopeDestination, imagesBuildCmd)
 	ImagesCmd.AddCommand(imagesSearchCmd)
 
 	ImagesCmd.AddCommand(imagesHistoryCmd)
@@ -695,4 +681,14 @@ func init() {
 	imagesBuildsCmd.Flags().StringVar(&buildsProvider, "provider", "", "Filter by provider")
 
 	imagesBuildsCmd.AddCommand(imagesBuildsGetCmd)
+}
+
+var buildRef = cmdutil.ResourceRef[image.BuildRecord, image.BuildRecord]{
+	EnvironmentScoped: true,
+	Singular:          "build", Plural: "builds",
+	IDHint: "the identifier", ListCmd: "arcane-cli images builds",
+	GetPath: types.ImageBuild, ListPath: types.ImageBuilds,
+	Matches: func(item image.BuildRecord, lower, original string) bool { return strings.EqualFold(item.ID, original) },
+	Label:   func(item image.BuildRecord) string { return item.ID },
+	Promote: func(item image.BuildRecord) *image.BuildRecord { return &item },
 }

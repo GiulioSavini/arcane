@@ -10,9 +10,9 @@ import (
 	"github.com/getarcaneapp/arcane/types/v2/imageupdate"
 	"github.com/spf13/cobra"
 
-	"github.com/getarcaneapp/arcane/cli/v2/internal/client"
 	"github.com/getarcaneapp/arcane/cli/v2/internal/cmdutil"
 	"github.com/getarcaneapp/arcane/cli/v2/internal/output"
+	"github.com/getarcaneapp/arcane/cli/v2/internal/runtime"
 	"github.com/getarcaneapp/arcane/cli/v2/internal/types"
 )
 
@@ -26,8 +26,8 @@ var UpdatesCmd = &cobra.Command{
 
 var checkAll bool
 
-// checkAllBodyInternal is an empty JSON object; older servers reject check-all without a body.
-var checkAllBodyInternal = struct{}{}
+// checkAllBody is an empty JSON object; older servers reject check-all without a body.
+var checkAllBody = struct{}{}
 
 var checkCmd = &cobra.Command{
 	Use:   "check [image-ref...]",
@@ -37,7 +37,7 @@ var checkCmd = &cobra.Command{
 	Args:         cobra.ArbitraryArgs,
 	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := client.NewFromConfig()
+		c, err := cmdutil.ClientFromCommand(cmd)
 		if err != nil {
 			return err
 		}
@@ -47,11 +47,11 @@ var checkCmd = &cobra.Command{
 				return errors.New("--all cannot be combined with image references")
 			}
 
-			result, checkAllUpdatesErr := c.PostJSON[imageupdate.BatchResponse](cmd.Context(), types.ImageUpdatesCheckAll(c.EnvID()), checkAllBodyInternal)
+			result, checkAllUpdatesErr := c.PostJSON[imageupdate.BatchResponse](cmd.Context(), types.ImageUpdatesCheckAll(c.EnvID()), checkAllBody)
 			if checkAllUpdatesErr != nil {
 				return fmt.Errorf("failed to check all updates: %w", checkAllUpdatesErr)
 			}
-			return printBatchResultsInternal(result.Data)
+			return printBatchResults(cmd, result.Data)
 		}
 
 		if len(args) == 0 {
@@ -63,12 +63,16 @@ var checkCmd = &cobra.Command{
 			if checkBatchUpdatesErr != nil {
 				return fmt.Errorf("failed to check updates: %w", checkBatchUpdatesErr)
 			}
-			return printBatchResultsInternal(result.Data)
+			return printBatchResults(cmd, result.Data)
 		}
 
 		result, err := c.GetJSON[imageupdate.Response](cmd.Context(), types.ImageUpdatesCheck(c.EnvID(), args[0]))
 		if err != nil {
 			return fmt.Errorf("failed to check updates: %w", err)
+		}
+
+		if app, ok := runtime.From(cmd.Context()); ok && app != nil && app.FleetConfirmed && result.Data.Error != "" {
+			return fmt.Errorf("failed to check updates: %s", result.Data.Error)
 		}
 
 		if jsonOutput {
@@ -95,31 +99,17 @@ var checkAllCmd = &cobra.Command{
 	Short:        "Check all images for updates",
 	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := client.NewFromConfig()
+		c, err := cmdutil.ClientFromCommand(cmd)
 		if err != nil {
 			return err
 		}
 
-		result, err := c.PostJSON[imageupdate.BatchResponse](cmd.Context(), types.ImageUpdatesCheckAll(c.EnvID()), checkAllBodyInternal)
+		result, err := c.PostJSON[imageupdate.BatchResponse](cmd.Context(), types.ImageUpdatesCheckAll(c.EnvID()), checkAllBody)
 		if err != nil {
 			return fmt.Errorf("failed to check all updates: %w", err)
 		}
 
-		if jsonOutput {
-			return cmdutil.PrintJSON(result.Data)
-		}
-
-		output.Header("Check All Results")
-		updatesAvailable := 0
-		for imageRef, update := range result.Data {
-			if update != nil && update.HasUpdate {
-				output.KeyValue(imageRef, fmt.Sprintf("%s → %s (%s)", update.CurrentVersion, update.LatestVersion, update.UpdateType))
-				updatesAvailable++
-			}
-		}
-
-		_, _ = fmt.Fprintf(output.Stdout(), "\nTotal: %d images checked, %d updates available\n", len(result.Data), updatesAvailable)
-		return nil
+		return printBatchResults(cmd, result.Data)
 	},
 }
 
@@ -130,7 +120,7 @@ var checkImageCmd = &cobra.Command{
 	Args:         cobra.ExactArgs(1),
 	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := client.NewFromConfig()
+		c, err := cmdutil.ClientFromCommand(cmd)
 		if err != nil {
 			return err
 		}
@@ -162,7 +152,7 @@ var summaryCmd = &cobra.Command{
 	Short:        "Get image updates summary",
 	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := client.NewFromConfig()
+		c, err := cmdutil.ClientFromCommand(cmd)
 		if err != nil {
 			return err
 		}
@@ -185,9 +175,19 @@ var summaryCmd = &cobra.Command{
 	},
 }
 
-// printBatchResultsInternal prints every requested reference, including
+// printBatchResults prints every requested reference, including
 // up-to-date and failed checks.
-func printBatchResultsInternal(result imageupdate.BatchResponse) error {
+func printBatchResults(cmd *cobra.Command, result imageupdate.BatchResponse) error {
+	if app, ok := runtime.From(cmd.Context()); ok && app != nil && app.FleetConfirmed {
+		for ref, update := range result {
+			if update == nil {
+				return fmt.Errorf("image update check failed for %s: no result", ref)
+			}
+			if update.Error != "" {
+				return fmt.Errorf("image update check failed for %s: %s", ref, update.Error)
+			}
+		}
+	}
 	if jsonOutput {
 		return cmdutil.PrintJSON(result)
 	}
@@ -215,7 +215,7 @@ func printBatchResultsInternal(result imageupdate.BatchResponse) error {
 		rows = append(rows, []string{imageRef, "No", update.CurrentVersion, "", ""})
 	}
 
-	if tableErr := output.Table(headers, rows); tableErr != nil {
+	if tableErr := cmdutil.PrintTable(cmd, headers, rows); tableErr != nil {
 		return tableErr
 	}
 	_, _ = fmt.Fprintf(output.Stdout(), "\nTotal: %d images checked, %d updates available\n", len(result), updatesAvailable)
@@ -223,6 +223,8 @@ func printBatchResultsInternal(result imageupdate.BatchResponse) error {
 }
 
 func init() {
+	cmdutil.SetScope(cmdutil.ScopeFleet, checkCmd, checkAllCmd)
+	cmdutil.SetScope(cmdutil.ScopeRead, summaryCmd)
 	UpdatesCmd.AddCommand(checkCmd)
 	checkCmd.Flags().BoolVar(&checkAll, "all", false, "Check every image for updates")
 	UpdatesCmd.AddCommand(checkAllCmd)

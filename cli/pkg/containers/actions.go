@@ -42,7 +42,7 @@ var containersKillCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
-		resolved, _, err := containerRef.Resolve(cmd.Context(), c, args[0], false)
+		resolved, _, err := ContainerRef.Resolve(cmd.Context(), c, args[0], false)
 		if err != nil {
 			return err
 		}
@@ -70,7 +70,7 @@ var containersPauseCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
-		resolved, _, err := containerRef.Resolve(cmd.Context(), c, args[0], false)
+		resolved, _, err := ContainerRef.Resolve(cmd.Context(), c, args[0], false)
 		if err != nil {
 			return err
 		}
@@ -93,7 +93,7 @@ var containersUnpauseCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
-		resolved, _, err := containerRef.Resolve(cmd.Context(), c, args[0], false)
+		resolved, _, err := ContainerRef.Resolve(cmd.Context(), c, args[0], false)
 		if err != nil {
 			return err
 		}
@@ -117,7 +117,7 @@ var containersCommitCmd = &cobra.Command{
 			return err
 		}
 
-		resolved, _, err := containerRef.Resolve(cmd.Context(), c, args[0], false)
+		resolved, _, err := ContainerRef.Resolve(cmd.Context(), c, args[0], false)
 		if err != nil {
 			return err
 		}
@@ -160,7 +160,7 @@ var containersEditCmd = &cobra.Command{
 			return err
 		}
 
-		resolved, _, err := containerRef.Resolve(cmd.Context(), c, args[0], false)
+		resolved, _, err := ContainerRef.Resolve(cmd.Context(), c, args[0], false)
 		if err != nil {
 			return err
 		}
@@ -211,7 +211,7 @@ var containersAutoUpdateCmd = &cobra.Command{
 			return err
 		}
 
-		resolved, _, err := containerRef.Resolve(cmd.Context(), c, args[0], false)
+		resolved, _, err := ContainerRef.Resolve(cmd.Context(), c, args[0], false)
 		if err != nil {
 			return err
 		}

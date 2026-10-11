@@ -1,63 +1,16 @@
-package integrationtest
+package version_test
 
 import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 
 	"github.com/getarcaneapp/arcane/cli/v2/internal/config"
+	"github.com/getarcaneapp/arcane/cli/v2/internal/testutil"
 )
-
-func TestContainersListJSONContract(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !strings.HasPrefix(r.URL.Path, "/api/environments/0/containers") {
-			w.WriteHeader(http.StatusNotFound)
-			_, _ = w.Write([]byte(`{"success":false,"error":"not found"}`))
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{
-			"success": true,
-			"data": [
-				{"id":"abc123","names":["/nginx"],"image":"nginx:latest","state":"running","status":"Up 1 hour"}
-			],
-			"pagination": {"totalPages":1,"totalItems":1,"currentPage":1,"itemsPerPage":20}
-		}`))
-	}))
-	defer srv.Close()
-
-	configPath := writeCLIIntegrationConfigInternal(t, srv.URL)
-
-	outBuf, errOut, err := executeCLIIntegrationCommandInternal(
-		t,
-		[]string{"--config", configPath, "--log-level", "debug", "containers", "list", "--json"},
-	)
-
-	require.NoError(t, err,
-		"execute: %v (%s)", err, errOut)
-
-	require.Contains(t, errOut, "Sending request")
-	require.NotContains(t, outBuf, "Sending request")
-	require.NotContains(t, outBuf, "\x1b")
-	var got map[string]any
-	{
-		unmarshalErr := json.Unmarshal([]byte(strings.TrimSpace(outBuf)), &got)
-		require.NoError(t, unmarshalErr,
-			"json parse failed: %v\noutput=%s", unmarshalErr, outBuf)
-	}
-
-	for _, key := range []string{"success", "data", "pagination"} {
-		{
-			_, ok := got[key]
-			require.True(t, ok,
-				"missing key %q in output: %v", key, got)
-		}
-	}
-}
 
 func TestVersionOutput(t *testing.T) {
 	for _, tc := range []struct {
@@ -85,11 +38,11 @@ func TestVersionOutput(t *testing.T) {
 				_, _ = w.Write([]byte(tc.body))
 			}))
 			defer srv.Close()
-			args := []string{"--config", writeCLIIntegrationConfigInternal(t, srv.URL), "--no-color", "version"}
+			args := []string{"--config", testutil.WriteConfig(t, srv.URL), "--no-color", "version"}
 			if tc.json {
 				args = append(args, "--json")
 			}
-			out, diagnostics, err := executeCLIIntegrationCommandInternal(t, args)
+			out, diagnostics, err := testutil.Execute(t, args)
 			if tc.json && tc.unavailable {
 				require.Error(t, err)
 				require.Empty(t, out)

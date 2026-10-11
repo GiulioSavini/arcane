@@ -1,10 +1,4 @@
-// Package vulnerabilities provides CLI commands for image vulnerability
-// scanning on Arcane servers.
-//
-// This package implements the "arcane images vulnerabilities" command group, which
-// includes subcommands for checking scanner status, viewing environment-wide
-// summaries, listing vulnerabilities, scanning images, and managing ignore
-// records.
+// Package vulnerabilities provides image vulnerability scanning commands.
 package vulnerabilities
 
 import (
@@ -208,7 +202,27 @@ var imageCmd = &cobra.Command{
 		}
 
 		if summaryFlag {
-			return runImageSummary(cmd, c, imageID)
+			result, summaryErr := c.GetJSON[vulnerability.ScanSummary](cmd.Context(), types.ImageVulnerabilitiesSummary(c.EnvID(), imageID))
+			if summaryErr != nil {
+				return fmt.Errorf("failed to get image vulnerability summary: %w", summaryErr)
+			}
+
+			if jsonOutput {
+				return cmdutil.PrintJSON(result.Data)
+			}
+
+			output.Header("Image Vulnerability Summary")
+			output.KeyValue("Image ID", result.Data.ImageID)
+			output.KeyValue("Status", string(result.Data.Status))
+			output.KeyValue("Scan Time", result.Data.ScanTime.Format(time.RFC3339))
+			if result.Data.ScanPhase != "" {
+				output.KeyValue("Phase", string(result.Data.ScanPhase))
+			}
+			if result.Data.Error != "" {
+				output.KeyValue("Error", result.Data.Error)
+			}
+			printSeveritySummary(result.Data.Summary)
+			return nil
 		}
 
 		query := url.Values{}
@@ -234,30 +248,6 @@ var imageCmd = &cobra.Command{
 			},
 		})
 	},
-}
-
-func runImageSummary(cmd *cobra.Command, c *client.Client, imageID string) error {
-	result, err := c.GetJSON[vulnerability.ScanSummary](cmd.Context(), types.ImageVulnerabilitiesSummary(c.EnvID(), imageID))
-	if err != nil {
-		return fmt.Errorf("failed to get image vulnerability summary: %w", err)
-	}
-
-	if jsonOutput {
-		return cmdutil.PrintJSON(result.Data)
-	}
-
-	output.Header("Image Vulnerability Summary")
-	output.KeyValue("Image ID", result.Data.ImageID)
-	output.KeyValue("Status", string(result.Data.Status))
-	output.KeyValue("Scan Time", result.Data.ScanTime.Format(time.RFC3339))
-	if result.Data.ScanPhase != "" {
-		output.KeyValue("Phase", string(result.Data.ScanPhase))
-	}
-	if result.Data.Error != "" {
-		output.KeyValue("Error", result.Data.Error)
-	}
-	printSeveritySummary(result.Data.Summary)
-	return nil
 }
 
 var ignoreCmd = &cobra.Command{
@@ -322,10 +312,12 @@ var ignoredCmd = &cobra.Command{
 				if item.Reason != nil {
 					reason = *item.Reason
 				}
+				imageID := strings.TrimPrefix(item.ImageID, "sha256:")
+				imageID = imageID[:min(len(imageID), 12)]
 				return []string{
 					item.ID,
 					item.VulnerabilityID,
-					shortImageID(item.ImageID),
+					imageID,
 					item.PkgName,
 					cmp.Or(reason, "-"),
 					item.CreatedAt.Format(time.RFC3339),
@@ -367,6 +359,9 @@ var unignoreCmd = &cobra.Command{
 }
 
 func init() {
+	cmdutil.SetResource(ignoreRef, unignoreCmd)
+	cmdutil.SetScope(cmdutil.ScopeResource, VulnerabilitiesCmd)
+	cmdutil.SetScope(cmdutil.ScopeRead, statusCmd, summaryCmd, listCmd, ignoredCmd)
 	VulnerabilitiesCmd.AddCommand(statusCmd)
 	VulnerabilitiesCmd.AddCommand(summaryCmd)
 	VulnerabilitiesCmd.AddCommand(listCmd)
@@ -424,14 +419,6 @@ func printSeveritySummary(s *vulnerability.SeveritySummary) {
 	output.KeyValue("Total", s.Total)
 }
 
-func shortImageID(id string) string {
-	trimmed := strings.TrimPrefix(id, "sha256:")
-	if len(trimmed) > 12 {
-		return trimmed[:12]
-	}
-	return trimmed
-}
-
 // resolveImageID resolves an image name, tag, or (partial) ID to a full image
 // ID via the shared images resolver.
 func resolveImageID(ctx context.Context, c *client.Client, identifier string) (string, error) {
@@ -440,4 +427,18 @@ func resolveImageID(ctx context.Context, c *client.Client, identifier string) (s
 		return "", err
 	}
 	return resolved.ID, nil
+}
+
+var ignoreRef = cmdutil.ResourceRef[vulnerability.IgnoredVulnerability, vulnerability.IgnoredVulnerability]{
+	EnvironmentScoped: true,
+	Singular:          "ignore", Plural: "ignores",
+	IDHint: "the identifier", ListCmd: "arcane-cli images vulnerabilities ignored",
+	GetPath: nil, ListPath: types.VulnerabilitiesIgnored,
+	Matches: func(item vulnerability.IgnoredVulnerability, lower, original string) bool {
+		return strings.EqualFold(item.ID, original)
+	},
+	Label: func(item vulnerability.IgnoredVulnerability) string {
+		return item.VulnerabilityID + " (" + item.ID + ")"
+	},
+	Promote: func(item vulnerability.IgnoredVulnerability) *vulnerability.IgnoredVulnerability { return &item },
 }

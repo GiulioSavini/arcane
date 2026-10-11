@@ -10,7 +10,6 @@ import (
 	"github.com/getarcaneapp/arcane/types/v2/volume"
 	"github.com/spf13/cobra"
 
-	"github.com/getarcaneapp/arcane/cli/v2/internal/client"
 	"github.com/getarcaneapp/arcane/cli/v2/internal/cmdutil"
 	"github.com/getarcaneapp/arcane/cli/v2/internal/output"
 	"github.com/getarcaneapp/arcane/cli/v2/internal/prompt"
@@ -51,7 +50,7 @@ var listCmd = &cobra.Command{
 		if inUseOnlyFlag && unusedOnlyFlag {
 			return errors.New("--inuse and --unused cannot be used together")
 		}
-		c, err := client.NewFromConfig()
+		c, err := cmdutil.ClientFromCommand(cmd)
 		if err != nil {
 			return err
 		}
@@ -66,7 +65,7 @@ var listCmd = &cobra.Command{
 			query.Set("inUse", "false")
 		}
 		if includeInternalFlag {
-			query.Set("includeInternal", "true")
+			query.Set("include", "true")
 		}
 
 		return cmdutil.RunList(cmd, c, cmdutil.ListSpec[volume.Volume]{
@@ -105,7 +104,7 @@ var getCmd = &cobra.Command{
 	Args:         cobra.ExactArgs(1),
 	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := client.NewFromConfig()
+		c, err := cmdutil.ClientFromCommand(cmd)
 		if err != nil {
 			return err
 		}
@@ -141,7 +140,7 @@ var deleteCmd = &cobra.Command{
 	Args:         cobra.ExactArgs(1),
 	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := client.NewFromConfig()
+		c, err := cmdutil.ClientFromCommand(cmd)
 		if err != nil {
 			return err
 		}
@@ -186,12 +185,21 @@ var countsCmd = &cobra.Command{
 	Short:        "Get volume usage counts",
 	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		return runVolumeDataCommand(cmd, volumeDataCommandConfig{
-			endpoint:       types.VolumesCounts,
-			failureMessage: "failed to get volume counts",
-			header:         "Volume Usage Counts",
-			marshalMessage: "failed to marshal volume counts",
-		})
+		c, err := cmdutil.ClientFromCommand(cmd)
+		if err != nil {
+			return err
+		}
+		result, err := c.GetJSON[any](cmd.Context(), types.VolumesCounts(c.EnvID()))
+		if err != nil {
+			return fmt.Errorf("failed to get volume counts: %w", err)
+		}
+		if !jsonOutput {
+			output.Header("Volume Usage Counts")
+		}
+		if printErr := cmdutil.PrintJSON(result.Data); printErr != nil {
+			return fmt.Errorf("failed to marshal volume counts: %w", printErr)
+		}
+		return nil
 	},
 }
 
@@ -211,7 +219,7 @@ var pruneCmd = &cobra.Command{
 			}
 		}
 
-		c, err := client.NewFromConfig()
+		c, err := cmdutil.ClientFromCommand(cmd)
 		if err != nil {
 			return err
 		}
@@ -230,40 +238,22 @@ var sizesCmd = &cobra.Command{
 	Short:        "Get volume sizes",
 	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		return runVolumeDataCommand(cmd, volumeDataCommandConfig{
-			endpoint:       types.VolumesSizes,
-			failureMessage: "failed to get volume sizes",
-			header:         "Volume Sizes",
-			marshalMessage: "failed to marshal volume sizes",
-		})
+		c, err := cmdutil.ClientFromCommand(cmd)
+		if err != nil {
+			return err
+		}
+		result, err := c.GetJSON[any](cmd.Context(), types.VolumesSizes(c.EnvID()))
+		if err != nil {
+			return fmt.Errorf("failed to get volume sizes: %w", err)
+		}
+		if !jsonOutput {
+			output.Header("Volume Sizes")
+		}
+		if printErr := cmdutil.PrintJSON(result.Data); printErr != nil {
+			return fmt.Errorf("failed to marshal volume sizes: %w", printErr)
+		}
+		return nil
 	},
-}
-
-type volumeDataCommandConfig struct {
-	endpoint       func(string) string
-	failureMessage string
-	header         string
-	marshalMessage string
-}
-
-func runVolumeDataCommand(cmd *cobra.Command, cfg volumeDataCommandConfig) error {
-	c, err := client.NewFromConfig()
-	if err != nil {
-		return err
-	}
-
-	result, err := c.GetJSON[any](cmd.Context(), cfg.endpoint(c.EnvID()))
-	if err != nil {
-		return fmt.Errorf("%s: %w", cfg.failureMessage, err)
-	}
-
-	if !jsonOutput {
-		output.Header("%s", cfg.header)
-	}
-	if printJSONErr := cmdutil.PrintJSON(result.Data); printJSONErr != nil {
-		return fmt.Errorf("%s: %w", cfg.marshalMessage, printJSONErr)
-	}
-	return nil
 }
 
 var usageCmd = &cobra.Command{
@@ -272,7 +262,7 @@ var usageCmd = &cobra.Command{
 	Args:         cobra.ExactArgs(1),
 	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := client.NewFromConfig()
+		c, err := cmdutil.ClientFromCommand(cmd)
 		if err != nil {
 			return err
 		}
@@ -302,7 +292,7 @@ var createCmd = &cobra.Command{
 	Short:        "Create a volume",
 	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := client.NewFromConfig()
+		c, err := cmdutil.ClientFromCommand(cmd)
 		if err != nil {
 			return err
 		}
@@ -350,6 +340,10 @@ var createCmd = &cobra.Command{
 }
 
 func init() {
+	cmdutil.SetScope(cmdutil.ScopeResource, VolumesCmd)
+	cmdutil.SetScope(cmdutil.ScopeRead, listCmd, countsCmd, sizesCmd)
+	cmdutil.SetScope(cmdutil.ScopeFleet, pruneCmd)
+	cmdutil.SetScope(cmdutil.ScopeDestination, createCmd)
 	VolumesCmd.AddCommand(listCmd)
 	VolumesCmd.AddCommand(getCmd)
 	VolumesCmd.AddCommand(deleteCmd)
@@ -394,13 +388,23 @@ func init() {
 }
 
 var volumeRef = cmdutil.ResourceRef[volume.Volume, volume.Volume]{
-	Singular: "volume",
-	Plural:   "volumes",
-	IDHint:   "the volume name",
-	ListCmd:  "arcane volumes list",
-	GetPath:  types.Volume,
-	ListPath: types.Volumes,
-	Matches:  volumeMatches,
+	EnvironmentScoped: true,
+	Singular:          "volume",
+	Plural:            "volumes",
+	IDHint:            "the volume name",
+	ListCmd:           "arcane volumes list",
+	GetPath:           types.Volume,
+	ListPath:          types.Volumes,
+	Matches: func(item volume.Volume, identifierLower, original string) bool {
+		if strings.EqualFold(item.Name, original) {
+			return true
+		}
+		if strings.Contains(strings.ToLower(item.Name), identifierLower) {
+			return true
+		}
+		idLower := strings.ToLower(item.ID)
+		return idLower == identifierLower || (len(identifierLower) >= 4 && strings.HasPrefix(idLower, identifierLower))
+	},
 	Label: func(match volume.Volume) string {
 		if match.Driver != "" {
 			return fmt.Sprintf("%s (%s)", match.Name, match.Driver)
@@ -408,15 +412,4 @@ var volumeRef = cmdutil.ResourceRef[volume.Volume, volume.Volume]{
 		return match.Name
 	},
 	Promote: func(match volume.Volume) *volume.Volume { return &match },
-}
-
-func volumeMatches(item volume.Volume, identifierLower, original string) bool {
-	if strings.EqualFold(item.Name, original) {
-		return true
-	}
-	if strings.Contains(strings.ToLower(item.Name), identifierLower) {
-		return true
-	}
-	idLower := strings.ToLower(item.ID)
-	return idLower == identifierLower || (len(identifierLower) >= 4 && strings.HasPrefix(idLower, identifierLower))
 }

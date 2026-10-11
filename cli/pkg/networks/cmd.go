@@ -10,11 +10,12 @@ import (
 	"github.com/getarcaneapp/arcane/types/v2/network"
 	"github.com/spf13/cobra"
 
-	"github.com/getarcaneapp/arcane/cli/v2/internal/client"
 	"github.com/getarcaneapp/arcane/cli/v2/internal/cmdutil"
 	"github.com/getarcaneapp/arcane/cli/v2/internal/output"
 	"github.com/getarcaneapp/arcane/cli/v2/internal/prompt"
+	"github.com/getarcaneapp/arcane/cli/v2/internal/runtime"
 	"github.com/getarcaneapp/arcane/cli/v2/internal/types"
+	"github.com/getarcaneapp/arcane/cli/v2/pkg/containers"
 )
 
 var (
@@ -33,7 +34,7 @@ var (
 	networkCreateSubnet     string
 	networkCreateGateway    string
 	networkCreateIPRange    string
-	networkCreateInternal   bool
+	networkCreate           bool
 	networkCreateAttachable bool
 	networkCreateIPv6       bool
 	networkCreateLabels     []string
@@ -64,7 +65,7 @@ var listCmd = &cobra.Command{
 		if inUseOnlyFlag && unusedOnlyFlag {
 			return errors.New("--inuse and --unused cannot be used together")
 		}
-		c, err := client.NewFromConfig()
+		c, err := cmdutil.ClientFromCommand(cmd)
 		if err != nil {
 			return err
 		}
@@ -116,7 +117,7 @@ var getCmd = &cobra.Command{
 	Args:         cobra.ExactArgs(1),
 	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := client.NewFromConfig()
+		c, err := cmdutil.ClientFromCommand(cmd)
 		if err != nil {
 			return err
 		}
@@ -160,7 +161,7 @@ var deleteCmd = &cobra.Command{
 	Args:         cobra.ExactArgs(1),
 	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := client.NewFromConfig()
+		c, err := cmdutil.ClientFromCommand(cmd)
 		if err != nil {
 			return err
 		}
@@ -205,7 +206,7 @@ var countsCmd = &cobra.Command{
 	Short:        "Get network usage counts",
 	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := client.NewFromConfig()
+		c, err := cmdutil.ClientFromCommand(cmd)
 		if err != nil {
 			return err
 		}
@@ -243,7 +244,7 @@ var pruneCmd = &cobra.Command{
 			}
 		}
 
-		c, err := client.NewFromConfig()
+		c, err := cmdutil.ClientFromCommand(cmd)
 		if err != nil {
 			return err
 		}
@@ -269,7 +270,7 @@ var createCmd = &cobra.Command{
 	Short:        "Create a network",
 	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := client.NewFromConfig()
+		c, err := cmdutil.ClientFromCommand(cmd)
 		if err != nil {
 			return err
 		}
@@ -278,7 +279,7 @@ var createCmd = &cobra.Command{
 			Name: networkCreateName,
 			Options: network.CreateOptions{
 				Driver:     networkCreateDriver,
-				Internal:   networkCreateInternal,
+				Internal:   networkCreate,
 				Attachable: networkCreateAttachable,
 				EnableIPv6: networkCreateIPv6,
 			},
@@ -343,14 +344,25 @@ var connectCmd = &cobra.Command{
 			return err
 		}
 
+		app, _ := runtime.From(cmd.Context())
+		preview := app.PreviewEnabled()
 		allowPrompt := !jsonOutput && prompt.IsInteractive()
 		resolved, _, err := networkRef.Resolve(cmd.Context(), c, args[0], allowPrompt)
 		if err != nil {
 			return err
 		}
 
+		containerID := args[1]
+		if preview {
+			dependent, _, resolveErr := containers.ContainerRef.Resolve(cmd.Context(), c, args[1], allowPrompt)
+			if resolveErr != nil {
+				return resolveErr
+			}
+			containerID = dependent.ID
+		}
+
 		req := network.ConnectContainerRequest{
-			ContainerID: args[1],
+			ContainerID: containerID,
 			Aliases:     connectAliases,
 			IPv4Address: connectIPv4,
 			IPv6Address: connectIPv6,
@@ -385,14 +397,25 @@ var disconnectCmd = &cobra.Command{
 			return err
 		}
 
+		app, _ := runtime.From(cmd.Context())
+		preview := app.PreviewEnabled()
 		allowPrompt := !jsonOutput && prompt.IsInteractive()
 		resolved, _, err := networkRef.Resolve(cmd.Context(), c, args[0], allowPrompt)
 		if err != nil {
 			return err
 		}
 
+		containerID := args[1]
+		if preview {
+			dependent, _, resolveErr := containers.ContainerRef.Resolve(cmd.Context(), c, args[1], allowPrompt)
+			if resolveErr != nil {
+				return resolveErr
+			}
+			containerID = dependent.ID
+		}
+
 		req := network.DisconnectContainerRequest{
-			ContainerID: args[1],
+			ContainerID: containerID,
 			Force:       disconnectForce,
 		}
 
@@ -472,11 +495,15 @@ var topologyCmd = &cobra.Command{
 			}
 			rows[i] = []string{source, target, edge.IPv4Address, edge.IPv6Address}
 		}
-		return output.Table(headers, rows)
+		return cmdutil.PrintTable(cmd, headers, rows)
 	},
 }
 
 func init() {
+	cmdutil.SetScope(cmdutil.ScopeResource, NetworksCmd)
+	cmdutil.SetScope(cmdutil.ScopeRead, listCmd, countsCmd, topologyCmd)
+	cmdutil.SetScope(cmdutil.ScopeFleet, pruneCmd)
+	cmdutil.SetScope(cmdutil.ScopeDestination, createCmd)
 	NetworksCmd.AddCommand(listCmd)
 	NetworksCmd.AddCommand(getCmd)
 	NetworksCmd.AddCommand(deleteCmd)
@@ -515,7 +542,7 @@ func init() {
 	createCmd.Flags().StringVar(&networkCreateSubnet, "subnet", "", "Subnet in CIDR format")
 	createCmd.Flags().StringVar(&networkCreateGateway, "gateway", "", "IPv4 or IPv6 gateway for the subnet")
 	createCmd.Flags().StringVar(&networkCreateIPRange, "ip-range", "", "Allocate container IPs from a sub-range")
-	createCmd.Flags().BoolVar(&networkCreateInternal, "internal", false, "Restrict external access to the network")
+	createCmd.Flags().BoolVar(&networkCreate, "internal", false, "Restrict external access to the network")
 	createCmd.Flags().BoolVar(&networkCreateAttachable, "attachable", false, "Allow manual container attachment")
 	createCmd.Flags().BoolVar(&networkCreateIPv6, "ipv6", false, "Enable IPv6 networking")
 	createCmd.Flags().StringArrayVar(&networkCreateLabels, "label", nil, "Label (KEY=VALUE)")
@@ -545,13 +572,26 @@ func shortID(id string) string {
 }
 
 var networkRef = cmdutil.ResourceRef[network.Inspect, network.Summary]{
-	Singular: "network",
-	Plural:   "networks",
-	IDHint:   "the network ID",
-	ListCmd:  "arcane networks list",
-	GetPath:  types.Network,
-	ListPath: types.Networks,
-	Matches:  networkMatches,
+	EnvironmentScoped: true,
+	Singular:          "network",
+	Plural:            "networks",
+	IDHint:            "the network ID",
+	ListCmd:           "arcane networks list",
+	GetPath:           types.Network,
+	ListPath:          types.Networks,
+	Matches: func(item network.Summary, identifierLower, original string) bool {
+		idLower := strings.ToLower(item.ID)
+		if idLower == identifierLower || (len(identifierLower) >= 4 && strings.HasPrefix(idLower, identifierLower)) {
+			return true
+		}
+		if strings.Contains(idLower, identifierLower) {
+			return true
+		}
+		if strings.Contains(strings.ToLower(item.Name), identifierLower) {
+			return true
+		}
+		return strings.EqualFold(item.Name, original)
+	},
 	Label: func(match network.Summary) string {
 		return fmt.Sprintf("%s (%s)", match.Name, shortID(match.ID))
 	},
@@ -566,18 +606,4 @@ var networkRef = cmdutil.ResourceRef[network.Inspect, network.Summary]{
 			Labels:  match.Labels,
 		}
 	},
-}
-
-func networkMatches(item network.Summary, identifierLower, original string) bool {
-	idLower := strings.ToLower(item.ID)
-	if idLower == identifierLower || (len(identifierLower) >= 4 && strings.HasPrefix(idLower, identifierLower)) {
-		return true
-	}
-	if strings.Contains(idLower, identifierLower) {
-		return true
-	}
-	if strings.Contains(strings.ToLower(item.Name), identifierLower) {
-		return true
-	}
-	return strings.EqualFold(item.Name, original)
 }

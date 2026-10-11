@@ -1,11 +1,14 @@
 package jobs
 
 import (
+	"context"
 	"crypto/rand"
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/getarcaneapp/arcane/types/v2/jobschedule"
@@ -39,7 +42,7 @@ var getCmd = &cobra.Command{
 	Short:        "Get configured job schedule intervals",
 	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := client.NewFromConfig()
+		c, err := cmdutil.ClientFromCommand(cmd)
 		if err != nil {
 			return err
 		}
@@ -72,7 +75,7 @@ var updateCmd = &cobra.Command{
 	Short:        "Update job schedule intervals",
 	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := client.NewFromConfig()
+		c, err := cmdutil.ClientFromCommand(cmd)
 		if err != nil {
 			return err
 		}
@@ -146,10 +149,9 @@ var listCmd = &cobra.Command{
 			}
 		}
 
-		if tableErr := output.Table(headers, rows); tableErr != nil {
+		if tableErr := cmdutil.PrintTable(cmd, headers, rows, cmdutil.TableSummary{Resource: "jobs"}); tableErr != nil {
 			return tableErr
 		}
-		_, _ = fmt.Fprintf(output.Stdout(), "\nTotal: %d jobs\n", len(result.Jobs))
 		return nil
 	},
 }
@@ -193,6 +195,10 @@ var runCmd = &cobra.Command{
 }
 
 func init() {
+	cmdutil.SetResource(jobRef, runCmd)
+	cmdutil.SetScope(cmdutil.ScopeResource, JobsCmd)
+	cmdutil.SetScope(cmdutil.ScopeRead, getCmd, listCmd)
+	cmdutil.SetScope(cmdutil.ScopeFleet, updateCmd)
 	JobsCmd.AddCommand(schedulesCmd)
 	schedulesCmd.AddCommand(getCmd)
 	schedulesCmd.AddCommand(updateCmd)
@@ -208,4 +214,17 @@ func init() {
 	updateCmd.Flags().StringVar(&environmentHealthInterval, "environment-health-interval", "", "Environment health job interval (cron expression)")
 	updateCmd.Flags().StringVar(&eventCleanupInterval, "event-cleanup-interval", "", "Event cleanup job interval (cron expression)")
 	updateCmd.Flags().StringVar(&expiredSessionsCleanupInterval, "expired-sessions-cleanup-interval", "", "Expired sessions cleanup job interval (cron expression)")
+}
+
+var jobRef = cmdutil.ResourceRef[jobschedule.JobStatus, jobschedule.JobStatus]{
+	EnvironmentScoped: true, Singular: "job", Plural: "jobs", IDHint: "the job ID", ListCmd: "arcane-cli jobs list",
+	SearchCandidates: func(ctx context.Context, c *client.Client, identifier string) ([]jobschedule.JobStatus, error) {
+		result, err := c.DoJSON[jobschedule.JobListResponse](ctx, http.MethodGet, types.Jobs(c.EnvID()), nil)
+		if err != nil {
+			return nil, err
+		}
+		return slices.DeleteFunc(result.Jobs, func(item jobschedule.JobStatus) bool { return !strings.EqualFold(item.ID, identifier) }), nil
+	},
+	Label:   func(item jobschedule.JobStatus) string { return item.Name + " (" + item.ID + ")" },
+	Promote: func(item jobschedule.JobStatus) *jobschedule.JobStatus { return &item },
 }

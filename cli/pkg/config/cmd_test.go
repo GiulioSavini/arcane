@@ -14,6 +14,7 @@ func TestApplyConfigSetArgs(t *testing.T) {
 	changed, err := applyConfigSetArgs(cfg, []string{
 		"server-url", "http://localhost:3552",
 		"api-key", "arc_test_12345678",
+		"previews.allEnvironments", "true",
 		"default-limit", "25",
 		"pagination.resources.images.limit", "100",
 		"resource-limit.volumes", "40",
@@ -34,6 +35,16 @@ func TestApplyConfigSetArgs(t *testing.T) {
 	require.Empty(t, cfg.JWTToken,
 		"JWTToken = %q, want empty", cfg.JWTToken)
 
+	require.True(t, cfg.Previews.AllEnvironments)
+	for _, value := range []string{"false", "true", "invalid"} {
+		_, setErr := applyConfigSetArg(cfg, "previews.allEnvironments", value)
+		if value == "invalid" {
+			require.Error(t, setErr)
+			continue
+		}
+		require.NoError(t, setErr)
+		require.Equal(t, value == "true", cfg.Previews.AllEnvironments)
+	}
 	require.Equal(t, 25, cfg.Pagination.Default.Limit,
 		"Pagination.Default.Limit = %d, want 25", cfg.Pagination.Default.Limit)
 	{

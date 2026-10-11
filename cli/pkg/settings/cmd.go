@@ -9,7 +9,6 @@ import (
 	"github.com/getarcaneapp/arcane/types/v2/settings"
 	"github.com/spf13/cobra"
 
-	"github.com/getarcaneapp/arcane/cli/v2/internal/client"
 	"github.com/getarcaneapp/arcane/cli/v2/internal/cmdutil"
 	"github.com/getarcaneapp/arcane/cli/v2/internal/output"
 	"github.com/getarcaneapp/arcane/cli/v2/internal/types"
@@ -45,7 +44,7 @@ var updateCmd = &cobra.Command{
 	Short:        "Update environment settings",
 	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := client.NewFromConfig()
+		c, err := cmdutil.ClientFromCommand(cmd)
 		if err != nil {
 			return err
 		}
@@ -94,7 +93,7 @@ type settingsListConfig struct {
 }
 
 func runSettingsList(cmd *cobra.Command, cfg settingsListConfig) error {
-	c, err := client.NewFromConfig()
+	c, err := cmdutil.ClientFromCommand(cmd)
 	if err != nil {
 		return err
 	}
@@ -114,14 +113,15 @@ func runSettingsList(cmd *cobra.Command, cfg settingsListConfig) error {
 		rows[i] = []string{s.Key, s.Type, s.Value}
 	}
 
-	if tableErr := output.Table(headers, rows); tableErr != nil {
+	if tableErr := cmdutil.PrintTable(cmd, headers, rows, cmdutil.TableSummary{Resource: cfg.totalLabel}); tableErr != nil {
 		return tableErr
 	}
-	_, _ = fmt.Fprintf(output.Stdout(), "\nTotal: %d %s\n", len(result), cfg.totalLabel)
 	return nil
 }
 
 func init() {
+	cmdutil.SetScope(cmdutil.ScopeRead, SettingsCmd)
+	cmdutil.SetScope(cmdutil.ScopeFleet, updateCmd)
 	SettingsCmd.AddCommand(listCmd)
 	SettingsCmd.AddCommand(updateCmd)
 	SettingsCmd.AddCommand(publicCmd)

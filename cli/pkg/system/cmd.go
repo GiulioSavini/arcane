@@ -13,9 +13,9 @@ import (
 	"github.com/getarcaneapp/arcane/types/v2/system"
 	"github.com/spf13/cobra"
 
-	"github.com/getarcaneapp/arcane/cli/v2/internal/client"
 	"github.com/getarcaneapp/arcane/cli/v2/internal/cmdutil"
 	"github.com/getarcaneapp/arcane/cli/v2/internal/output"
+	"github.com/getarcaneapp/arcane/cli/v2/internal/runtime"
 	"github.com/getarcaneapp/arcane/cli/v2/internal/types"
 )
 
@@ -33,7 +33,7 @@ var pruneCmd = &cobra.Command{
 	Short:        "Prune all unused resources",
 	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := client.NewFromConfig()
+		c, err := cmdutil.ClientFromCommand(cmd)
 		if err != nil {
 			return err
 		}
@@ -65,7 +65,7 @@ var dockerInfoCmd = &cobra.Command{
 	Short:        "Get Docker daemon information",
 	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := client.NewFromConfig()
+		c, err := cmdutil.ClientFromCommand(cmd)
 		if err != nil {
 			return err
 		}
@@ -102,7 +102,7 @@ var containersStartCmd = &cobra.Command{
 	Short:        "Start all containers",
 	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := client.NewFromConfig()
+		c, err := cmdutil.ClientFromCommand(cmd)
 		if err != nil {
 			return err
 		}
@@ -128,7 +128,7 @@ var containersStopCmd = &cobra.Command{
 	Short:        "Stop all containers",
 	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := client.NewFromConfig()
+		c, err := cmdutil.ClientFromCommand(cmd)
 		if err != nil {
 			return err
 		}
@@ -148,7 +148,7 @@ var convertCmd = &cobra.Command{
 	Args:         cobra.ExactArgs(1),
 	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := client.NewFromConfig()
+		c, err := cmdutil.ClientFromCommand(cmd)
 		if err != nil {
 			return err
 		}
@@ -204,11 +204,29 @@ var upgradeCmd = &cobra.Command{
 		if upgradeCheckFlag && upgradeAllFlag {
 			return errors.New("--check cannot be combined with --all")
 		}
+		if app, ok := runtime.From(cmd.Context()); ok && app.PreviewEnabled() {
+			if upgradeCheckFlag {
+				return cmdutil.RunEnvironments(cmd, args, func(command *cobra.Command, _ []string) error { return runUpgradeCheck(command) }, false)
+			}
+			environments, discoveryErr := app.Environments(cmd.Context())
+			if discoveryErr != nil {
+				return discoveryErr
+			}
+			if len(environments) == 0 {
+				return errors.New("no enabled environments available")
+			}
+			for _, env := range environments {
+				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Upgrade environment: %s (%s)\n", cmp.Or(env.Name, env.ID), env.ID)
+			}
+			app.SelectEnvironment("0")
+			defer app.SelectEnvironment("")
+			return runUpgradeAll(cmd)
+		}
 		if upgradeAllFlag {
-			return runUpgradeAllInternal(cmd)
+			return runUpgradeAll(cmd)
 		}
 		if upgradeCheckFlag {
-			return runUpgradeCheckInternal(cmd)
+			return runUpgradeCheck(cmd)
 		}
 
 		if !forceFlag {
@@ -222,7 +240,7 @@ var upgradeCmd = &cobra.Command{
 			}
 		}
 
-		c, err := client.NewFromConfig()
+		c, err := cmdutil.ClientFromCommand(cmd)
 		if err != nil {
 			return err
 		}
@@ -240,8 +258,8 @@ var upgradeCmd = &cobra.Command{
 
 var upgradeCheckFlag bool
 
-func runUpgradeCheckInternal(cmd *cobra.Command) error {
-	c, err := client.NewFromConfig()
+func runUpgradeCheck(cmd *cobra.Command) error {
+	c, err := cmdutil.ClientFromCommand(cmd)
 	if err != nil {
 		return err
 	}
@@ -271,9 +289,7 @@ func runUpgradeCheckInternal(cmd *cobra.Command) error {
 	return nil
 }
 
-// environmentUpdateJob mirrors the backend's fleet-wide update job payload
-// (backend/internal/system.EnvironmentUpdateJob), which is not exported in the
-// shared types module.
+// environmentUpdateJob mirrors the backend fleet update payload, which has no shared public DTO.
 type environmentUpdateJob struct {
 	ID                    string `json:"id"`
 	Status                string `json:"status"`
@@ -292,7 +308,7 @@ type environmentUpdateJob struct {
 	CompletedAt *time.Time `json:"completedAt,omitempty"`
 }
 
-func printUpdateAllJobInternal(job environmentUpdateJob) error {
+func printUpdateAllJob(job environmentUpdateJob) error {
 	output.KeyValue("Status", job.Status)
 	if job.Username != "" {
 		output.KeyValue("Triggered By", job.Username)
@@ -331,7 +347,7 @@ var (
 	upgradeAllStatusFlag bool
 )
 
-func runUpgradeAllInternal(cmd *cobra.Command) error {
+func runUpgradeAll(cmd *cobra.Command) error {
 	c, err := cmdutil.ClientFromCommand(cmd)
 	if err != nil {
 		return err
@@ -348,7 +364,7 @@ func runUpgradeAllInternal(cmd *cobra.Command) error {
 		}
 
 		output.Header("Update-All Status")
-		return printUpdateAllJobInternal(result.Data)
+		return printUpdateAllJob(result.Data)
 	}
 
 	if !forceFlag {
@@ -372,10 +388,14 @@ func runUpgradeAllInternal(cmd *cobra.Command) error {
 	}
 
 	output.Success("Update-all started")
-	return printUpdateAllJobInternal(result.Data)
+	return printUpdateAllJob(result.Data)
 }
 
 func init() {
+	cmdutil.SetScope(cmdutil.ScopeRead, dockerInfoCmd)
+	cmdutil.SetScope(cmdutil.ScopeFleet, pruneCmd, containersStartCmd, containersStopCmd)
+	cmdutil.SetScope(cmdutil.ScopeDestination, convertCmd)
+	cmdutil.SetScope(cmdutil.ScopeGlobal, upgradeCmd)
 	SystemCmd.AddCommand(pruneCmd)
 	SystemCmd.AddCommand(dockerInfoCmd)
 	SystemCmd.AddCommand(systemContainersCmd)

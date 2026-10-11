@@ -559,6 +559,10 @@ var imagesUploadCmd = &cobra.Command{
 }
 
 func init() {
+	cmdutil.SetScope(cmdutil.ScopeResource, ImagesCmd)
+	cmdutil.SetScope(cmdutil.ScopeRead, imagesListCmd, imagesCountsCmd)
+	cmdutil.SetScope(cmdutil.ScopeFleet, imagesPruneCmd)
+	cmdutil.SetScope(cmdutil.ScopeDestination, imagesPullCmd, imagesUploadCmd)
 	ImagesCmd.AddCommand(imagesListCmd)
 	imagesListCmd.Flags().IntVarP(&imagesLimit, "limit", "n", 0, "Number of images to show (server default 20)")
 	imagesListCmd.Flags().IntVar(&imagesStart, "start", 0, cmdutil.StartFlagUsage)
@@ -582,19 +586,25 @@ func init() {
 
 	ImagesCmd.AddCommand(imagesCountsCmd)
 	ImagesCmd.AddCommand(updates.UpdatesCmd)
+	for _, command := range updates.UpdatesCmd.Commands() {
+		if command.Name() == "check-image" {
+			cmdutil.SetResource(ImageRef, command)
+		}
+	}
 
 	ImagesCmd.AddCommand(imagesUploadCmd)
 }
 
 var ImageRef = cmdutil.ResourceRef[image.DetailSummary, image.Summary]{
-	Singular:         "image",
-	Plural:           "images",
-	IDHint:           "the image ID",
-	ListCmd:          "arcane images list",
-	GetPath:          types.Image,
-	ListPath:         types.Images,
-	SearchCandidates: searchImageCandidatesInternal,
-	Matches:          imageMatches,
+	EnvironmentScoped: true,
+	Singular:          "image",
+	Plural:            "images",
+	IDHint:            "the image ID",
+	ListCmd:           "arcane images list",
+	GetPath:           types.Image,
+	ListPath:          types.Images,
+	SearchCandidates:  searchImageCandidates,
+	Matches:           imageMatches,
 	Label: func(match image.Summary) string {
 		label := match.ID
 		if len(match.RepoTags) > 0 {
@@ -613,7 +623,8 @@ var ImageRef = cmdutil.ResourceRef[image.DetailSummary, image.Summary]{
 			Size:             match.Size,
 		}
 	},
-	IDOf: func(match image.Summary) string { return match.ID },
+	IDOf:         func(match image.Summary) string { return match.ID },
+	IdentifierOf: func(details image.DetailSummary) string { return details.ID },
 	Validate: func(details image.DetailSummary, identifier string) error {
 		if details.ID == "" {
 			return fmt.Errorf("image lookup for %q returned empty ID", identifier)
@@ -622,8 +633,17 @@ var ImageRef = cmdutil.ResourceRef[image.DetailSummary, image.Summary]{
 	},
 }
 
-func searchImageCandidatesInternal(ctx context.Context, c *client.Client, identifier string) ([]image.Summary, error) {
-	terms := imageSearchTermsInternal(identifier)
+func searchImageCandidates(ctx context.Context, c *client.Client, identifier string) ([]image.Summary, error) {
+	terms := []string{identifier}
+	separator := ":"
+	if strings.Contains(identifier, "@") {
+		separator = "@"
+	}
+	if separator == "@" || !strings.HasPrefix(strings.ToLower(identifier), "sha256:") {
+		if repository, _, ok := strings.Cut(identifier, separator); ok && repository != "" {
+			terms = append(terms, repository)
+		}
+	}
 	seenTerms := make(map[string]struct{}, len(terms))
 	for _, term := range terms {
 		term = strings.TrimSpace(term)
@@ -654,23 +674,6 @@ func searchImageCandidatesInternal(ctx context.Context, c *client.Client, identi
 	}
 
 	return nil, nil
-}
-
-func imageSearchTermsInternal(identifier string) []string {
-	terms := []string{identifier}
-	identifierLower := strings.ToLower(identifier)
-	if strings.Contains(identifier, "@") {
-		if repository, _, ok := strings.Cut(identifier, "@"); ok && repository != "" {
-			terms = append(terms, repository)
-		}
-		return terms
-	}
-	if strings.Contains(identifier, ":") && !strings.HasPrefix(identifierLower, "sha256:") {
-		if repository, _, ok := strings.Cut(identifier, ":"); ok && repository != "" {
-			terms = append(terms, repository)
-		}
-	}
-	return terms
 }
 
 func imageMatches(item image.Summary, identifierLower, original string) bool {

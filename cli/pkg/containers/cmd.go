@@ -16,7 +16,6 @@ import (
 	"github.com/getarcaneapp/arcane/types/v2/updater"
 	"github.com/spf13/cobra"
 
-	"github.com/getarcaneapp/arcane/cli/v2/internal/client"
 	"github.com/getarcaneapp/arcane/cli/v2/internal/cmdutil"
 	"github.com/getarcaneapp/arcane/cli/v2/internal/output"
 	"github.com/getarcaneapp/arcane/cli/v2/internal/prompt"
@@ -24,17 +23,17 @@ import (
 )
 
 var (
-	containersLimit           int
-	containersStart           int
-	containersAll             bool
-	containersUpdatesFilter   string
-	containersStandalone      string
-	containersLabelFilter     string
-	containersIncludeInternal bool
-	containersIncludeHidden   bool
-	containersDeleteVolumes   bool
-	forceFlag                 bool
-	jsonOutput                bool
+	containersLimit         int
+	containersStart         int
+	containersAll           bool
+	containersUpdatesFilter string
+	containersStandalone    string
+	containersLabelFilter   string
+	containersInclude       bool
+	containersIncludeHidden bool
+	containersDeleteVolumes bool
+	forceFlag               bool
+	jsonOutput              bool
 
 	containerCreateFile       string
 	containerCreateName       string
@@ -82,7 +81,7 @@ var containersUpdatesCmd = &cobra.Command{
 }
 
 func runContainersList(cmd *cobra.Command, forceHasUpdateFilter bool) error {
-	c, err := client.NewFromConfig()
+	c, err := cmdutil.ClientFromCommand(cmd)
 	if err != nil {
 		return err
 	}
@@ -94,8 +93,8 @@ func runContainersList(cmd *cobra.Command, forceHasUpdateFilter bool) error {
 	if containersIncludeHidden {
 		query.Set("includeHidden", "true")
 	}
-	if containersIncludeInternal {
-		query.Set("includeInternal", "true")
+	if containersInclude {
+		query.Set("include", "true")
 	}
 	updatesFilter := strings.TrimSpace(containersUpdatesFilter)
 	if forceHasUpdateFilter {
@@ -131,43 +130,33 @@ func runContainersList(cmd *cobra.Command, forceHasUpdateFilter bool) error {
 		}
 		spec.Headers = []string{"ID", "NAME", "IMAGE", "STATE", "UPDATES", "LATEST"}
 		spec.Row = func(item container.Summary) []string {
+			status, latest := "unknown", "-"
+			if item.UpdateInfo != nil {
+				switch {
+				case item.UpdateInfo.Error != "":
+					status = "error"
+				case item.UpdateInfo.HasUpdate:
+					status = "has_update"
+				default:
+					status = "up_to_date"
+				}
+				if strings.TrimSpace(item.UpdateInfo.LatestVersion) != "" {
+					latest = item.UpdateInfo.LatestVersion
+				} else if strings.TrimSpace(item.UpdateInfo.LatestDigest) != "" {
+					latest = item.UpdateInfo.LatestDigest
+				}
+			}
 			return []string{
 				shortID(item.ID),
 				containerSummaryName(item),
 				item.Image,
 				item.State,
-				containerUpdateStatus(item),
-				containerUpdateLatest(item),
+				status,
+				latest,
 			}
 		}
 	}
 	return cmdutil.RunList(cmd, c, spec)
-}
-
-func containerUpdateStatus(item container.Summary) string {
-	switch {
-	case item.UpdateInfo == nil:
-		return "unknown"
-	case item.UpdateInfo.Error != "":
-		return "error"
-	case item.UpdateInfo.HasUpdate:
-		return "has_update"
-	default:
-		return "up_to_date"
-	}
-}
-
-func containerUpdateLatest(item container.Summary) string {
-	if item.UpdateInfo == nil {
-		return "-"
-	}
-	if strings.TrimSpace(item.UpdateInfo.LatestVersion) != "" {
-		return item.UpdateInfo.LatestVersion
-	}
-	if strings.TrimSpace(item.UpdateInfo.LatestDigest) != "" {
-		return item.UpdateInfo.LatestDigest
-	}
-	return "-"
 }
 
 var containersGetCmd = &cobra.Command{
@@ -176,13 +165,13 @@ var containersGetCmd = &cobra.Command{
 	Args:         cobra.ExactArgs(1),
 	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := client.NewFromConfig()
+		c, err := cmdutil.ClientFromCommand(cmd)
 		if err != nil {
 			return err
 		}
 
 		allowPrompt := !jsonOutput && prompt.IsInteractive()
-		resolved, complete, err := containerRef.Resolve(cmd.Context(), c, args[0], allowPrompt)
+		resolved, complete, err := ContainerRef.Resolve(cmd.Context(), c, args[0], allowPrompt)
 		if err != nil {
 			return err
 		}
@@ -215,12 +204,12 @@ var containersStartCmd = &cobra.Command{
 	Args:         cobra.ExactArgs(1),
 	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := client.NewFromConfig()
+		c, err := cmdutil.ClientFromCommand(cmd)
 		if err != nil {
 			return err
 		}
 
-		resolved, _, err := containerRef.Resolve(cmd.Context(), c, args[0], false)
+		resolved, _, err := ContainerRef.Resolve(cmd.Context(), c, args[0], false)
 		if err != nil {
 			return err
 		}
@@ -240,12 +229,12 @@ var containersStopCmd = &cobra.Command{
 	Args:         cobra.ExactArgs(1),
 	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := client.NewFromConfig()
+		c, err := cmdutil.ClientFromCommand(cmd)
 		if err != nil {
 			return err
 		}
 
-		resolved, _, err := containerRef.Resolve(cmd.Context(), c, args[0], false)
+		resolved, _, err := ContainerRef.Resolve(cmd.Context(), c, args[0], false)
 		if err != nil {
 			return err
 		}
@@ -265,12 +254,12 @@ var containersRestartCmd = &cobra.Command{
 	Args:         cobra.ExactArgs(1),
 	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := client.NewFromConfig()
+		c, err := cmdutil.ClientFromCommand(cmd)
 		if err != nil {
 			return err
 		}
 
-		resolved, _, err := containerRef.Resolve(cmd.Context(), c, args[0], false)
+		resolved, _, err := ContainerRef.Resolve(cmd.Context(), c, args[0], false)
 		if err != nil {
 			return err
 		}
@@ -290,12 +279,12 @@ var containersUpdateCmd = &cobra.Command{
 	Args:         cobra.ExactArgs(1),
 	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := client.NewFromConfig()
+		c, err := cmdutil.ClientFromCommand(cmd)
 		if err != nil {
 			return err
 		}
 
-		resolved, _, err := containerRef.Resolve(cmd.Context(), c, args[0], false)
+		resolved, _, err := ContainerRef.Resolve(cmd.Context(), c, args[0], false)
 		if err != nil {
 			return err
 		}
@@ -318,12 +307,12 @@ var containersRedeployCmd = &cobra.Command{
 	Args:         cobra.ExactArgs(1),
 	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := client.NewFromConfig()
+		c, err := cmdutil.ClientFromCommand(cmd)
 		if err != nil {
 			return err
 		}
 
-		resolved, _, err := containerRef.Resolve(cmd.Context(), c, args[0], false)
+		resolved, _, err := ContainerRef.Resolve(cmd.Context(), c, args[0], false)
 		if err != nil {
 			return err
 		}
@@ -345,12 +334,12 @@ var containersDeleteCmd = &cobra.Command{
 	Args:         cobra.ExactArgs(1),
 	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := client.NewFromConfig()
+		c, err := cmdutil.ClientFromCommand(cmd)
 		if err != nil {
 			return err
 		}
 
-		resolved, _, err := containerRef.Resolve(cmd.Context(), c, args[0], false)
+		resolved, _, err := ContainerRef.Resolve(cmd.Context(), c, args[0], false)
 		if err != nil {
 			return err
 		}
@@ -391,7 +380,7 @@ var containersCountsCmd = &cobra.Command{
 	Short:        "Get container status counts",
 	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := client.NewFromConfig()
+		c, err := cmdutil.ClientFromCommand(cmd)
 		if err != nil {
 			return err
 		}
@@ -418,7 +407,7 @@ var containersCreateCmd = &cobra.Command{
 	Short:        "Create a new container",
 	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := client.NewFromConfig()
+		c, err := cmdutil.ClientFromCommand(cmd)
 		if err != nil {
 			return err
 		}
@@ -528,6 +517,9 @@ var containersCreateCmd = &cobra.Command{
 }
 
 func init() {
+	cmdutil.SetScope(cmdutil.ScopeResource, ContainersCmd)
+	cmdutil.SetScope(cmdutil.ScopeRead, containersListCmd, containersUpdatesCmd, containersCountsCmd)
+	cmdutil.SetScope(cmdutil.ScopeDestination, containersCreateCmd)
 	ContainersCmd.AddCommand(containersListCmd)
 	ContainersCmd.AddCommand(containersUpdatesCmd)
 	ContainersCmd.AddCommand(containersGetCmd)
@@ -568,7 +560,7 @@ func init() {
 	containersListCmd.Flags().StringVar(&containersStandalone, "standalone", "", "Filter standalone containers only (true/false)")
 	containersListCmd.Flags().StringVar(&containersLabelFilter, "label", "", "Filter by label (key or key=value)")
 	containersListCmd.Flags().BoolVar(&containersIncludeHidden, "include-hidden", false, "Include hidden containers")
-	containersListCmd.Flags().BoolVar(&containersIncludeInternal, "include-internal", false, "Include Arcane-internal containers")
+	containersListCmd.Flags().BoolVar(&containersInclude, "include-internal", false, "Include Arcane-internal containers")
 	containersListCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
 	containersUpdatesCmd.Flags().IntVarP(&containersLimit, "limit", "n", 20, "Number of containers to show")
 	containersUpdatesCmd.Flags().IntVar(&containersStart, "start", 0, cmdutil.StartFlagUsage)
@@ -610,17 +602,52 @@ func containerDisplayName(details *container.Details) string {
 	return ""
 }
 
-var containerRef = cmdutil.ResourceRef[container.Details, container.Summary]{
-	Singular: "container",
-	Plural:   "containers",
-	IDHint:   "the container ID",
-	ListCmd:  "arcane containers list",
-	GetPath:  types.Container,
-	ListPath: types.Containers,
-	Matches:  containerMatches,
-	Label:    formatContainerOption,
-	Promote:  containerDetailsFromSummary,
-	IDOf:     func(item container.Summary) string { return item.ID },
+var ContainerRef = cmdutil.ResourceRef[container.Details, container.Summary]{
+	EnvironmentScoped: true,
+	Singular:          "container",
+	Plural:            "containers",
+	IDHint:            "the container ID",
+	ListCmd:           "arcane containers list",
+	GetPath:           types.Container,
+	ListPath:          types.Containers,
+	Matches: func(item container.Summary, identifierLower, original string) bool {
+		idLower := strings.ToLower(item.ID)
+		if idLower == identifierLower || (len(identifierLower) >= 4 && strings.HasPrefix(idLower, identifierLower)) {
+			return true
+		}
+		if strings.Contains(idLower, identifierLower) {
+			return true
+		}
+		if strings.Contains(strings.ToLower(item.Image), identifierLower) {
+			return true
+		}
+		for _, name := range item.Names {
+			trimmedName := strings.TrimPrefix(name, "/")
+			if strings.Contains(strings.ToLower(trimmedName), identifierLower) {
+				return true
+			}
+			if strings.EqualFold(trimmedName, original) || strings.EqualFold(name, original) {
+				return true
+			}
+		}
+		return false
+	},
+	Label: func(item container.Summary) string {
+		name := ""
+		if len(item.Names) > 0 {
+			name = strings.TrimPrefix(item.Names[0], "/")
+		}
+		if name == "" {
+			name = shortID(item.ID)
+		}
+		image := cmp.Or(item.Image, "<unknown>")
+		state := cmp.Or(item.State, "unknown")
+		return fmt.Sprintf("%s (%s, %s)", name, shortID(item.ID), image+" / "+state)
+	},
+	Promote: func(summary container.Summary) *container.Details {
+		return &container.Details{ID: summary.ID, Name: containerSummaryName(summary)}
+	},
+	IDOf: func(item container.Summary) string { return item.ID },
 }
 
 func containerSummaryName(summary container.Summary) string {
@@ -628,44 +655,4 @@ func containerSummaryName(summary container.Summary) string {
 		return ""
 	}
 	return strings.TrimPrefix(summary.Names[0], "/")
-}
-
-func containerDetailsFromSummary(summary container.Summary) *container.Details {
-	return &container.Details{ID: summary.ID, Name: containerSummaryName(summary)}
-}
-
-func containerMatches(item container.Summary, identifierLower, original string) bool {
-	idLower := strings.ToLower(item.ID)
-	if idLower == identifierLower || (len(identifierLower) >= 4 && strings.HasPrefix(idLower, identifierLower)) {
-		return true
-	}
-	if strings.Contains(idLower, identifierLower) {
-		return true
-	}
-	if strings.Contains(strings.ToLower(item.Image), identifierLower) {
-		return true
-	}
-	for _, name := range item.Names {
-		trimmedName := strings.TrimPrefix(name, "/")
-		if strings.Contains(strings.ToLower(trimmedName), identifierLower) {
-			return true
-		}
-		if strings.EqualFold(trimmedName, original) || strings.EqualFold(name, original) {
-			return true
-		}
-	}
-	return false
-}
-
-func formatContainerOption(item container.Summary) string {
-	name := ""
-	if len(item.Names) > 0 {
-		name = strings.TrimPrefix(item.Names[0], "/")
-	}
-	if name == "" {
-		name = shortID(item.ID)
-	}
-	image := cmp.Or(item.Image, "<unknown>")
-	state := cmp.Or(item.State, "unknown")
-	return fmt.Sprintf("%s (%s, %s)", name, shortID(item.ID), image+" / "+state)
 }

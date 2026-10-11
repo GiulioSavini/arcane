@@ -3,9 +3,11 @@
 package activities
 
 import (
+	"cmp"
 	"fmt"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	activitytypes "github.com/getarcaneapp/arcane/types/v2/activity"
@@ -65,14 +67,36 @@ var listCmd = &cobra.Command{
 			JSON:     jsonOutput,
 			Headers:  []string{"ID", "TYPE", "STATUS", "RESOURCE", "STARTED", "PROGRESS", "MESSAGE"},
 			Row: func(item activitytypes.Activity) []string {
+				resource := ""
+				if item.ResourceName != nil {
+					resource = *item.ResourceName
+				}
+				if resource == "" && item.ResourceID != nil {
+					resource = *item.ResourceID
+				}
+				if item.ResourceType != nil && *item.ResourceType != "" {
+					if resource == "" {
+						resource = *item.ResourceType
+					} else {
+						resource = *item.ResourceType + "/" + resource
+					}
+				}
+				progress := "-"
+				if item.Progress != nil {
+					progress = strconv.Itoa(*item.Progress) + "%"
+				}
+				message := cmp.Or(item.LatestMessage, item.Step)
+				if message == "" && item.Error != nil {
+					message = *item.Error
+				}
 				return []string{
 					item.ID,
 					string(item.Type),
 					string(item.Status),
-					activityResource(item),
+					resource,
 					item.StartedAt.Format(time.RFC3339),
-					activityProgress(item),
-					activityMessage(item),
+					progress,
+					message,
 				}
 			},
 		})
@@ -108,11 +132,25 @@ var getCmd = &cobra.Command{
 		output.KeyValue("ID", item.ID)
 		output.KeyValue("Type", string(item.Type))
 		output.KeyValue("Status", string(item.Status))
-		if resource := activityResource(item); resource != "" {
+		resource := ""
+		if item.ResourceName != nil {
+			resource = *item.ResourceName
+		}
+		if resource == "" && item.ResourceID != nil {
+			resource = *item.ResourceID
+		}
+		if item.ResourceType != nil && *item.ResourceType != "" {
+			if resource == "" {
+				resource = *item.ResourceType
+			} else {
+				resource = *item.ResourceType + "/" + resource
+			}
+		}
+		if resource != "" {
 			output.KeyValue("Resource", resource)
 		}
 		if item.Progress != nil {
-			output.KeyValue("Progress", activityProgress(item))
+			output.KeyValue("Progress", strconv.Itoa(*item.Progress)+"%")
 		}
 		if item.Step != "" {
 			output.KeyValue("Step", item.Step)
@@ -217,6 +255,10 @@ var clearCmd = &cobra.Command{
 }
 
 func init() {
+	cmdutil.SetResource(activityRef, getCmd, cancelCmd)
+	cmdutil.SetScope(cmdutil.ScopeResource, ActivitiesCmd)
+	cmdutil.SetScope(cmdutil.ScopeRead, listCmd)
+	cmdutil.SetScope(cmdutil.ScopeFleet, clearCmd)
 	ActivitiesCmd.AddCommand(listCmd)
 	ActivitiesCmd.AddCommand(getCmd)
 	ActivitiesCmd.AddCommand(cancelCmd)
@@ -244,39 +286,14 @@ func init() {
 	clearCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
 }
 
-func activityResource(item activitytypes.Activity) string {
-	name := ""
-	if item.ResourceName != nil {
-		name = *item.ResourceName
-	}
-	if name == "" && item.ResourceID != nil {
-		name = *item.ResourceID
-	}
-	if item.ResourceType != nil && *item.ResourceType != "" {
-		if name == "" {
-			return *item.ResourceType
-		}
-		return fmt.Sprintf("%s/%s", *item.ResourceType, name)
-	}
-	return name
-}
-
-func activityProgress(item activitytypes.Activity) string {
-	if item.Progress == nil {
-		return "-"
-	}
-	return strconv.Itoa(*item.Progress) + "%"
-}
-
-func activityMessage(item activitytypes.Activity) string {
-	if item.LatestMessage != "" {
-		return item.LatestMessage
-	}
-	if item.Step != "" {
-		return item.Step
-	}
-	if item.Error != nil {
-		return *item.Error
-	}
-	return ""
+var activityRef = cmdutil.ResourceRef[activitytypes.Detail, activitytypes.Activity]{
+	EnvironmentScoped: true,
+	Singular:          "activity", Plural: "activities",
+	IDHint: "the identifier", ListCmd: "arcane-cli activities list",
+	GetPath: types.Activity, ListPath: types.Activities,
+	Matches: func(item activitytypes.Activity, lower, original string) bool {
+		return strings.EqualFold(item.ID, original)
+	},
+	Label:   func(item activitytypes.Activity) string { return item.ID },
+	Promote: func(item activitytypes.Activity) *activitytypes.Detail { return &activitytypes.Detail{Activity: item} },
 }

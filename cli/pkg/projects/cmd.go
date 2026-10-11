@@ -21,7 +21,6 @@ import (
 	workspacetypes "github.com/getarcaneapp/arcane/types/v2/workspace"
 	"github.com/spf13/cobra"
 
-	"github.com/getarcaneapp/arcane/cli/v2/internal/client"
 	"github.com/getarcaneapp/arcane/cli/v2/internal/cmdutil"
 	"github.com/getarcaneapp/arcane/cli/v2/internal/output"
 	"github.com/getarcaneapp/arcane/cli/v2/internal/prompt"
@@ -77,7 +76,7 @@ var updatesCmd = &cobra.Command{
 }
 
 func runProjectsList(cmd *cobra.Command, forceHasUpdateFilter bool) error {
-	c, err := client.NewFromConfig()
+	c, err := cmdutil.ClientFromCommand(cmd)
 	if err != nil {
 		return err
 	}
@@ -135,24 +134,21 @@ func runProjectsList(cmd *cobra.Command, forceHasUpdateFilter bool) error {
 				imageCount = proj.UpdateInfo.ImageCount
 				updatedCount = proj.UpdateInfo.ImagesWithUpdates
 			}
+			status := "unknown"
+			if proj.UpdateInfo != nil && strings.TrimSpace(proj.UpdateInfo.Status) != "" {
+				status = proj.UpdateInfo.Status
+			}
 			return []string{
 				proj.ID,
 				proj.Name,
 				proj.Status,
-				projectUpdateStatus(proj),
+				status,
 				strconv.Itoa(imageCount),
 				strconv.Itoa(updatedCount),
 			}
 		}
 	}
 	return cmdutil.RunList(cmd, c, spec)
-}
-
-func projectUpdateStatus(item project.Details) string {
-	if item.UpdateInfo == nil || strings.TrimSpace(item.UpdateInfo.Status) == "" {
-		return "unknown"
-	}
-	return item.UpdateInfo.Status
 }
 
 var destroyCmd = &cobra.Command{
@@ -162,7 +158,7 @@ var destroyCmd = &cobra.Command{
 	Args:         cobra.ExactArgs(1),
 	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := client.NewFromConfig()
+		c, err := cmdutil.ClientFromCommand(cmd)
 		if err != nil {
 			return err
 		}
@@ -210,7 +206,7 @@ var getCmd = &cobra.Command{
 	Args:         cobra.ExactArgs(1),
 	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := client.NewFromConfig()
+		c, err := cmdutil.ClientFromCommand(cmd)
 		if err != nil {
 			return err
 		}
@@ -263,7 +259,7 @@ var downCmd = &cobra.Command{
 	Args:         cobra.ExactArgs(1),
 	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := client.NewFromConfig()
+		c, err := cmdutil.ClientFromCommand(cmd)
 		if err != nil {
 			return err
 		}
@@ -287,7 +283,7 @@ var restartCmd = &cobra.Command{
 	Args:         cobra.ExactArgs(1),
 	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := client.NewFromConfig()
+		c, err := cmdutil.ClientFromCommand(cmd)
 		if err != nil {
 			return err
 		}
@@ -333,9 +329,7 @@ var pullCmd = &cobra.Command{
 	},
 }
 
-// projectStreamActionConfig describes a project action whose endpoint responds
-// with an NDJSON operation stream: {"log":"<raw docker CLI line>"} frames are
-// printed as-is and a terminal {"error":"..."} frame fails the command.
+// projectStreamActionConfig defines an NDJSON action that prints raw logs and returns terminal errors.
 type projectStreamActionConfig struct {
 	endpoint       func(string, string) string
 	failureMessage string
@@ -343,7 +337,7 @@ type projectStreamActionConfig struct {
 }
 
 func runProjectStreamAction(cmd *cobra.Command, identifier string, cfg projectStreamActionConfig) error {
-	c, err := client.NewFromConfig()
+	c, err := cmdutil.ClientFromCommand(cmd)
 	if err != nil {
 		return err
 	}
@@ -365,7 +359,7 @@ func runProjectStreamAction(cmd *cobra.Command, identifier string, cfg projectSt
 		return fmt.Errorf("%s: %w", cfg.failureMessage, ensureSuccessStatusErr)
 	}
 
-	if printOperationStreamErr := printOperationStreamInternal(resp.Body); printOperationStreamErr != nil {
+	if printOperationStreamErr := printOperationStream(resp.Body); printOperationStreamErr != nil {
 		return fmt.Errorf("%s: %w", cfg.failureMessage, printOperationStreamErr)
 	}
 
@@ -373,10 +367,8 @@ func runProjectStreamAction(cmd *cobra.Command, identifier string, cfg projectSt
 	return nil
 }
 
-// printOperationStreamInternal consumes an NDJSON operation stream, printing
-// raw docker CLI log lines to stdout. A terminal error frame is returned as an
-// error; unknown frames (e.g. the activity envelope) are skipped.
-func printOperationStreamInternal(body io.Reader) error {
+// printOperationStream prints NDJSON Docker logs and returns terminal errors, ignoring unknown frames.
+func printOperationStream(body io.Reader) error {
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 
@@ -413,7 +405,7 @@ var createCmd = &cobra.Command{
 	Short:        "Create a new project from a Docker Compose file",
 	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := client.NewFromConfig()
+		c, err := cmdutil.ClientFromCommand(cmd)
 		if err != nil {
 			return err
 		}
@@ -493,7 +485,7 @@ var updateCmd = &cobra.Command{
 	Args:         cobra.ExactArgs(1),
 	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := client.NewFromConfig()
+		c, err := cmdutil.ClientFromCommand(cmd)
 		if err != nil {
 			return err
 		}
@@ -546,7 +538,7 @@ var updateIncludesCmd = &cobra.Command{
 	Args:         cobra.ExactArgs(1),
 	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := client.NewFromConfig()
+		c, err := cmdutil.ClientFromCommand(cmd)
 		if err != nil {
 			return err
 		}
@@ -626,7 +618,7 @@ var countsCmd = &cobra.Command{
 	Short:        "Get project counts",
 	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := client.NewFromConfig()
+		c, err := cmdutil.ClientFromCommand(cmd)
 		if err != nil {
 			return err
 		}
@@ -649,6 +641,9 @@ var countsCmd = &cobra.Command{
 }
 
 func init() {
+	cmdutil.SetScope(cmdutil.ScopeResource, ProjectsCmd)
+	cmdutil.SetScope(cmdutil.ScopeRead, listCmd, updatesCmd, countsCmd)
+	cmdutil.SetScope(cmdutil.ScopeDestination, createCmd)
 	ProjectsCmd.AddCommand(listCmd)
 	ProjectsCmd.AddCommand(updatesCmd)
 	ProjectsCmd.AddCommand(getCmd)
@@ -710,32 +705,31 @@ func init() {
 }
 
 var projectRef = cmdutil.ResourceRef[project.Details, project.Details]{
-	Singular: "project",
-	Plural:   "projects",
-	IDHint:   "the project ID",
-	ListCmd:  "arcane projects list",
-	GetPath:  types.Project,
-	ListPath: types.Projects,
-	Matches:  projectMatches,
+	EnvironmentScoped: true,
+	Singular:          "project",
+	Plural:            "projects",
+	IDHint:            "the project ID",
+	ListCmd:           "arcane projects list",
+	GetPath:           types.Project,
+	ListPath:          types.Projects,
+	Matches: func(item project.Details, identifierLower, original string) bool {
+		idLower := strings.ToLower(item.ID)
+		if idLower == identifierLower || (len(identifierLower) >= 4 && strings.HasPrefix(idLower, identifierLower)) {
+			return true
+		}
+		if strings.Contains(idLower, identifierLower) {
+			return true
+		}
+		if strings.Contains(strings.ToLower(item.Name), identifierLower) {
+			return true
+		}
+		if strings.EqualFold(item.Name, original) {
+			return true
+		}
+		return strings.Contains(strings.ToLower(item.Path), identifierLower)
+	},
 	Label: func(match project.Details) string {
 		return fmt.Sprintf("%s (%s, %s)", match.Name, match.ID, match.Status)
 	},
 	Promote: func(match project.Details) *project.Details { return &match },
-}
-
-func projectMatches(item project.Details, identifierLower, original string) bool {
-	idLower := strings.ToLower(item.ID)
-	if idLower == identifierLower || (len(identifierLower) >= 4 && strings.HasPrefix(idLower, identifierLower)) {
-		return true
-	}
-	if strings.Contains(idLower, identifierLower) {
-		return true
-	}
-	if strings.Contains(strings.ToLower(item.Name), identifierLower) {
-		return true
-	}
-	if strings.EqualFold(item.Name, original) {
-		return true
-	}
-	return strings.Contains(strings.ToLower(item.Path), identifierLower)
 }

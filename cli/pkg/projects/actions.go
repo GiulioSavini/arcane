@@ -50,13 +50,12 @@ var tagsCmd = &cobra.Command{
 			return cmdutil.PrintJSON(result.Data)
 		}
 
-		output.Header("Project Tags")
 		headers := []string{"NAME", "COLOR"}
 		rows := make([][]string, len(result.Data))
 		for i, tag := range result.Data {
 			rows[i] = []string{tag.Name, string(tag.Color)}
 		}
-		return output.Table(headers, rows)
+		return cmdutil.PrintTable(cmd, headers, rows)
 	},
 }
 
@@ -197,7 +196,7 @@ var buildCmd = &cobra.Command{
 			return fmt.Errorf("failed to build project images: %w", ensureSuccessStatusErr)
 		}
 
-		if printOperationStreamErr := printOperationStreamInternal(resp.Body); printOperationStreamErr != nil {
+		if printOperationStreamErr := printOperationStream(resp.Body); printOperationStreamErr != nil {
 			return fmt.Errorf("failed to build project images: %w", printOperationStreamErr)
 		}
 
@@ -331,6 +330,7 @@ var workspaceDownloadCmd = &cobra.Command{
 }
 
 func init() {
+	cmdutil.SetScope(cmdutil.ScopeRead, tagsCmd)
 	ProjectsCmd.AddCommand(tagsCmd)
 	ProjectsCmd.AddCommand(tagCmd)
 	ProjectsCmd.AddCommand(archiveCmd)

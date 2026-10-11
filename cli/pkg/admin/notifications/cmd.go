@@ -7,12 +7,12 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 
 	"github.com/getarcaneapp/arcane/types/v2/base"
 	"github.com/getarcaneapp/arcane/types/v2/notification"
 	"github.com/spf13/cobra"
 
-	"github.com/getarcaneapp/arcane/cli/v2/internal/client"
 	"github.com/getarcaneapp/arcane/cli/v2/internal/cmdutil"
 	"github.com/getarcaneapp/arcane/cli/v2/internal/output"
 	"github.com/getarcaneapp/arcane/cli/v2/internal/types"
@@ -40,7 +40,7 @@ var settingsGetCmd = &cobra.Command{
 	Short:        "Get notification settings",
 	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := client.NewFromConfig()
+		c, err := cmdutil.ClientFromCommand(cmd)
 		if err != nil {
 			return err
 		}
@@ -64,10 +64,9 @@ var settingsGetCmd = &cobra.Command{
 			}
 		}
 
-		if tableErr := output.Table(headers, rows); tableErr != nil {
+		if tableErr := cmdutil.PrintTable(cmd, headers, rows, cmdutil.TableSummary{Resource: "notification settings"}); tableErr != nil {
 			return tableErr
 		}
-		_, _ = fmt.Fprintf(output.Stdout(), "\nTotal: %d notification settings\n", len(result))
 		return nil
 	},
 }
@@ -89,7 +88,7 @@ var settingsDeleteCmd = &cobra.Command{
 			}
 		}
 
-		c, err := client.NewFromConfig()
+		c, err := cmdutil.ClientFromCommand(cmd)
 		if err != nil {
 			return err
 		}
@@ -177,7 +176,7 @@ var testProviderCmd = &cobra.Command{
 	Args:         cobra.ExactArgs(1),
 	SilenceUsage: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := client.NewFromConfig()
+		c, err := cmdutil.ClientFromCommand(cmd)
 		if err != nil {
 			return err
 		}
@@ -192,6 +191,10 @@ var testProviderCmd = &cobra.Command{
 }
 
 func init() {
+	cmdutil.SetResource(providerRef, settingsDeleteCmd, testProviderCmd)
+	cmdutil.SetScope(cmdutil.ScopeResource, NotificationsCmd)
+	cmdutil.SetScope(cmdutil.ScopeRead, settingsGetCmd)
+	cmdutil.SetScope(cmdutil.ScopeFleet, settingsSetCmd)
 	NotificationsCmd.AddCommand(settingsCmd)
 	NotificationsCmd.AddCommand(testProviderCmd)
 
@@ -209,4 +212,16 @@ func init() {
 	settingsDeleteCmd.Flags().BoolVarP(&notifForceFlag, "force", "f", false, "Force deletion without confirmation")
 	settingsDeleteCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
 	testProviderCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
+}
+
+var providerRef = cmdutil.ResourceRef[notification.Response, notification.Response]{
+	EnvironmentScoped: true,
+	Singular:          "provider", Plural: "providers",
+	IDHint: "the identifier", ListCmd: "arcane-cli admin notifications settings get",
+	GetPath: types.NotificationSettingsProvider, ListPath: types.NotificationsSettings,
+	Matches: func(item notification.Response, lower, original string) bool {
+		return strings.EqualFold(string(item.Provider), original)
+	},
+	Label:   func(item notification.Response) string { return string(item.Provider) },
+	Promote: func(item notification.Response) *notification.Response { return &item },
 }
