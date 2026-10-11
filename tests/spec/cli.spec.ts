@@ -119,11 +119,7 @@ const readOnlyJsonCommands: JsonReadOnlyCommand[] = [
 		name: 'images counts',
 		args: ['--output', 'json', 'images', 'counts'],
 		expectation: (value) => {
-			expect(value).toEqual(
-				expect.objectContaining({
-					data: expect.objectContaining({ totalImages: expect.any(Number) })
-				})
-			);
+			expect(value).toEqual(expect.objectContaining({ totalImages: expect.any(Number) }));
 		}
 	},
 	{

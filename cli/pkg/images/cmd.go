@@ -518,6 +518,8 @@ func readPullStream(cmd *cobra.Command, reader io.Reader) error {
 			Status         string `json:"status"`
 			Error          string `json:"error"`
 			ID             string `json:"id"`
+			Log            string `json:"log"`
+			Done           bool   `json:"done"`
 			ProgressDetail struct {
 				Current int64 `json:"current"`
 				Total   int64 `json:"total"`
@@ -534,7 +536,16 @@ func readPullStream(cmd *cobra.Command, reader io.Reader) error {
 			loading.Finish(event.ID, pullErr)
 			return pullErr
 		}
-		if jsonMode || event.Type != "" && event.Status == "" {
+		if event.Done {
+			break
+		}
+		// Servers render Docker progress as "<layer>: <status>" log lines.
+		if id, status, ok := strings.Cut(event.Log, ": "); ok && len(id) == 12 && strings.Trim(id, "0123456789abcdef") == "" {
+			event.ID, event.Status = id, status
+		} else if event.Log != "" {
+			event.Status = event.Log
+		}
+		if jsonMode || event.Status == "" {
 			continue
 		}
 		if event.ID != "" {
@@ -546,9 +557,9 @@ func readPullStream(cmd *cobra.Command, reader io.Reader) error {
 		if (!output.IsTerminal(cmd.ErrOrStderr()) || !output.IsTerminal(cmd.OutOrStdout()) || event.ID == "") && event.Status != "Downloading" && event.Status != "Extracting" {
 			resume := output.SuspendProgress()
 			if event.ID != "" {
-				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "%s: %s\n", event.ID, event.Status)
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "  %s: %s\n", event.ID, event.Status)
 			} else {
-				_, _ = fmt.Fprintln(cmd.OutOrStdout(), event.Status)
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "  %s\n", event.Status)
 			}
 			resume()
 		}

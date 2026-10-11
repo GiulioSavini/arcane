@@ -568,9 +568,10 @@ func readBuildStream(cmd *cobra.Command, reader io.Reader) error {
 		line := scanner.Text()
 		trimmed := strings.TrimSpace(line)
 		var frame struct {
-			Type  string `json:"type"`
-			Done  bool   `json:"done"`
-			Error string `json:"error"`
+			Type  string  `json:"type"`
+			Done  bool    `json:"done"`
+			Error string  `json:"error"`
+			Log   *string `json:"log"`
 		}
 		framed := strings.HasPrefix(trimmed, "{") && json.Unmarshal([]byte(trimmed), &frame) == nil
 		if jsonMode && trimmed != "" {
@@ -588,6 +589,9 @@ func readBuildStream(cmd *cobra.Command, reader io.Reader) error {
 			}
 			if frame.Type != "" {
 				continue
+			}
+			if frame.Log != nil {
+				line = *frame.Log
 			}
 		}
 		if !jsonMode {
