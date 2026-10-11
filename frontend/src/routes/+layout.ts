@@ -62,36 +62,28 @@ export const load: LayoutLoad = async ({ url }) => {
 		};
 	}
 
-	const versionInformationRequest = versionService.getVersionInformation();
-	const autoLoginConfigRequest = browser
-		? queryClient.query({
-				queryKey: queryKeys.auth.autoLoginConfig(),
-				queryFn: () => authService.getAutoLoginConfig()
-			})
-		: Promise.resolve(null);
-	let [user, autoLoginConfig] = await Promise.all([
+	let [user, versionInformation] = await Promise.all([
 		// Only an explicit rejection signs the user out; transient check failures keep the known user.
 		tryCatch(userService.getCurrentUser()).then((result): User | null => {
 			if (!result.error) return result.data;
 			return isAuthRejectionError(result.error) || isSessionCancelledError(result.error) ? null : userStore.current;
 		}),
-		autoLoginConfigRequest
+		versionService.getVersionInformation()
 	]);
+	const autoLoginConfig =
+		browser && versionInformation.enabledFeatures?.includes('autologin')
+			? await queryClient.query({
+					queryKey: queryKeys.auth.autoLoginConfig(),
+					queryFn: () => authService.getAutoLoginConfig()
+				})
+			: null;
 
-	if (autoLoginConfig) {
-		if (autoLoginConfig.enabled) {
-			settingsStore.autoLoginEnabled.set(true);
-			settingsStore.autoLoginEnabled.clearDisabledCache();
-			if (!user) {
-				user = await queryClient.query({
-					queryKey: queryKeys.auth.autoLoginAttempt(),
-					queryFn: () => authService.attemptAutoLogin()
-				});
-			}
-		} else {
-			settingsStore.autoLoginEnabled.set(false);
-			settingsStore.autoLoginEnabled.cacheDisabled();
-		}
+	settingsStore.autoLoginEnabled.set(autoLoginConfig?.enabled === true);
+	if (autoLoginConfig?.enabled && !user) {
+		user = await queryClient.query({
+			queryKey: queryKeys.auth.autoLoginAttempt(),
+			queryFn: () => authService.attemptAutoLogin()
+		});
 	}
 
 	const nextAuthenticatedUserId = user?.id ?? null;
@@ -155,7 +147,6 @@ export const load: LayoutLoad = async ({ url }) => {
 		settingsStore.set(settings);
 	}
 
-	const versionInformation = await versionInformationRequest;
 	versionStore.seed(versionInformation);
 	// Waiting lets the first page view be traced, but a stalled SDK download must never hold up the app.
 	await Promise.race([

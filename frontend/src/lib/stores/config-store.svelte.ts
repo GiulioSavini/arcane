@@ -23,30 +23,7 @@ const set = (settings: Settings) => {
 	});
 };
 
-// Auto-login state management
-const AUTO_LOGIN_DISABLED_KEY = 'arcane_auto_login_disabled';
 let autoLoginEnabled = $state(false);
-
-const setAutoLoginEnabled = (enabled: boolean) => {
-	autoLoginEnabled = enabled;
-};
-
-const cacheAutoLoginDisabled = (): void => {
-	if (typeof sessionStorage !== 'undefined') {
-		sessionStorage.setItem(AUTO_LOGIN_DISABLED_KEY, 'true');
-	}
-};
-
-const isAutoLoginKnownDisabled = (): boolean => {
-	if (typeof sessionStorage === 'undefined') return false;
-	return sessionStorage.getItem(AUTO_LOGIN_DISABLED_KEY) === 'true';
-};
-
-const clearAutoLoginDisabledCache = (): void => {
-	if (typeof sessionStorage !== 'undefined') {
-		sessionStorage.removeItem(AUTO_LOGIN_DISABLED_KEY);
-	}
-};
 
 export default {
 	get current() {
@@ -66,9 +43,8 @@ export default {
 		get current() {
 			return autoLoginEnabled;
 		},
-		set: setAutoLoginEnabled,
-		cacheDisabled: cacheAutoLoginDisabled,
-		isKnownDisabled: isAutoLoginKnownDisabled,
-		clearDisabledCache: clearAutoLoginDisabledCache
+		set(enabled: boolean) {
+			autoLoginEnabled = enabled;
+		}
 	}
 };
