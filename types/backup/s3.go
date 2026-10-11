@@ -2,6 +2,11 @@ package backup
 
 import "time"
 
+// S3DestinationUsage reports whether a destination is referenced by backups.
+type S3DestinationUsage struct {
+	InUse bool `json:"inUse"`
+}
+
 type S3Destination struct {
 	ID               string     `json:"id"`
 	Name             string     `json:"name"`

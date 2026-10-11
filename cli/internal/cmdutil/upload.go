@@ -10,7 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	uploadtypes "github.com/getarcaneapp/arcane/types/v2/upload"
+	"github.com/getarcaneapp/arcane/types/v2/upload"
 	kit "go.getarcane.app/kit/pkg"
 
 	"github.com/getarcaneapp/arcane/cli/v2/internal/client"
@@ -21,11 +21,8 @@ import (
 
 const uploadChunkAttempts = 3
 
-// UploadFileInChunks streams a local file to the server through a chunked
-// upload session of the given kind and returns the completed session ID. The
-// file is sent as independently retried chunks so reverse-proxy body limits
-// never see the full size. On failure the session is deleted server-side.
-// When showProgress is true a progress bar is rendered.
+// UploadFileInChunks sends retried chunks with optional progress and aborts the session on failure.
+// It returns the completed upload session ID.
 func UploadFileInChunks(ctx context.Context, c *client.Client, kind, filePath string, showProgress bool) (string, error) {
 	log := logger.GetLogger()
 
@@ -42,7 +39,7 @@ func UploadFileInChunks(ctx context.Context, c *client.Client, kind, filePath st
 	loading := output.StartTracker(ctx, output.Stderr(), showProgress, "Creating upload session", "Uploading chunks")
 	loading.NextStep()
 	defer loading.Stop()
-	created, err := c.PostJSON[uploadtypes.Session](ctx, types.UploadSessions(c.EnvID(), kind), uploadtypes.CreateSessionRequest{
+	created, err := c.PostJSON[upload.Session](ctx, types.UploadSessions(c.EnvID(), kind), upload.CreateSessionRequest{
 		Filename: filepath.Base(filePath),
 		Size:     fileInfo.Size(),
 	})
@@ -57,17 +54,11 @@ func UploadFileInChunks(ctx context.Context, c *client.Client, kind, filePath st
 	loading.SetProgress("", "Uploading", 0, fileInfo.Size(), true)
 	var uploaded int64
 
-	deleteSession := func() {
-		if resp, deleteErr := c.Delete(context.WithoutCancel(ctx), types.UploadSession(c.EnvID(), kind, session.ID)); deleteErr == nil {
-			_ = resp.Body.Close()
-		}
-	}
-
 	buf := make([]byte, session.ChunkSize)
 	for index := range session.TotalChunks {
 		expected := kit.Ternary(index == session.TotalChunks-1, session.Size-int64(index)*session.ChunkSize, session.ChunkSize)
 		if _, readFullErr := io.ReadFull(file, buf[:expected]); readFullErr != nil {
-			deleteSession()
+			AbortUploadSession(ctx, c, kind, session.ID)
 			return "", fmt.Errorf("failed to read file: %w", readFullErr)
 		}
 
@@ -86,7 +77,7 @@ func UploadFileInChunks(ctx context.Context, c *client.Client, kind, filePath st
 				}
 			}
 			if attempt >= uploadChunkAttempts {
-				deleteSession()
+				AbortUploadSession(ctx, c, kind, session.ID)
 				return "", fmt.Errorf("failed to upload file: %w", chunkErr)
 			}
 			log.Debugf("Retrying chunk %d after error: %v", index, chunkErr)

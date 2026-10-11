@@ -25,7 +25,7 @@ type tableOutput struct {
 }
 
 // PrintTable renders rows and an optional summary, collecting them during an environment preview.
-func PrintTable[T ~[]string](cmd *cobra.Command, headers []string, rows []T, summaries ...TableSummary) error {
+func PrintTable(cmd *cobra.Command, headers []string, rows [][]string, summaries ...TableSummary) error {
 	var summary TableSummary
 	if len(summaries) > 0 {
 		summary = summaries[0]
@@ -33,7 +33,7 @@ func PrintTable[T ~[]string](cmd *cobra.Command, headers []string, rows []T, sum
 	combined, _ := cmd.Context().Value(tableContextKey{}).(*tableOutput)
 	formatted := make([][]string, len(rows))
 	for i, row := range rows {
-		formatted[i] = []string(row)
+		formatted[i] = row
 		if combined != nil {
 			formatted[i] = slices.Concat([]string{combined.environment}, formatted[i])
 		}

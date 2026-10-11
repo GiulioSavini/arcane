@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"go.getarcane.app/kit/pkg"
 
 	"github.com/getarcaneapp/arcane/cli/v2/internal/cmdutil"
 	"github.com/getarcaneapp/arcane/cli/v2/internal/config"
@@ -35,13 +36,10 @@ const (
 	maxCLIExtractSize      = 128 * 1024 * 1024
 )
 
-var (
-	cliUpdateVersion string
-	cliUpdateTarget  string
-	cliUpdateDryRun  bool
-	cliUpdateVerbose bool
-	jsonOutput       bool
-)
+type cliUpdateOptions struct {
+	version, target string
+	dryRun, verbose bool
+}
 
 type cliUpdatePlan struct {
 	Channel      string `json:"channel"`
@@ -60,97 +58,94 @@ type githubLatestRelease struct {
 	TagName string `json:"tag_name"`
 }
 
-// Cmd updates the arcane-cli executable.
-var Cmd = &cobra.Command{
-	Use:          "self-update",
-	Aliases:      []string{"self", "cli"},
-	Short:        "Update arcane-cli",
-	SilenceUsage: true,
-	RunE:         runCLIUpdateCommandInternal,
-}
-
-var selfUpdateRunCmd = &cobra.Command{
-	Use:          "run",
-	Short:        "Update arcane-cli using the configured channel",
-	SilenceUsage: true,
-	RunE:         runCLIUpdateCommandInternal,
-}
-
-var selfUpdateChannelCmd = &cobra.Command{
-	Use:          "channel [stable|next]",
-	Short:        "Set the CLI update channel and update arcane-cli",
-	Args:         cobra.ExactArgs(1),
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		return setCLIUpdateChannelAndRunInternal(cmd, args[0])
-	},
-}
-
-func init() {
-	Cmd.AddCommand(selfUpdateRunCmd)
-	Cmd.AddCommand(selfUpdateChannelCmd)
-	stableCmd := newSelfUpdateChannelValueCmdInternal(cliUpdateChannelStable)
-	nextCmd := newSelfUpdateChannelValueCmdInternal(cliUpdateChannelNext)
-	selfUpdateChannelCmd.AddCommand(stableCmd)
-	selfUpdateChannelCmd.AddCommand(nextCmd)
-
-	registerCLIUpdateFlagsInternal(Cmd)
-	registerCLIUpdateFlagsInternal(selfUpdateRunCmd)
-	registerCLIUpdateFlagsInternal(selfUpdateChannelCmd)
-	registerCLIUpdateFlagsInternal(stableCmd)
-	registerCLIUpdateFlagsInternal(nextCmd)
-}
-
-func registerCLIUpdateFlagsInternal(cmd *cobra.Command) {
-	cmd.Flags().StringVar(&cliUpdateVersion, "version", "", "Stable release tag to install (default: latest)")
-	cmd.Flags().StringVar(&cliUpdateTarget, "target", "", "Binary path to replace (default: current executable)")
-	cmd.Flags().BoolVar(&cliUpdateDryRun, "dry-run", false, "Check for an update without installing it")
-	cmd.Flags().BoolVar(&cliUpdateVerbose, "verbose", false, "Print self-update resolution details")
-	cmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
-}
-
-func newSelfUpdateChannelValueCmdInternal(channel string) *cobra.Command {
-	return &cobra.Command{
-		Use:          channel,
-		Short:        fmt.Sprintf("Set the CLI update channel to %s and update arcane-cli", channel),
-		Args:         cobra.NoArgs,
-		SilenceUsage: true,
-		RunE: func(cmd *cobra.Command, args []string) error {
-			return setCLIUpdateChannelAndRunInternal(cmd, channel)
-		},
+// Command updates the arcane-cli executable.
+func Command() *cobra.Command {
+	var opts cliUpdateOptions
+	cmd := &cobra.Command{
+		Use: "self-update", Aliases: []string{"self", "cli"}, Short: "Update arcane-cli",
+		Args: cobra.NoArgs, SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, _ []string) error { return opts.runCLIUpdate(cmd, "") },
 	}
+	cmd.AddCommand(newSelfUpdateRunCmd(), newSelfUpdateChannelCmd())
+	registerCLIUpdateFlags(cmd, &opts)
+	return cmd
 }
 
-func setCLIUpdateChannelAndRunInternal(cmd *cobra.Command, channel string) error {
+func newSelfUpdateRunCmd() *cobra.Command {
+	var opts cliUpdateOptions
+	cmd := &cobra.Command{
+		Use: "run", Short: "Update arcane-cli using the configured channel",
+		Args: cobra.NoArgs, SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, _ []string) error { return opts.runCLIUpdate(cmd, "") },
+	}
+	registerCLIUpdateFlags(cmd, &opts)
+	return cmd
+}
+
+func newSelfUpdateChannelCmd() *cobra.Command {
+	var opts cliUpdateOptions
+	cmd := &cobra.Command{
+		Use: "channel <stable|next>", Short: "Set the CLI update channel and update arcane-cli",
+		Args: cobra.ExactArgs(1), SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error { return opts.setCLIUpdateChannelAndRun(cmd, args[0]) },
+	}
+	cmd.AddCommand(newSelfUpdateChannelValueCmd(cliUpdateChannelStable), newSelfUpdateChannelValueCmd(cliUpdateChannelNext))
+	registerCLIUpdateFlags(cmd, &opts)
+	return cmd
+}
+
+func newSelfUpdateChannelValueCmd(channel string) *cobra.Command {
+	var opts cliUpdateOptions
+	cmd := &cobra.Command{
+		Use: channel, Short: fmt.Sprintf("Set the CLI update channel to %s and update arcane-cli", channel),
+		Args: cobra.NoArgs, SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, _ []string) error { return opts.setCLIUpdateChannelAndRun(cmd, channel) },
+	}
+	registerCLIUpdateFlags(cmd, &opts)
+	return cmd
+}
+
+func registerCLIUpdateFlags(cmd *cobra.Command, opts *cliUpdateOptions) {
+	cmd.Flags().StringVar(&opts.version, "version", "", "Stable release tag to install (default: latest)")
+	cmd.Flags().StringVar(&opts.target, "target", "", "Binary path to replace (default: current executable)")
+	cmd.Flags().BoolVar(&opts.dryRun, "dry-run", false, "Check for an update without installing it")
+	cmd.Flags().BoolVar(&opts.verbose, "verbose", false, "Print self-update resolution details")
+}
+
+func (opts cliUpdateOptions) setCLIUpdateChannelAndRun(cmd *cobra.Command, channel string) error {
 	channel = strings.ToLower(strings.TrimSpace(channel))
 	if channel != cliUpdateChannelNext && channel != cliUpdateChannelStable {
 		return fmt.Errorf("invalid update channel %q (expected stable or next)", channel)
 	}
-	if err := saveCLIUpdateChannelInternal(channel); err != nil {
-		return err
+	cfg, err := config.Load()
+	if err != nil {
+		return fmt.Errorf("failed to load config: %w", err)
 	}
-	if !jsonOutput {
+	cfg.CLIUpdateChannel = channel
+	if saveErr := config.Save(cfg); saveErr != nil {
+		return fmt.Errorf("failed to save config: %w", saveErr)
+	}
+
+	if !cmdutil.JSONOutputEnabled(cmd) {
 		output.Success("Set CLI update channel to %s", channel)
 	}
-	return runCLIUpdateInternal(cmd.Context(), channel)
+	return opts.runCLIUpdate(cmd, channel)
 }
 
-func runCLIUpdateCommandInternal(cmd *cobra.Command, args []string) error {
-	return runCLIUpdateInternal(cmd.Context(), "")
-}
-
-func runCLIUpdateInternal(ctx context.Context, overrideChannel string) error {
-	loading := output.StartTracker(ctx, output.Stderr(), !jsonOutput, "Resolving update")
+func (opts cliUpdateOptions) runCLIUpdate(cmd *cobra.Command, overrideChannel string) error {
+	ctx := cmd.Context()
+	jsonMode := cmdutil.JSONOutputEnabled(cmd)
+	loading := output.StartTracker(ctx, output.Stderr(), !jsonMode, "Resolving update")
 	loading.NextStep()
 	defer loading.Stop()
-	plan, err := buildCLIUpdatePlanInternal(ctx, overrideChannel)
+	plan, err := opts.buildCLIUpdatePlan(ctx, overrideChannel)
 	if err != nil {
 		return err
 	}
 
 	loading.Finish("", err)
 	loading.Stop()
-	if jsonOutput {
+	if jsonMode {
 		return cmdutil.PrintJSON(plan)
 	}
 
@@ -168,56 +163,62 @@ func runCLIUpdateInternal(ctx context.Context, overrideChannel string) error {
 		return nil
 	}
 
-	if cliUpdateDryRun {
+	if opts.dryRun {
 		output.Info("Update available: %s", plan.ArtifactURL)
 		return nil
 	}
 
-	if installCLIUpdateErr := installCLIUpdateInternal(ctx, plan); installCLIUpdateErr != nil {
+	if installCLIUpdateErr := opts.installCLIUpdate(ctx, plan, jsonMode); installCLIUpdateErr != nil {
 		return installCLIUpdateErr
 	}
 	output.Success("arcane-cli updated successfully")
 	return nil
 }
 
-func buildCLIUpdatePlanInternal(ctx context.Context, overrideChannel string) (*cliUpdatePlan, error) {
-	targetPath, err := resolveCLIUpdateTargetInternal()
+func (opts cliUpdateOptions) buildCLIUpdatePlan(ctx context.Context, overrideChannel string) (*cliUpdatePlan, error) {
+	targetPath, err := opts.resolveCLIUpdateTarget()
 	if err != nil {
 		return nil, err
 	}
 
 	channel := strings.ToLower(strings.TrimSpace(overrideChannel))
 	if channel == "" {
-		channel, err = configuredCLIUpdateChannelInternal()
+		channel, err = configuredCLIUpdateChannel()
 		if err != nil {
 			return nil, err
 		}
 	}
 	if channel == "" {
-		channel = inferCLIUpdateChannelInternal(config.Version)
+		normalized := strings.ToLower(strings.TrimSpace(config.Version))
+		channel = kit.Ternary(strings.Contains(normalized, "next") || strings.Contains(normalized, "beta"), cliUpdateChannelNext, cliUpdateChannelStable)
 	}
 	if channel != cliUpdateChannelNext && channel != cliUpdateChannelStable {
 		return nil, fmt.Errorf("invalid update channel %q (expected next or stable)", channel)
 	}
-	verboseCLIUpdateInternal("channel=%s target=%s platform=%s/%s", channel, targetPath, runtime.GOOS, runtime.GOARCH)
+	opts.verboseCLIUpdate("channel=%s target=%s platform=%s/%s", channel, targetPath, runtime.GOOS, runtime.GOARCH)
 
-	currentSHA, err := sha256FileInternal(targetPath)
+	currentSHA, err := sha256File(targetPath)
 	if err != nil {
 		return nil, err
 	}
 
-	plan, err := resolveRemoteCLIUpdateInternal(ctx, channel)
+	var plan *cliUpdatePlan
+	if channel == cliUpdateChannelNext {
+		plan, err = opts.resolveNextCLIUpdate(ctx)
+	} else {
+		plan, err = opts.resolveStableCLIUpdate(ctx)
+	}
 	if err != nil {
 		return nil, err
 	}
 	plan.Channel = channel
 	plan.TargetPath = targetPath
 	plan.CurrentSHA = currentSHA
-	plan.UpdateNeeded = cliUpdateNeededInternal(channel, currentSHA, plan.ExpectedSHA, plan.Version)
+	plan.UpdateNeeded = cliUpdateNeeded(channel, currentSHA, plan.ExpectedSHA, plan.Version)
 	return plan, nil
 }
 
-func configuredCLIUpdateChannelInternal() (string, error) {
+func configuredCLIUpdateChannel() (string, error) {
 	cfg, err := config.Load()
 	if err != nil {
 		return "", fmt.Errorf("failed to load config: %w", err)
@@ -232,21 +233,9 @@ func configuredCLIUpdateChannelInternal() (string, error) {
 	return channel, nil
 }
 
-func saveCLIUpdateChannelInternal(channel string) error {
-	cfg, err := config.Load()
-	if err != nil {
-		return fmt.Errorf("failed to load config: %w", err)
-	}
-	cfg.CLIUpdateChannel = channel
-	if saveErr := config.Save(cfg); saveErr != nil {
-		return fmt.Errorf("failed to save config: %w", saveErr)
-	}
-	return nil
-}
-
-func resolveCLIUpdateTargetInternal() (string, error) {
-	if strings.TrimSpace(cliUpdateTarget) != "" {
-		return filepath.Abs(strings.TrimSpace(cliUpdateTarget))
+func (opts cliUpdateOptions) resolveCLIUpdateTarget() (string, error) {
+	if strings.TrimSpace(opts.target) != "" {
+		return filepath.Abs(strings.TrimSpace(opts.target))
 	}
 	if pathTarget, err := exec.LookPath("arcane-cli"); err == nil {
 		absTarget, absErr := filepath.Abs(pathTarget)
@@ -262,48 +251,30 @@ func resolveCLIUpdateTargetInternal() (string, error) {
 	return filepath.EvalSymlinks(exe)
 }
 
-func inferCLIUpdateChannelInternal(version string) string {
-	normalized := strings.ToLower(strings.TrimSpace(version))
-	if strings.Contains(normalized, "next") || strings.Contains(normalized, "beta") {
-		return cliUpdateChannelNext
-	}
-	return cliUpdateChannelStable
-}
-
-func resolveRemoteCLIUpdateInternal(ctx context.Context, channel string) (*cliUpdatePlan, error) {
-	if channel == cliUpdateChannelNext {
-		return resolveNextCLIUpdateInternal(ctx)
-	}
-	return resolveStableCLIUpdateInternal(ctx)
-}
-
-func resolveNextCLIUpdateInternal(ctx context.Context) (*cliUpdatePlan, error) {
+func (opts cliUpdateOptions) resolveNextCLIUpdate(ctx context.Context) (*cliUpdatePlan, error) {
 	baseURL := strings.TrimSpace(config.CLINextBaseURL)
 	if baseURL == "" {
 		return nil, errors.New("next CLI update base URL is empty")
 	}
 
-	artifactName, err := cliRawArtifactNameInternal()
+	platformName, err := cliPlatformName()
 	if err != nil {
 		return nil, err
 	}
-	platformName, err := cliPlatformNameInternal()
-	if err != nil {
-		return nil, err
-	}
-	checksumURL := joinURLPathInternal(baseURL, "arcane-cli_checksums.txt")
-	artifactURL := joinURLPathInternal(baseURL, artifactName)
-	verboseCLIUpdateInternal("next base URL: %s", baseURL)
-	verboseCLIUpdateInternal("next artifact URL: %s", artifactURL)
-	verboseCLIUpdateInternal("next checksum URL: %s", checksumURL)
-	verboseCLIUpdateInternal("next checksum candidates: %s", artifactName+", "+platformName)
+	artifactName := "arcane-cli_" + platformName
+	checksumURL := joinURLPath(baseURL, "arcane-cli_checksums.txt")
+	artifactURL := joinURLPath(baseURL, artifactName)
+	opts.verboseCLIUpdate("next base URL: %s", baseURL)
+	opts.verboseCLIUpdate("next artifact URL: %s", artifactURL)
+	opts.verboseCLIUpdate("next checksum URL: %s", checksumURL)
+	opts.verboseCLIUpdate("next checksum candidates: %s", artifactName+", "+platformName)
 
-	checksums, err := fetchTextInternal(ctx, checksumURL)
+	checksums, err := fetchText(ctx, checksumURL)
 	if err != nil {
 		return nil, err
 	}
-	verboseCLIUpdateInternal("next checksum entries: %s", strings.Join(checksumEntryNamesInternal(checksums), ", "))
-	expectedSHA, err := findChecksumInternal(checksums, artifactName, platformName)
+	opts.verboseCLIUpdate("next checksum entries: %s", strings.Join(checksumEntryNames(checksums), ", "))
+	expectedSHA, err := findChecksum(checksums, artifactName, platformName)
 	if err != nil {
 		return nil, err
 	}
@@ -318,10 +289,10 @@ func resolveNextCLIUpdateInternal(ctx context.Context) (*cliUpdatePlan, error) {
 	}, nil
 }
 
-func resolveStableCLIUpdateInternal(ctx context.Context) (*cliUpdatePlan, error) {
-	version := strings.TrimSpace(cliUpdateVersion)
+func (opts cliUpdateOptions) resolveStableCLIUpdate(ctx context.Context) (*cliUpdatePlan, error) {
+	version := strings.TrimSpace(opts.version)
 	if version == "" {
-		latest, err := fetchLatestGitHubReleaseInternal(ctx)
+		latest, err := fetchLatestGitHubRelease(ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -336,25 +307,26 @@ func resolveStableCLIUpdateInternal(ctx context.Context) (*cliUpdatePlan, error)
 		return nil, errors.New("stable CLI update base URL is empty")
 	}
 
-	artifactName, err := cliArchiveArtifactNameInternal()
+	arch, err := cliArtifactArch()
 	if err != nil {
 		return nil, err
 	}
+	artifactName := fmt.Sprintf("arcane-cli_%s_%s.tar.gz", runtime.GOOS, arch)
 	checksumName := fmt.Sprintf("arcane_%s_checksums.txt", strings.TrimPrefix(version, "v"))
-	versionBaseURL := joinURLPathInternal(baseURL, version)
-	checksumURL := joinURLPathInternal(versionBaseURL, checksumName)
-	artifactURL := joinURLPathInternal(versionBaseURL, artifactName)
-	verboseCLIUpdateInternal("stable version: %s", version)
-	verboseCLIUpdateInternal("stable artifact URL: %s", artifactURL)
-	verboseCLIUpdateInternal("stable checksum URL: %s", checksumURL)
-	verboseCLIUpdateInternal("stable checksum candidates: %s", artifactName)
+	versionBaseURL := joinURLPath(baseURL, version)
+	checksumURL := joinURLPath(versionBaseURL, checksumName)
+	artifactURL := joinURLPath(versionBaseURL, artifactName)
+	opts.verboseCLIUpdate("stable version: %s", version)
+	opts.verboseCLIUpdate("stable artifact URL: %s", artifactURL)
+	opts.verboseCLIUpdate("stable checksum URL: %s", checksumURL)
+	opts.verboseCLIUpdate("stable checksum candidates: %s", artifactName)
 
-	checksums, err := fetchTextInternal(ctx, checksumURL)
+	checksums, err := fetchText(ctx, checksumURL)
 	if err != nil {
 		return nil, err
 	}
-	verboseCLIUpdateInternal("stable checksum entries: %s", strings.Join(checksumEntryNamesInternal(checksums), ", "))
-	artifactSHA, err := findChecksumInternal(checksums, artifactName)
+	opts.verboseCLIUpdate("stable checksum entries: %s", strings.Join(checksumEntryNames(checksums), ", "))
+	artifactSHA, err := findChecksum(checksums, artifactName)
 	if err != nil {
 		return nil, err
 	}
@@ -368,19 +340,16 @@ func resolveStableCLIUpdateInternal(ctx context.Context) (*cliUpdatePlan, error)
 	}, nil
 }
 
-func cliUpdateNeededInternal(channel, currentSHA, expectedSHA, remoteVersion string) bool {
+func cliUpdateNeeded(channel, currentSHA, expectedSHA, remoteVersion string) bool {
 	if channel == cliUpdateChannelStable {
 		current := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(config.Version)), "v")
 		remote := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(remoteVersion)), "v")
 		return current != remote
 	}
-	if strings.TrimSpace(expectedSHA) == "" {
-		return true
-	}
-	return !strings.EqualFold(currentSHA, expectedSHA)
+	return strings.TrimSpace(expectedSHA) == "" || !strings.EqualFold(currentSHA, expectedSHA)
 }
 
-func fetchLatestGitHubReleaseInternal(ctx context.Context) (string, error) {
+func fetchLatestGitHubRelease(ctx context.Context) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.github.com/repos/getarcaneapp/arcane/releases/latest", http.NoBody)
 	if err != nil {
 		return "", err
@@ -404,31 +373,15 @@ func fetchLatestGitHubReleaseInternal(ctx context.Context) (string, error) {
 	return strings.TrimSpace(latest.TagName), nil
 }
 
-func cliRawArtifactNameInternal() (string, error) {
-	platformName, err := cliPlatformNameInternal()
-	if err != nil {
-		return "", err
-	}
-	return "arcane-cli_" + platformName, nil
-}
-
-func cliPlatformNameInternal() (string, error) {
-	arch, err := cliArtifactArchInternal()
+func cliPlatformName() (string, error) {
+	arch, err := cliArtifactArch()
 	if err != nil {
 		return "", err
 	}
 	return fmt.Sprintf("%s_%s", runtime.GOOS, arch), nil
 }
 
-func cliArchiveArtifactNameInternal() (string, error) {
-	arch, err := cliArtifactArchInternal()
-	if err != nil {
-		return "", err
-	}
-	return fmt.Sprintf("arcane-cli_%s_%s.tar.gz", runtime.GOOS, arch), nil
-}
-
-func cliArtifactArchInternal() (string, error) {
+func cliArtifactArch() (string, error) {
 	switch runtime.GOARCH {
 	case "amd64", "arm64", "386", "riscv64":
 		return runtime.GOARCH, nil
@@ -439,22 +392,22 @@ func cliArtifactArchInternal() (string, error) {
 	}
 }
 
-func installCLIUpdateInternal(ctx context.Context, plan *cliUpdatePlan) error {
+func (opts cliUpdateOptions) installCLIUpdate(ctx context.Context, plan *cliUpdatePlan, jsonMode bool) error {
 	tmpDir, err := os.MkdirTemp("", "arcane-cli-update-*")
 	if err != nil {
 		return fmt.Errorf("failed to create update temp dir: %w", err)
 	}
 	defer func() { _ = os.RemoveAll(tmpDir) }()
 
-	loading := output.StartTracker(ctx, output.Stderr(), !jsonOutput, "Downloading artifact", "Verifying artifact", "Installing executable")
+	loading := output.StartTracker(ctx, output.Stderr(), !jsonMode, "Downloading artifact", "Verifying artifact", "Installing executable")
 	loading.NextStep()
 	defer loading.Stop()
 	downloadPath := filepath.Join(tmpDir, plan.ArtifactName)
-	if downloadFileErr := downloadFileInternal(ctx, plan.ArtifactURL, downloadPath); downloadFileErr != nil {
+	if downloadFileErr := opts.downloadFile(ctx, plan.ArtifactURL, downloadPath, jsonMode); downloadFileErr != nil {
 		return downloadFileErr
 	}
 	loading.NextStep()
-	if gotSHA, sha256FileErr := sha256FileInternal(downloadPath); sha256FileErr != nil {
+	if gotSHA, sha256FileErr := sha256File(downloadPath); sha256FileErr != nil {
 		return sha256FileErr
 	} else if !strings.EqualFold(gotSHA, plan.ArtifactSHA) {
 		return fmt.Errorf("downloaded artifact SHA mismatch: got %s, expected %s", gotSHA, plan.ArtifactSHA)
@@ -464,7 +417,7 @@ func installCLIUpdateInternal(ctx context.Context, plan *cliUpdatePlan) error {
 	binaryPath := downloadPath
 	if strings.HasSuffix(plan.ArtifactName, ".tar.gz") {
 		extractedPath := filepath.Join(tmpDir, "arcane-cli")
-		if extractCLIFromTarGzErr := extractCLIFromTarGzInternal(downloadPath, extractedPath); extractCLIFromTarGzErr != nil {
+		if extractCLIFromTarGzErr := extractCLIFromTarGz(downloadPath, extractedPath); extractCLIFromTarGzErr != nil {
 			return extractCLIFromTarGzErr
 		}
 		binaryPath = extractedPath
@@ -473,10 +426,10 @@ func installCLIUpdateInternal(ctx context.Context, plan *cliUpdatePlan) error {
 	if chmodErr := os.Chmod(binaryPath, 0o755); chmodErr != nil {
 		return fmt.Errorf("failed to make downloaded binary executable: %w", chmodErr)
 	}
-	return replaceExecutableInternal(binaryPath, plan.TargetPath)
+	return replaceExecutable(binaryPath, plan.TargetPath)
 }
 
-func replaceExecutableInternal(sourcePath, targetPath string) error {
+func replaceExecutable(sourcePath, targetPath string) error {
 	targetDir := filepath.Dir(targetPath)
 	tmpTarget, err := os.CreateTemp(targetDir, filepath.Base(targetPath)+".update-*")
 	if err != nil {
@@ -528,7 +481,7 @@ func replaceExecutableInternal(sourcePath, targetPath string) error {
 	return nil
 }
 
-func extractCLIFromTarGzInternal(archivePath, outputPath string) error {
+func extractCLIFromTarGz(archivePath, outputPath string) error {
 	file, err := os.Open(archivePath)
 	if err != nil {
 		return fmt.Errorf("failed to open archive: %w", err)
@@ -576,7 +529,7 @@ func extractCLIFromTarGzInternal(archivePath, outputPath string) error {
 	return errors.New("archive did not contain arcane-cli")
 }
 
-func fetchTextInternal(ctx context.Context, url string) (string, error) {
+func fetchText(ctx context.Context, url string) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, http.NoBody)
 	if err != nil {
 		return "", err
@@ -603,8 +556,8 @@ func fetchTextInternal(ctx context.Context, url string) (string, error) {
 	return string(body), nil
 }
 
-func downloadFileInternal(ctx context.Context, url, outputPath string) error {
-	verboseCLIUpdateInternal("downloading %s to %s", url, outputPath)
+func (opts cliUpdateOptions) downloadFile(ctx context.Context, url, outputPath string, jsonMode bool) error {
+	opts.verboseCLIUpdate("downloading %s to %s", url, outputPath)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, http.NoBody)
 	if err != nil {
 		return err
@@ -624,7 +577,7 @@ func downloadFileInternal(ctx context.Context, url, outputPath string) error {
 		return fmt.Errorf("failed to create download file: %w", err)
 	}
 	limitedBody := &io.LimitedReader{R: resp.Body, N: maxCLIDownloadSize + 1}
-	written, err := output.Copy(ctx, out, limitedBody, resp.ContentLength, "Downloading artifact", !jsonOutput)
+	written, err := output.Copy(ctx, out, limitedBody, resp.ContentLength, "Downloading artifact", !jsonMode)
 	if err != nil {
 		_ = out.Close()
 		return fmt.Errorf("failed to write download file: %w", err)
@@ -640,14 +593,14 @@ func downloadFileInternal(ctx context.Context, url, outputPath string) error {
 }
 
 //nolint:goprintffuncname // internal verbose-logging helper; printf-style by design
-func verboseCLIUpdateInternal(format string, args ...any) {
-	if !cliUpdateVerbose {
+func (opts cliUpdateOptions) verboseCLIUpdate(format string, args ...any) {
+	if !opts.verbose {
 		return
 	}
 	_, _ = fmt.Fprintf(output.CoordinatedWriter(output.Stderr()), "self-update: "+format+"\n", args...)
 }
 
-func sha256FileInternal(filePath string) (string, error) {
+func sha256File(filePath string) (string, error) {
 	file, err := os.Open(filePath)
 	if err != nil {
 		return "", fmt.Errorf("failed to open %s for SHA-256: %w", filePath, err)
@@ -661,7 +614,7 @@ func sha256FileInternal(filePath string) (string, error) {
 	return hex.EncodeToString(hash.Sum(nil)), nil
 }
 
-func findChecksumInternal(checksums string, artifactNames ...string) (string, error) {
+func findChecksum(checksums string, artifactNames ...string) (string, error) {
 	wanted := make(map[string]struct{}, len(artifactNames))
 	for _, artifactName := range artifactNames {
 		artifactName = strings.TrimPrefix(path.Clean(strings.TrimSpace(artifactName)), "./")
@@ -671,22 +624,30 @@ func findChecksumInternal(checksums string, artifactNames ...string) (string, er
 	}
 
 	for line := range strings.SplitSeq(checksums, "\n") {
-		fields := strings.Fields(strings.TrimSpace(line))
+		fields := strings.Fields(line)
 		if len(fields) < 2 {
 			continue
 		}
 		checksumPath := strings.TrimPrefix(path.Clean(strings.TrimSpace(fields[len(fields)-1])), "./")
-		if checksumPathMatchesInternal(checksumPath, wanted) {
+		if _, ok := wanted[checksumPath]; ok {
 			return strings.ToLower(fields[0]), nil
+		}
+		if _, ok := wanted[path.Base(checksumPath)]; ok {
+			return strings.ToLower(fields[0]), nil
+		}
+		for wantedPath := range wanted {
+			if strings.HasSuffix(checksumPath, "/"+wantedPath) {
+				return strings.ToLower(fields[0]), nil
+			}
 		}
 	}
 	return "", fmt.Errorf("checksum for %s not found", strings.Join(artifactNames, " or "))
 }
 
-func checksumEntryNamesInternal(checksums string) []string {
+func checksumEntryNames(checksums string) []string {
 	names := make([]string, 0)
 	for line := range strings.SplitSeq(checksums, "\n") {
-		fields := strings.Fields(strings.TrimSpace(line))
+		fields := strings.Fields(line)
 		if len(fields) < 2 {
 			continue
 		}
@@ -695,22 +656,7 @@ func checksumEntryNamesInternal(checksums string) []string {
 	return names
 }
 
-func checksumPathMatchesInternal(checksumPath string, wanted map[string]struct{}) bool {
-	if _, ok := wanted[checksumPath]; ok {
-		return true
-	}
-	if _, ok := wanted[path.Base(checksumPath)]; ok {
-		return true
-	}
-	for wantedPath := range wanted {
-		if strings.HasSuffix(checksumPath, "/"+wantedPath) {
-			return true
-		}
-	}
-	return false
-}
-
-func joinURLPathInternal(baseURL string, parts ...string) string {
+func joinURLPath(baseURL string, parts ...string) string {
 	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
 	joined := path.Join(parts...)
 	if joined == "." || joined == "" {

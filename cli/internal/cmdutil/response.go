@@ -45,11 +45,8 @@ func EnsureSuccessStatus(resp *http.Response) error {
 	}
 }
 
-// DecodeJSON decodes JSON into out and enforces a successful HTTP status.
-func DecodeJSON[T any](resp *http.Response, out *T) error {
-	if err := EnsureSuccessStatus(resp); err != nil {
-		return err
-	}
+// DecodeJSON decodes into out; callers must first enforce HTTP success with EnsureSuccessStatus.
+func DecodeJSON(resp *http.Response, out any) error {
 	if out == nil {
 		return errors.New("nil decode target")
 	}

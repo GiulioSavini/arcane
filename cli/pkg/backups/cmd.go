@@ -12,364 +12,550 @@ import (
 	"github.com/getarcaneapp/arcane/types/v2/backup"
 	"github.com/getarcaneapp/arcane/types/v2/base"
 	"github.com/spf13/cobra"
-	kit "go.getarcane.app/kit/pkg"
+	"go.getarcane.app/kit/pkg"
 
 	"github.com/getarcaneapp/arcane/cli/v2/internal/client"
 	"github.com/getarcaneapp/arcane/cli/v2/internal/cmdutil"
 	"github.com/getarcaneapp/arcane/cli/v2/internal/output"
-	"github.com/getarcaneapp/arcane/cli/v2/internal/prompt"
 	"github.com/getarcaneapp/arcane/cli/v2/internal/types"
 )
 
-var (
-	limitFlag  int
-	startFlag  int
-	allFlag    bool
-	forceFlag  bool
-	jsonOutput bool
-
-	createDestination   string
-	createS3Destination string
-	createLocal         bool
-	createRecoveryKey   string
-	createPolicyID      string
-
-	deleteRecoveryKey string
-
-	restoreRecoveryKey string
-
-	uploadS3Destination string
-	uploadRecoveryKey   string
-
-	discoverS3Destination string
-	discoverRecoveryKey   string
-
-	policiesUpdateFile          string
-	policiesUpdateID            string
-	policiesUpdateEnabled       bool
-	policiesUpdateDisabled      bool
-	policiesUpdateSchedule      string
-	policiesUpdateRetention     int
-	policiesUpdateLocal         bool
-	policiesUpdateS3            bool
-	policiesUpdateS3Destination string
-
-	generateSave   bool
-	setRecoveryKey string
-)
-
-// BackupsCmd is the parent command for Arcane system backup operations (admin-only).
-var BackupsCmd = &cobra.Command{
-	Use:     "backups",
-	Aliases: []string{"backup"},
-	Short:   "Manage Arcane system backups (admin only)",
-	Long: `System backups snapshot Arcane's database and configuration, encrypted with the recovery key.
+// Command is the parent command for Arcane system backup operations (admin-only).
+func Command() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:     "backups",
+		Aliases: []string{"backup"},
+		Short:   "Manage Arcane system backups (admin only)",
+		Long: `System backups snapshot Arcane's database and configuration, encrypted with the recovery key.
 Backups are stored in the local repository, a saved S3 destination, or both; policies schedule automatic runs.`,
+	}
+	cmd.AddCommand(newListCmd())
+	cmd.AddCommand(newCreateCmd())
+	cmd.AddCommand(newDeleteCmd())
+	cmd.AddCommand(newRestoreCmd())
+	cmd.AddCommand(newUploadCmd())
+	cmd.AddCommand(newDiscoverCmd())
+	cmd.AddCommand(newPoliciesCmd())
+	cmd.AddCommand(newRecoveryKeyCmd())
+	cmd.AddCommand(newS3Cmd())
+	return cmd
 }
 
-var listCmd = &cobra.Command{
-	Use:          "list",
-	Aliases:      []string{"ls"},
-	Short:        "List Arcane system backups",
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := cmdutil.ClientFromCommand(cmd)
-		if err != nil {
-			return err
-		}
+func newListCmd() *cobra.Command {
+	var opts struct {
+		limit int
+		start int
+		all   bool
+	}
+	cmd := &cobra.Command{
+		Use:          "list",
+		Aliases:      []string{"ls"},
+		Short:        "List Arcane system backups",
+		Args:         cobra.NoArgs,
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := cmdutil.ClientFromCommand(cmd)
+			if err != nil {
+				return err
+			}
 
-		return cmdutil.RunList(cmd, c, cmdutil.ListSpec[backup.SystemBackupRun]{
-			Resource: "backups",
-			Endpoint: types.Backups(),
-			Params:   cmdutil.ListParams{Resource: "backups", Limit: limitFlag, FallbackDefault: 20, Start: startFlag, All: allFlag},
-			JSON:     cmdutil.JSONOutputEnabled(cmd),
-			Headers:  []string{"ID", "STATUS", "TRIGGER", "DESTINATION", "SIZE", "S3 DESTINATION", "CREATED"},
-			Row: func(run backup.SystemBackupRun) []string {
-				size := ""
-				if run.Size > 0 {
-					size = output.Bytes(run.Size)
-				}
-				return []string{
-					run.ID,
-					run.Status,
-					run.Trigger,
-					string(run.Destination),
-					size,
-					run.S3DestinationName,
-					run.CreatedAt.Format("2006-01-02 15:04"),
-				}
-			},
-		})
-	},
+			return cmdutil.RunList(cmd, c, cmdutil.ListSpec[backup.SystemBackupRun]{
+				Resource: "backups",
+				Endpoint: types.Backups(),
+				Params:   cmdutil.ListParams{Resource: "backups", Limit: opts.limit, FallbackDefault: 20, Start: opts.start, All: opts.all},
+				Headers:  []string{"ID", "STATUS", "TRIGGER", "DESTINATION", "SIZE", "S3 DESTINATION", "CREATED"},
+				Row: func(run backup.SystemBackupRun) []string {
+					return []string{
+						run.ID,
+						run.Status,
+						run.Trigger,
+						string(run.Destination),
+						kit.Ternary(run.Size > 0, output.Bytes(run.Size), ""),
+						run.S3DestinationName,
+						run.CreatedAt.Format("2006-01-02 15:04"),
+					}
+				},
+			})
+		},
+	}
+	cmd.Flags().IntVarP(&opts.limit, "limit", "n", 20, "Number of backups to show")
+	cmd.Flags().IntVar(&opts.start, "start", 0, cmdutil.StartFlagUsage)
+	cmd.Flags().BoolVarP(&opts.all, "all", "a", false, cmdutil.AllFlagUsage)
+	return cmd
 }
 
-var createCmd = &cobra.Command{
-	Use:   "create",
-	Short: "Create an Arcane system backup",
-	Long: `Create a system backup. With no flags the backup is stored locally; --s3-destination
+func newCreateCmd() *cobra.Command {
+	var opts struct {
+		destination   backup.SystemBackupDestination
+		s3Destination string
+		local         bool
+		recoveryKey   string
+		policyID      string
+	}
+	cmd := &cobra.Command{
+		Use:   "create",
+		Short: "Create an Arcane system backup",
+		Long: `Create a system backup. With no flags the backup is stored locally; --s3-destination
 alone stores it in S3, and --local together with --s3-destination stores it in both.`,
-	Args:         cobra.NoArgs,
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := cmdutil.ClientFromCommand(cmd)
-		if err != nil {
-			return err
-		}
-
-		s3DestinationID := ""
-		if createS3Destination != "" {
-			resolved, _, resolveErr := s3DestinationRef.Resolve(cmd.Context(), c, createS3Destination, !cmdutil.JSONOutputEnabled(cmd) && prompt.IsInteractive())
-			if resolveErr != nil {
-				return resolveErr
-			}
-			s3DestinationID = resolved.ID
-		}
-
-		destination := backup.SystemBackupDestination(createDestination)
-		if cmd.Flags().Changed("destination") {
-			switch destination {
-			case backup.SystemBackupDestinationLocal, backup.SystemBackupDestinationS3, backup.SystemBackupDestinationLocalS3:
-			default:
-				return fmt.Errorf("invalid --destination %q: must be local, s3, or local_s3", createDestination)
-			}
-		} else {
-			switch {
-			case s3DestinationID != "" && createLocal:
-				destination = backup.SystemBackupDestinationLocalS3
-			case s3DestinationID != "":
-				destination = backup.SystemBackupDestinationS3
-			default:
-				destination = backup.SystemBackupDestinationLocal
-			}
-		}
-		if (destination == backup.SystemBackupDestinationS3 || destination == backup.SystemBackupDestinationLocalS3) && s3DestinationID == "" {
-			return fmt.Errorf("--destination %s requires --s3-destination", destination)
-		}
-
-		req := backup.CreateSystemBackupRequest{
-			Destination:     destination,
-			S3DestinationID: s3DestinationID,
-			RecoveryKey:     createRecoveryKey,
-			PolicyID:        createPolicyID,
-		}
-
-		run, err := c.DoJSON[backup.SystemBackupRun](cmd.Context(), http.MethodPost, types.Backups(), req)
-		if err != nil {
-			return fmt.Errorf("failed to create backup: %w", err)
-		}
-
-		if cmdutil.JSONOutputEnabled(cmd) {
-			return cmdutil.PrintJSON(run)
-		}
-
-		output.Success("Backup %s created successfully", run.ID)
-		output.KeyValue("ID", run.ID)
-		output.KeyValue("Status", run.Status)
-		output.KeyValue("Destination", string(run.Destination))
-		if run.Size > 0 {
-			output.KeyValue("Size", output.Bytes(run.Size))
-		}
-		if run.S3DestinationName != "" {
-			output.KeyValue("S3 Destination", run.S3DestinationName)
-		}
-		return nil
-	},
-}
-
-var deleteCmd = &cobra.Command{
-	Use:          "delete <backup-id>",
-	Aliases:      []string{"rm", "remove"},
-	Short:        "Delete an Arcane system backup",
-	Args:         cobra.ExactArgs(1),
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		if !forceFlag {
-			confirmed, err := cmdutil.Confirm(cmd, fmt.Sprintf("Are you sure you want to delete backup %s?", args[0]))
+		Args:         cobra.NoArgs,
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := cmdutil.ClientFromCommand(cmd)
 			if err != nil {
 				return err
 			}
-			if !confirmed {
-				_, _ = fmt.Fprintln(output.Stdout(), "Cancelled")
-				return nil
+
+			s3DestinationID := ""
+			if opts.s3Destination != "" {
+				resolved, _, resolveErr := s3DestinationRef.Resolve(cmd.Context(), c, opts.s3Destination, cmdutil.AllowPrompt(cmd))
+				if resolveErr != nil {
+					return resolveErr
+				}
+				s3DestinationID = resolved.ID
 			}
-		}
 
-		c, err := cmdutil.ClientFromCommand(cmd)
-		if err != nil {
-			return err
-		}
+			destination := opts.destination
+			if cmd.Flags().Changed("destination") && destination == "" {
+				return fmt.Errorf("invalid --destination %q: must be local, s3, or local_s3", opts.destination)
+			}
+			if !cmd.Flags().Changed("destination") {
+				switch {
+				case s3DestinationID != "" && opts.local:
+					destination = backup.SystemBackupDestinationLocalS3
+				case s3DestinationID != "":
+					destination = backup.SystemBackupDestinationS3
+				default:
+					destination = backup.SystemBackupDestinationLocal
+				}
+			}
+			if (destination == backup.SystemBackupDestinationS3 || destination == backup.SystemBackupDestinationLocalS3) && s3DestinationID == "" {
+				return fmt.Errorf("--destination %s requires --s3-destination", destination)
+			}
 
-		result, err := c.DoJSON[base.ApiResponse[base.MessageResponse]](cmd.Context(), http.MethodDelete, types.Backup(args[0]), backup.DeleteSystemBackupRequest{RecoveryKey: deleteRecoveryKey})
-		if err != nil {
-			return fmt.Errorf("failed to delete backup: %w", err)
-		}
+			req := backup.CreateSystemBackupRequest{
+				Destination:     destination,
+				S3DestinationID: s3DestinationID,
+				RecoveryKey:     opts.recoveryKey,
+				PolicyID:        opts.policyID,
+			}
 
-		if cmdutil.JSONOutputEnabled(cmd) {
-			return cmdutil.PrintJSON(result.Data)
-		}
+			run, err := c.DoJSON[backup.SystemBackupRun](cmd.Context(), http.MethodPost, types.Backups(), req)
+			if err != nil {
+				return fmt.Errorf("failed to create backup: %w", err)
+			}
 
-		output.Success("Backup %s deleted successfully", args[0])
-		return nil
-	},
+			if cmdutil.JSONOutputEnabled(cmd) {
+				return cmdutil.PrintJSON(run)
+			}
+
+			output.Success("Backup %s created successfully", run.ID)
+			output.KeyValue("ID", run.ID)
+			output.KeyValue("Status", run.Status)
+			output.KeyValue("Destination", string(run.Destination))
+			if run.Size > 0 {
+				output.KeyValue("Size", output.Bytes(run.Size))
+			}
+			if run.S3DestinationName != "" {
+				output.KeyValue("S3 Destination", run.S3DestinationName)
+			}
+			return nil
+		},
+	}
+	cmdutil.EnumVarP(cmd, cmd.Flags(), &opts.destination, "destination", "", "",
+		"Backup destination (inferred from --local/--s3-destination when omitted)",
+		backup.SystemBackupDestinationLocal, backup.SystemBackupDestinationS3, backup.SystemBackupDestinationLocalS3)
+	cmd.Flags().StringVar(&opts.s3Destination, "s3-destination", "", "S3 destination name or ID")
+	cmd.Flags().BoolVar(&opts.local, "local", false, "Also keep a local copy when backing up to S3")
+	cmd.Flags().StringVar(&opts.recoveryKey, "recovery-key", "", "Recovery key used to encrypt the backup")
+	cmd.Flags().StringVar(&opts.policyID, "policy", "", "Backup policy ID to associate with the run")
+	return cmd
 }
 
-var restoreCmd = &cobra.Command{
-	Use:          "restore <backup-id>",
-	Short:        "Restore Arcane from a system backup",
-	Long:         `Restore overwrites the current Arcane database and configuration with the backup contents, then restarts Arcane.`,
-	Args:         cobra.ExactArgs(1),
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		if !forceFlag {
-			output.Warning("Restoring backup %s will OVERWRITE the current Arcane database and configuration, then restart Arcane. This cannot be undone.", args[0])
-			confirmed, err := cmdutil.Confirm(cmd, "Are you absolutely sure you want to restore this backup?")
+func newDeleteCmd() *cobra.Command {
+	var opts struct {
+		force       bool
+		recoveryKey string
+	}
+	cmd := &cobra.Command{
+		Use:          "delete <backup-id>",
+		Aliases:      []string{"rm", "remove"},
+		Short:        "Delete an Arcane system backup",
+		Args:         cobra.ExactArgs(1),
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := cmdutil.ClientFromCommand(cmd)
 			if err != nil {
 				return err
 			}
-			if !confirmed {
-				_, _ = fmt.Fprintln(output.Stdout(), "Cancelled")
-				return nil
+
+			return cmdutil.RunDelete(cmd, c, cmdutil.DeleteSpec{
+				Force:          opts.force,
+				Prompt:         fmt.Sprintf("Are you sure you want to delete backup %s?", args[0]),
+				Path:           types.Backup(args[0]),
+				Body:           backup.DeleteSystemBackupRequest{RecoveryKey: opts.recoveryKey},
+				FailureMessage: "failed to delete backup",
+				SuccessMessage: fmt.Sprintf("Backup %s deleted successfully", args[0]),
+			})
+		},
+	}
+	cmd.Flags().StringVar(&opts.recoveryKey, "recovery-key", "", "Recovery key (required to delete remote snapshots)")
+	cmd.Flags().BoolVarP(&opts.force, "force", "f", false, "Delete without confirmation")
+	return cmd
+}
+
+func newRestoreCmd() *cobra.Command {
+	var opts struct {
+		force       bool
+		recoveryKey string
+	}
+	cmd := &cobra.Command{
+		Use:          "restore <backup-id>",
+		Short:        "Restore Arcane from a system backup",
+		Long:         `Restore overwrites the current Arcane database and configuration with the backup contents, then restarts Arcane.`,
+		Args:         cobra.ExactArgs(1),
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if !opts.force {
+				output.Warning("Restoring backup %s will OVERWRITE the current Arcane database and configuration, then restart Arcane. This cannot be undone.", args[0])
+			}
+			confirmed, confirmErr := cmdutil.ConfirmOrCancel(cmd, opts.force, "Are you absolutely sure you want to restore this backup?")
+			if confirmErr != nil || !confirmed {
+				return confirmErr
+			}
+
+			key := opts.recoveryKey
+			if key == "" {
+				var err error
+				if key, err = output.Secret(cmd.Context(), cmd.InOrStdin(), cmd.ErrOrStderr(), "Recovery key", "recovery-key"); err != nil {
+					return fmt.Errorf("failed to read recovery key: %w", err)
+				}
+				if key == "" {
+					return errors.New("recovery key is required")
+				}
+			}
+
+			c, err := cmdutil.ClientFromCommand(cmd)
+			if err != nil {
+				return err
+			}
+
+			return cmdutil.Run(cmd, c, cmdutil.Spec[base.MessageResponse]{
+				Method:         http.MethodPost,
+				Path:           types.BackupRestore(args[0]),
+				Body:           backup.RestoreSystemBackupRequest{RecoveryKey: key},
+				FailureMessage: "failed to restore backup",
+				Render: func(data base.MessageResponse) error {
+					output.Success("%s", data.Message)
+					output.Warning("Arcane will restart while the restore is applied; the server may be unavailable for a short time.")
+					return nil
+				},
+			})
+		},
+	}
+	cmd.Flags().StringVar(&opts.recoveryKey, "recovery-key", "", "Recovery key the backup was encrypted with (prompted for when omitted)")
+	cmd.Flags().BoolVarP(&opts.force, "force", "f", false, "Restore without confirmation")
+	return cmd
+}
+
+func newUploadCmd() *cobra.Command {
+	var opts struct {
+		s3Destination string
+		recoveryKey   string
+	}
+	cmd := &cobra.Command{
+		Use:          "upload <backup-id>",
+		Short:        "Upload an Arcane system backup to an S3 destination",
+		Args:         cobra.ExactArgs(1),
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := cmdutil.ClientFromCommand(cmd)
+			if err != nil {
+				return err
+			}
+
+			resolved, _, err := s3DestinationRef.Resolve(cmd.Context(), c, opts.s3Destination, cmdutil.AllowPrompt(cmd))
+			if err != nil {
+				return err
+			}
+
+			req := backup.UploadSystemBackupRequest{
+				S3DestinationID: resolved.ID,
+				RecoveryKey:     opts.recoveryKey,
+			}
+
+			run, err := c.DoJSON[backup.SystemBackupRun](cmd.Context(), http.MethodPost, types.BackupUpload(args[0]), req)
+			if err != nil {
+				return fmt.Errorf("failed to upload backup: %w", err)
+			}
+
+			if cmdutil.JSONOutputEnabled(cmd) {
+				return cmdutil.PrintJSON(run)
+			}
+
+			output.Success("Backup %s uploaded successfully", run.ID)
+			output.KeyValue("Destination", string(run.Destination))
+			if run.S3DestinationName != "" {
+				output.KeyValue("S3 Destination", run.S3DestinationName)
+			}
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&opts.s3Destination, "s3-destination", "", "S3 destination name or ID to upload to")
+	cmd.Flags().StringVar(&opts.recoveryKey, "recovery-key", "", "Recovery key the backup was encrypted with")
+	_ = cmd.MarkFlagRequired("s3-destination")
+	return cmd
+}
+
+func newDiscoverCmd() *cobra.Command {
+	var opts struct {
+		s3Destination string
+		recoveryKey   string
+	}
+	cmd := &cobra.Command{
+		Use:          "discover",
+		Short:        "Discover Arcane system backups stored in an S3 destination",
+		Long:         `Discover scans an S3 destination for backups and imports records for any not already known to this Arcane instance.`,
+		Args:         cobra.NoArgs,
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := cmdutil.ClientFromCommand(cmd)
+			if err != nil {
+				return err
+			}
+
+			resolved, _, err := s3DestinationRef.Resolve(cmd.Context(), c, opts.s3Destination, cmdutil.AllowPrompt(cmd))
+			if err != nil {
+				return err
+			}
+
+			req := backup.DiscoverSystemBackupsRequest{
+				S3DestinationID: resolved.ID,
+				RecoveryKey:     opts.recoveryKey,
+			}
+
+			return cmdutil.Run(cmd, c, cmdutil.Spec[int]{
+				Method:         http.MethodPost,
+				Path:           types.BackupsDiscover(),
+				Body:           req,
+				FailureMessage: "failed to discover backups",
+				Render: func(data int) error {
+					output.Success("Discovered %d backup(s)", data)
+					return nil
+				},
+			})
+		},
+	}
+	cmd.Flags().StringVar(&opts.s3Destination, "s3-destination", "", "S3 destination name or ID to search")
+	cmd.Flags().StringVar(&opts.recoveryKey, "recovery-key", "", "Recovery key the backups were encrypted with")
+	_ = cmd.MarkFlagRequired("s3-destination")
+	return cmd
+}
+
+func newPoliciesCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:          "policies",
+		Short:        "Show Arcane system backup policies",
+		Args:         cobra.NoArgs,
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := cmdutil.ClientFromCommand(cmd)
+			if err != nil {
+				return err
+			}
+
+			result, err := c.DoJSON[backup.SystemBackupPolicyCollection](cmd.Context(), http.MethodGet, types.BackupsPolicies(), nil)
+			if err != nil {
+				return fmt.Errorf("failed to get backup policies: %w", err)
+			}
+
+			if cmdutil.JSONOutputEnabled(cmd) {
+				return cmdutil.PrintJSON(result)
+			}
+
+			return renderSystemPolicies(result)
+		},
+	}
+	cmd.AddCommand(newPoliciesUpdateCmd())
+	return cmd
+}
+
+func newPoliciesUpdateCmd() *cobra.Command {
+	var opts policiesUpdateOptions
+	cmd := &cobra.Command{
+		Use:   "update",
+		Short: "Update Arcane system backup policies",
+		Long: `Update a system backup policy with flags: the current policies are fetched, the targeted
+policy is modified, and the whole set is saved back. A new policy is created when none exist.
+Alternatively, --file replaces all policies from a raw JSON payload.`,
+		Args:         cobra.NoArgs,
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := cmdutil.ClientFromCommand(cmd)
+			if err != nil {
+				return err
+			}
+
+			req, err := opts.request(cmd, c)
+			if err != nil {
+				return err
+			}
+
+			result, err := c.DoJSON[backup.SystemBackupPolicyCollection](cmd.Context(), http.MethodPut, types.BackupsPolicies(), req)
+			if err != nil {
+				return fmt.Errorf("failed to update backup policies: %w", err)
+			}
+
+			if cmdutil.JSONOutputEnabled(cmd) {
+				return cmdutil.PrintJSON(result)
+			}
+
+			output.Success("Backup policies updated successfully")
+			return renderSystemPolicies(result)
+		},
+	}
+	cmd.Flags().StringVar(&opts.file, "file", "", "JSON file with the full policies payload (use - for stdin); replaces all policies")
+	cmd.Flags().StringVar(&opts.id, "policy-id", "", "Policy ID to update (defaults to the sole policy)")
+	cmd.Flags().BoolVar(&opts.enabled, "enabled", false, "Enable the policy")
+	cmd.Flags().BoolVar(&opts.disabled, "disabled", false, "Disable the policy")
+	cmd.Flags().StringVar(&opts.schedule, "schedule", "", "Cron schedule for automatic backups")
+	cmd.Flags().IntVar(&opts.retention, "retention", 0, "Number of backups to retain")
+	cmd.Flags().BoolVar(&opts.local, "local", false, "Store backups in the local repository")
+	cmd.Flags().BoolVar(&opts.s3, "s3", false, "Store backups in the S3 destination")
+	cmd.Flags().StringVar(&opts.s3Destination, "s3-destination", "", "S3 destination name or ID (implies --s3)")
+	_ = cmd.Flags().MarkDeprecated("disabled", "use --enabled=false")
+	cmd.PreRunE = func(cmd *cobra.Command, _ []string) error {
+		if conflictErr := cmdutil.ExclusiveFlags(cmd, "enabled", "disabled"); conflictErr != nil {
+			return conflictErr
+		}
+		if !cmd.Flags().Changed("file") {
+			return nil
+		}
+		for _, name := range []string{"policy-id", "enabled", "disabled", "schedule", "retention", "local", "s3", "s3-destination"} {
+			if cmd.Flags().Changed(name) {
+				return fmt.Errorf("--file cannot be combined with --%s", name)
 			}
 		}
+		return nil
+	}
+	return cmd
+}
 
-		key := restoreRecoveryKey
-		if key == "" {
-			var err error
-			if key, err = output.Secret(cmd.Context(), cmd.InOrStdin(), cmd.ErrOrStderr(), "Recovery key", "recovery-key"); err != nil {
-				return fmt.Errorf("failed to read recovery key: %w", err)
+func newRecoveryKeyCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "recovery",
+		Short: "Manage the Arcane system backup recovery key",
+	}
+	cmd.AddCommand(newRecoveryKeyGenerateCmd())
+	cmd.AddCommand(newRecoveryKeySetCmd())
+	return cmd
+}
+
+func newRecoveryKeyGenerateCmd() *cobra.Command {
+	var opts struct {
+		save bool
+	}
+	cmd := &cobra.Command{
+		Use:          "generate",
+		Short:        "Generate a new Arcane system backup recovery key",
+		Args:         cobra.NoArgs,
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := cmdutil.ClientFromCommand(cmd)
+			if err != nil {
+				return err
+			}
+
+			result, err := c.DoJSON[backup.SystemBackupRecoveryKey](cmd.Context(), http.MethodPost, types.BackupsRecoveryKeyGenerate(), nil)
+			if err != nil {
+				return fmt.Errorf("failed to generate recovery key: %w", err)
+			}
+
+			jsonMode := cmdutil.JSONOutputEnabled(cmd)
+			if !jsonMode {
+				output.Header("Generated Recovery Key")
+				_, _ = fmt.Fprintln(output.Stdout(), result.RecoveryKey)
+				output.Warning("Store this recovery key somewhere safe. Backups encrypted with it cannot be restored without it.")
+			}
+
+			save := opts.save
+			if !save && cmdutil.AllowPrompt(cmd) {
+				save, err = cmdutil.Confirm(cmd, "Store this recovery key on the server now?")
+				if err != nil {
+					return err
+				}
+			}
+			if !save {
+				if jsonMode {
+					return cmdutil.PrintJSON(result)
+				}
+				_, _ = fmt.Fprintln(output.Stdout(), "Run `arcane admin backups recovery set` to store it on the server later.")
+				return nil
+			}
+			storeRequest := backup.SystemBackupRecoveryKey{RecoveryKey: result.RecoveryKey}
+			if _, storeErr := c.DoJSON[backup.SystemBackupRecoveryKeyStatus](cmd.Context(), http.MethodPut, types.BackupsRecoveryKey(), storeRequest); storeErr != nil {
+				return fmt.Errorf("failed to store recovery key: %w", storeErr)
+			}
+			if jsonMode {
+				return cmdutil.PrintJSON(result)
+			}
+			output.Success("Recovery key stored on the server")
+			return nil
+		},
+	}
+	cmd.Flags().BoolVar(&opts.save, "save", false, "Store the generated recovery key on the server")
+	return cmd
+}
+
+func newRecoveryKeySetCmd() *cobra.Command {
+	var opts struct {
+		recoveryKey string
+	}
+	cmd := &cobra.Command{
+		Use:          "set",
+		Short:        "Configure the Arcane system backup recovery key",
+		Args:         cobra.NoArgs,
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			key := opts.recoveryKey
+			if key == "" {
+				var err error
+				if key, err = output.Secret(cmd.Context(), cmd.InOrStdin(), cmd.ErrOrStderr(), "Recovery key", "recovery-key"); err != nil {
+					return fmt.Errorf("failed to read recovery key: %w", err)
+				}
 			}
 			if key == "" {
-				return errors.New("recovery key is required")
+				return errors.New("recovery key is required; use --recovery-key")
 			}
-		}
 
-		c, err := cmdutil.ClientFromCommand(cmd)
-		if err != nil {
-			return err
-		}
+			c, err := cmdutil.ClientFromCommand(cmd)
+			if err != nil {
+				return err
+			}
 
-		result, err := c.PostJSON[base.MessageResponse](cmd.Context(), types.BackupRestore(args[0]), backup.RestoreSystemBackupRequest{RecoveryKey: key})
-		if err != nil {
-			return fmt.Errorf("failed to restore backup: %w", err)
-		}
+			status, err := c.DoJSON[backup.SystemBackupRecoveryKeyStatus](cmd.Context(), http.MethodPut, types.BackupsRecoveryKey(), backup.SystemBackupRecoveryKey{RecoveryKey: key})
+			if err != nil {
+				return fmt.Errorf("failed to set recovery key: %w", err)
+			}
 
-		if cmdutil.JSONOutputEnabled(cmd) {
-			return cmdutil.PrintJSON(result.Data)
-		}
+			if cmdutil.JSONOutputEnabled(cmd) {
+				return cmdutil.PrintJSON(status)
+			}
 
-		output.Success("%s", result.Data.Message)
-		output.Warning("Arcane will restart while the restore is applied; the server may be unavailable for a short time.")
-		return nil
-	},
+			output.Success("Recovery key configured successfully")
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&opts.recoveryKey, "recovery-key", "", "Recovery key to store (prompted for when omitted)")
+	return cmd
 }
 
-var uploadCmd = &cobra.Command{
-	Use:          "upload <backup-id>",
-	Short:        "Upload an Arcane system backup to an S3 destination",
-	Args:         cobra.ExactArgs(1),
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := cmdutil.ClientFromCommand(cmd)
-		if err != nil {
-			return err
-		}
-
-		resolved, _, err := s3DestinationRef.Resolve(cmd.Context(), c, uploadS3Destination, !cmdutil.JSONOutputEnabled(cmd) && prompt.IsInteractive())
-		if err != nil {
-			return err
-		}
-
-		req := backup.UploadSystemBackupRequest{
-			S3DestinationID: resolved.ID,
-			RecoveryKey:     uploadRecoveryKey,
-		}
-
-		run, err := c.DoJSON[backup.SystemBackupRun](cmd.Context(), http.MethodPost, types.BackupUpload(args[0]), req)
-		if err != nil {
-			return fmt.Errorf("failed to upload backup: %w", err)
-		}
-
-		if cmdutil.JSONOutputEnabled(cmd) {
-			return cmdutil.PrintJSON(run)
-		}
-
-		output.Success("Backup %s uploaded successfully", run.ID)
-		output.KeyValue("Destination", string(run.Destination))
-		if run.S3DestinationName != "" {
-			output.KeyValue("S3 Destination", run.S3DestinationName)
-		}
-		return nil
-	},
-}
-
-var discoverCmd = &cobra.Command{
-	Use:          "discover",
-	Short:        "Discover Arcane system backups stored in an S3 destination",
-	Long:         `Discover scans an S3 destination for backups and imports records for any not already known to this Arcane instance.`,
-	Args:         cobra.NoArgs,
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := cmdutil.ClientFromCommand(cmd)
-		if err != nil {
-			return err
-		}
-
-		resolved, _, err := s3DestinationRef.Resolve(cmd.Context(), c, discoverS3Destination, !cmdutil.JSONOutputEnabled(cmd) && prompt.IsInteractive())
-		if err != nil {
-			return err
-		}
-
-		req := backup.DiscoverSystemBackupsRequest{
-			S3DestinationID: resolved.ID,
-			RecoveryKey:     discoverRecoveryKey,
-		}
-
-		result, err := c.PostJSON[int](cmd.Context(), types.BackupsDiscover(), req)
-		if err != nil {
-			return fmt.Errorf("failed to discover backups: %w", err)
-		}
-
-		if cmdutil.JSONOutputEnabled(cmd) {
-			return cmdutil.PrintJSON(result.Data)
-		}
-
-		output.Success("Discovered %d backup(s)", result.Data)
-		return nil
-	},
-}
-
-var policiesCmd = &cobra.Command{
-	Use:          "policies",
-	Short:        "Show Arcane system backup policies",
-	Args:         cobra.NoArgs,
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := cmdutil.ClientFromCommand(cmd)
-		if err != nil {
-			return err
-		}
-
-		result, err := c.DoJSON[backup.SystemBackupPolicyCollection](cmd.Context(), http.MethodGet, types.BackupsPolicies(), nil)
-		if err != nil {
-			return fmt.Errorf("failed to get backup policies: %w", err)
-		}
-
-		if cmdutil.JSONOutputEnabled(cmd) {
-			return cmdutil.PrintJSON(result)
-		}
-
-		return printPolicies(result)
-	},
-}
-
-func printPolicies(result backup.SystemBackupPolicyCollection) error {
+func renderSystemPolicies(policies backup.SystemBackupPolicyCollection) error {
 	output.Header("System Backup Policies")
-	recoveryKey := kit.Ternary(result.RecoveryKeyStored, "Configured", "Not configured")
-	output.KeyValue("Recovery Key", recoveryKey)
+	output.KeyValue("Recovery Key", kit.Ternary(policies.RecoveryKeyStored, "Configured", "Not configured"))
 
 	headers := []string{"ID", "ENABLED", "SCHEDULE", "RETENTION", "LOCAL", "S3", "S3 DESTINATION", "LAST RUN"}
-	rows := make([][]string, len(result.Policies))
-	for i, policy := range result.Policies {
+	rows := make([][]string, len(policies.Policies))
+	for i, policy := range policies.Policies {
 		lastRun := ""
 		if policy.LastRun != nil {
 			lastRun = fmt.Sprintf("%s (%s)", policy.LastRun.CreatedAt.Format("2006-01-02 15:04"), policy.LastRun.Status)
@@ -388,285 +574,103 @@ func printPolicies(result backup.SystemBackupPolicyCollection) error {
 	return output.Table(headers, rows)
 }
 
-var policiesUpdateCmd = &cobra.Command{
-	Use:   "update",
-	Short: "Update Arcane system backup policies",
-	Long: `Update a system backup policy with flags: the current policies are fetched, the targeted
-policy is modified, and the whole set is saved back. A new policy is created when none exist.
-Alternatively, --file replaces all policies from a raw JSON payload.`,
-	Args:         cobra.NoArgs,
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := cmdutil.ClientFromCommand(cmd)
-		if err != nil {
-			return err
-		}
+type policiesUpdateOptions struct {
+	file          string
+	id            string
+	enabled       bool
+	disabled      bool
+	schedule      string
+	retention     int
+	local         bool
+	s3            bool
+	s3Destination string
+}
 
-		var req backup.UpdateSystemBackupPolicies
-		if policiesUpdateFile != "" {
-			for _, name := range []string{"policy-id", "enabled", "disabled", "schedule", "retention", "local", "s3", "s3-destination"} {
-				if cmd.Flags().Changed(name) {
-					return fmt.Errorf("--file cannot be combined with --%s", name)
-				}
-			}
-
-			var data []byte
-			if policiesUpdateFile == "-" {
-				data, err = io.ReadAll(os.Stdin)
-				if err != nil {
-					return fmt.Errorf("failed to read policies from stdin: %w", err)
-				}
-			} else {
-				data, err = os.ReadFile(policiesUpdateFile)
-				if err != nil {
-					return fmt.Errorf("failed to read file %s: %w", policiesUpdateFile, err)
-				}
-			}
-			if unmarshalErr := json.Unmarshal(data, &req); unmarshalErr != nil {
-				return fmt.Errorf("failed to parse policies file: %w", unmarshalErr)
+func (opts policiesUpdateOptions) request(cmd *cobra.Command, c *client.Client) (backup.UpdateSystemBackupPolicies, error) {
+	var req backup.UpdateSystemBackupPolicies
+	var err error
+	if opts.file != "" {
+		var data []byte
+		if opts.file == "-" {
+			data, err = io.ReadAll(os.Stdin)
+			if err != nil {
+				return req, fmt.Errorf("failed to read policies from stdin: %w", err)
 			}
 		} else {
-			current, getPoliciesErr := c.DoJSON[backup.SystemBackupPolicyCollection](cmd.Context(), http.MethodGet, types.BackupsPolicies(), nil)
-			if getPoliciesErr != nil {
-				return fmt.Errorf("failed to get current backup policies: %w", getPoliciesErr)
-			}
-
-			req.Policies = make([]backup.UpdateSystemBackupPolicy, len(current.Policies))
-			targetIndex := -1
-			for i, p := range current.Policies {
-				req.Policies[i] = backup.UpdateSystemBackupPolicy{
-					ID:              p.ID,
-					Enabled:         p.Enabled,
-					Schedule:        p.Schedule,
-					RetentionCount:  p.RetentionCount,
-					LocalEnabled:    p.LocalEnabled,
-					S3Enabled:       p.S3Enabled,
-					S3DestinationID: p.S3DestinationID,
-				}
-				if policiesUpdateID != "" && p.ID == policiesUpdateID {
-					targetIndex = i
-				}
-			}
-
-			switch {
-			case policiesUpdateID != "" && targetIndex == -1:
-				return fmt.Errorf("policy %q not found; run `arcane admin backups policies`", policiesUpdateID)
-			case policiesUpdateID == "" && len(req.Policies) > 1:
-				return fmt.Errorf("%d backup policies exist; select one with --policy-id", len(req.Policies))
-			case policiesUpdateID == "" && len(req.Policies) == 1:
-				targetIndex = 0
-			case targetIndex == -1:
-				if !cmd.Flags().Changed("schedule") {
-					return errors.New("--schedule is required when creating a new backup policy")
-				}
-				// New policies default to local storage unless --local was set explicitly.
-				req.Policies = append(req.Policies, backup.UpdateSystemBackupPolicy{LocalEnabled: !cmd.Flags().Changed("local") || policiesUpdateLocal})
-				targetIndex = len(req.Policies) - 1
-			}
-
-			target := &req.Policies[targetIndex]
-			if cmd.Flags().Changed("enabled") {
-				target.Enabled = true
-			}
-			if cmd.Flags().Changed("disabled") {
-				target.Enabled = false
-			}
-			if cmd.Flags().Changed("schedule") {
-				target.Schedule = policiesUpdateSchedule
-			}
-			if cmd.Flags().Changed("retention") {
-				target.RetentionCount = policiesUpdateRetention
-			}
-			if cmd.Flags().Changed("local") {
-				target.LocalEnabled = policiesUpdateLocal
-			}
-			if cmd.Flags().Changed("s3") {
-				target.S3Enabled = policiesUpdateS3
-			}
-			if cmd.Flags().Changed("s3-destination") {
-				resolved, _, resolveErr := s3DestinationRef.Resolve(cmd.Context(), c, policiesUpdateS3Destination, !cmdutil.JSONOutputEnabled(cmd) && prompt.IsInteractive())
-				if resolveErr != nil {
-					return resolveErr
-				}
-				target.S3DestinationID = resolved.ID
-				if !cmd.Flags().Changed("s3") {
-					target.S3Enabled = true
-				}
-			}
-		}
-
-		result, err := c.DoJSON[backup.SystemBackupPolicyCollection](cmd.Context(), http.MethodPut, types.BackupsPolicies(), req)
-		if err != nil {
-			return fmt.Errorf("failed to update backup policies: %w", err)
-		}
-
-		if cmdutil.JSONOutputEnabled(cmd) {
-			return cmdutil.PrintJSON(result)
-		}
-
-		output.Success("Backup policies updated successfully")
-		return printPolicies(result)
-	},
-}
-
-var recoveryKeyCmd = &cobra.Command{
-	Use:   "recovery",
-	Short: "Manage the Arcane system backup recovery key",
-}
-
-var recoveryKeyGenerateCmd = &cobra.Command{
-	Use:          "generate",
-	Short:        "Generate a new Arcane system backup recovery key",
-	Args:         cobra.NoArgs,
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := cmdutil.ClientFromCommand(cmd)
-		if err != nil {
-			return err
-		}
-
-		result, err := c.DoJSON[backup.SystemBackupRecoveryKey](cmd.Context(), http.MethodPost, types.BackupsRecoveryKeyGenerate(), nil)
-		if err != nil {
-			return fmt.Errorf("failed to generate recovery key: %w", err)
-		}
-
-		if cmdutil.JSONOutputEnabled(cmd) {
-			if generateSave {
-				if storeRecoveryKeyErr := storeRecoveryKey(cmd, c, result.RecoveryKey); storeRecoveryKeyErr != nil {
-					return storeRecoveryKeyErr
-				}
-			}
-			return cmdutil.PrintJSON(result)
-		}
-
-		output.Header("Generated Recovery Key")
-		_, _ = fmt.Fprintln(output.Stdout(), result.RecoveryKey)
-		output.Warning("Store this recovery key somewhere safe. Backups encrypted with it cannot be restored without it.")
-
-		save := generateSave
-		if !save && prompt.IsInteractive() {
-			save, err = cmdutil.Confirm(cmd, "Store this recovery key on the server now?")
+			data, err = os.ReadFile(opts.file)
 			if err != nil {
-				return err
+				return req, fmt.Errorf("failed to read file %s: %w", opts.file, err)
 			}
 		}
-		if !save {
-			_, _ = fmt.Fprintln(output.Stdout(), "Run `arcane admin backups recovery set` to store it on the server later.")
-			return nil
+		if unmarshalErr := json.Unmarshal(data, &req); unmarshalErr != nil {
+			return req, fmt.Errorf("failed to parse policies file: %w", unmarshalErr)
 		}
-		if storeRotatedRecoveryKeyErr := storeRecoveryKey(cmd, c, result.RecoveryKey); storeRotatedRecoveryKeyErr != nil {
-			return storeRotatedRecoveryKeyErr
+	} else {
+		current, getPoliciesErr := c.DoJSON[backup.SystemBackupPolicyCollection](cmd.Context(), http.MethodGet, types.BackupsPolicies(), nil)
+		if getPoliciesErr != nil {
+			return req, fmt.Errorf("failed to get current backup policies: %w", getPoliciesErr)
 		}
-		output.Success("Recovery key stored on the server")
-		return nil
-	},
-}
 
-var recoveryKeySetCmd = &cobra.Command{
-	Use:          "set",
-	Short:        "Configure the Arcane system backup recovery key",
-	Args:         cobra.NoArgs,
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		key := setRecoveryKey
-		if key == "" {
-			var err error
-			if key, err = output.Secret(cmd.Context(), cmd.InOrStdin(), cmd.ErrOrStderr(), "Recovery key", "recovery-key"); err != nil {
-				return fmt.Errorf("failed to read recovery key: %w", err)
+		req.Policies = make([]backup.UpdateSystemBackupPolicy, len(current.Policies))
+		targetIndex := -1
+		for i, p := range current.Policies {
+			req.Policies[i] = backup.UpdateSystemBackupPolicy{
+				ID:              p.ID,
+				Enabled:         p.Enabled,
+				Schedule:        p.Schedule,
+				RetentionCount:  p.RetentionCount,
+				LocalEnabled:    p.LocalEnabled,
+				S3Enabled:       p.S3Enabled,
+				S3DestinationID: p.S3DestinationID,
+			}
+			if opts.id != "" && p.ID == opts.id {
+				targetIndex = i
 			}
 		}
-		if key == "" {
-			return errors.New("recovery key is required; use --recovery-key")
+
+		switch {
+		case opts.id != "" && targetIndex == -1:
+			return req, fmt.Errorf("policy %q not found; run `arcane admin backups policies`", opts.id)
+		case opts.id == "" && len(req.Policies) > 1:
+			return req, fmt.Errorf("%d backup policies exist; select one with --policy-id", len(req.Policies))
+		case opts.id == "" && len(req.Policies) == 1:
+			targetIndex = 0
+		case targetIndex == -1:
+			if !cmd.Flags().Changed("schedule") {
+				return req, errors.New("--schedule is required when creating a new backup policy")
+			}
+			// New policies default to local storage unless --local was set explicitly.
+			req.Policies = append(req.Policies, backup.UpdateSystemBackupPolicy{LocalEnabled: !cmd.Flags().Changed("local") || opts.local})
+			targetIndex = len(req.Policies) - 1
 		}
 
-		c, err := cmdutil.ClientFromCommand(cmd)
-		if err != nil {
-			return err
+		target := &req.Policies[targetIndex]
+		if cmd.Flags().Changed("enabled") || cmd.Flags().Changed("disabled") {
+			target.Enabled = opts.enabled && !opts.disabled
 		}
-
-		status, err := c.DoJSON[backup.SystemBackupRecoveryKeyStatus](cmd.Context(), http.MethodPut, types.BackupsRecoveryKey(), backup.SystemBackupRecoveryKey{RecoveryKey: key})
-		if err != nil {
-			return fmt.Errorf("failed to set recovery key: %w", err)
+		if cmd.Flags().Changed("schedule") {
+			target.Schedule = opts.schedule
 		}
-
-		if cmdutil.JSONOutputEnabled(cmd) {
-			return cmdutil.PrintJSON(status)
+		if cmd.Flags().Changed("retention") {
+			target.RetentionCount = opts.retention
 		}
-
-		output.Success("Recovery key configured successfully")
-		return nil
-	},
-}
-
-func storeRecoveryKey(cmd *cobra.Command, c *client.Client, key string) error {
-	_, err := c.DoJSON[backup.SystemBackupRecoveryKeyStatus](cmd.Context(), http.MethodPut, types.BackupsRecoveryKey(), backup.SystemBackupRecoveryKey{RecoveryKey: key})
-	if err != nil {
-		return fmt.Errorf("failed to store recovery key: %w", err)
+		if cmd.Flags().Changed("local") {
+			target.LocalEnabled = opts.local
+		}
+		if cmd.Flags().Changed("s3") {
+			target.S3Enabled = opts.s3
+		}
+		if cmd.Flags().Changed("s3-destination") {
+			resolved, _, resolveErr := s3DestinationRef.Resolve(cmd.Context(), c, opts.s3Destination, cmdutil.AllowPrompt(cmd))
+			if resolveErr != nil {
+				return req, resolveErr
+			}
+			target.S3DestinationID = resolved.ID
+			if !cmd.Flags().Changed("s3") {
+				target.S3Enabled = true
+			}
+		}
 	}
-	return nil
-}
 
-func init() {
-	BackupsCmd.AddCommand(listCmd)
-	BackupsCmd.AddCommand(createCmd)
-	BackupsCmd.AddCommand(deleteCmd)
-	BackupsCmd.AddCommand(restoreCmd)
-	BackupsCmd.AddCommand(uploadCmd)
-	BackupsCmd.AddCommand(discoverCmd)
-	BackupsCmd.AddCommand(policiesCmd)
-	BackupsCmd.AddCommand(recoveryKeyCmd)
-
-	policiesCmd.AddCommand(policiesUpdateCmd)
-	recoveryKeyCmd.AddCommand(recoveryKeyGenerateCmd)
-	recoveryKeyCmd.AddCommand(recoveryKeySetCmd)
-
-	listCmd.Flags().IntVarP(&limitFlag, "limit", "n", 20, "Number of backups to show")
-	listCmd.Flags().IntVar(&startFlag, "start", 0, cmdutil.StartFlagUsage)
-	listCmd.Flags().BoolVarP(&allFlag, "all", "a", false, cmdutil.AllFlagUsage)
-	listCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
-
-	createCmd.Flags().StringVar(&createDestination, "destination", "", "Backup destination: local, s3, or local_s3 (inferred from --local/--s3-destination when omitted)")
-	createCmd.Flags().StringVar(&createS3Destination, "s3-destination", "", "S3 destination name or ID")
-	createCmd.Flags().BoolVar(&createLocal, "local", false, "Also keep a local copy when backing up to S3")
-	createCmd.Flags().StringVar(&createRecoveryKey, "recovery-key", "", "Recovery key used to encrypt the backup")
-	createCmd.Flags().StringVar(&createPolicyID, "policy", "", "Backup policy ID to associate with the run")
-	createCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
-
-	deleteCmd.Flags().StringVar(&deleteRecoveryKey, "recovery-key", "", "Recovery key (required to delete remote snapshots)")
-	deleteCmd.Flags().BoolVarP(&forceFlag, "force", "f", false, "Delete without confirmation")
-	deleteCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
-
-	restoreCmd.Flags().StringVar(&restoreRecoveryKey, "recovery-key", "", "Recovery key the backup was encrypted with (prompted for when omitted)")
-	restoreCmd.Flags().BoolVarP(&forceFlag, "force", "f", false, "Restore without confirmation")
-	restoreCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
-
-	uploadCmd.Flags().StringVar(&uploadS3Destination, "s3-destination", "", "S3 destination name or ID to upload to")
-	uploadCmd.Flags().StringVar(&uploadRecoveryKey, "recovery-key", "", "Recovery key the backup was encrypted with")
-	uploadCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
-	_ = uploadCmd.MarkFlagRequired("s3-destination")
-
-	discoverCmd.Flags().StringVar(&discoverS3Destination, "s3-destination", "", "S3 destination name or ID to search")
-	discoverCmd.Flags().StringVar(&discoverRecoveryKey, "recovery-key", "", "Recovery key the backups were encrypted with")
-	discoverCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
-	_ = discoverCmd.MarkFlagRequired("s3-destination")
-
-	policiesCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
-
-	policiesUpdateCmd.Flags().StringVar(&policiesUpdateFile, "file", "", "JSON file with the full policies payload (use - for stdin); replaces all policies")
-	policiesUpdateCmd.Flags().StringVar(&policiesUpdateID, "policy-id", "", "Policy ID to update (defaults to the sole policy)")
-	policiesUpdateCmd.Flags().BoolVar(&policiesUpdateEnabled, "enabled", false, "Enable the policy")
-	policiesUpdateCmd.Flags().BoolVar(&policiesUpdateDisabled, "disabled", false, "Disable the policy")
-	policiesUpdateCmd.Flags().StringVar(&policiesUpdateSchedule, "schedule", "", "Cron schedule for automatic backups")
-	policiesUpdateCmd.Flags().IntVar(&policiesUpdateRetention, "retention", 0, "Number of backups to retain")
-	policiesUpdateCmd.Flags().BoolVar(&policiesUpdateLocal, "local", false, "Store backups in the local repository")
-	policiesUpdateCmd.Flags().BoolVar(&policiesUpdateS3, "s3", false, "Store backups in the S3 destination")
-	policiesUpdateCmd.Flags().StringVar(&policiesUpdateS3Destination, "s3-destination", "", "S3 destination name or ID (implies --s3)")
-	policiesUpdateCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
-	policiesUpdateCmd.MarkFlagsMutuallyExclusive("enabled", "disabled")
-
-	recoveryKeyGenerateCmd.Flags().BoolVar(&generateSave, "save", false, "Store the generated recovery key on the server")
-	recoveryKeyGenerateCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
-
-	recoveryKeySetCmd.Flags().StringVar(&setRecoveryKey, "recovery-key", "", "Recovery key to store (prompted for when omitted)")
-	recoveryKeySetCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
+	return req, nil
 }

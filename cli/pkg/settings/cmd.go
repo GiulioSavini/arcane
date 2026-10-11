@@ -14,76 +14,92 @@ import (
 	"github.com/getarcaneapp/arcane/cli/v2/internal/types"
 )
 
-var jsonOutput bool
-
-// SettingsCmd is the parent command for settings operations
-var SettingsCmd = &cobra.Command{
-	Use:     "settings",
-	Aliases: []string{"setting"},
-	Short:   "Manage settings",
+// Command is the parent command for settings operations
+func Command() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:     "settings",
+		Aliases: []string{"setting"},
+		Short:   "Manage settings",
+	}
+	cmdutil.SetScope(cmdutil.ScopeRead, cmd)
+	cmd.AddCommand(newListCmd(), newUpdateCmd(), newPublicCmd())
+	return cmd
 }
 
-var listCmd = &cobra.Command{
-	Use:          "list",
-	Aliases:      []string{"ls"},
-	Short:        "List environment settings",
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		return runSettingsList(cmd, settingsListConfig{
-			endpoint:       types.Settings,
-			failureMessage: "failed to get settings",
-			totalLabel:     "settings",
-		})
-	},
+func newListCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:          "list",
+		Aliases:      []string{"ls"},
+		Short:        "List environment settings",
+		SilenceUsage: true,
+		Args:         cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runSettingsList(cmd, settingsListConfig{
+				endpoint:       types.Settings,
+				failureMessage: "failed to get settings",
+				totalLabel:     "settings",
+			})
+		},
+	}
 }
 
-var settingsUpdateFile string
+func newUpdateCmd() *cobra.Command {
+	var opts struct {
+		file string
+	}
+	cmd := &cobra.Command{
+		Use:          "update",
+		Short:        "Update environment settings",
+		SilenceUsage: true,
+		Args:         cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := cmdutil.ClientFromCommand(cmd)
+			if err != nil {
+				return err
+			}
 
-var updateCmd = &cobra.Command{
-	Use:          "update",
-	Short:        "Update environment settings",
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := cmdutil.ClientFromCommand(cmd)
-		if err != nil {
-			return err
-		}
+			data, err := os.ReadFile(opts.file)
+			if err != nil {
+				return fmt.Errorf("failed to read file %s: %w", opts.file, err)
+			}
 
-		data, err := os.ReadFile(settingsUpdateFile)
-		if err != nil {
-			return fmt.Errorf("failed to read file %s: %w", settingsUpdateFile, err)
-		}
+			var req settings.Update
+			if unmarshalErr := json.Unmarshal(data, &req); unmarshalErr != nil {
+				return fmt.Errorf("failed to parse settings file: %w", unmarshalErr)
+			}
 
-		var req settings.Update
-		if unmarshalErr := json.Unmarshal(data, &req); unmarshalErr != nil {
-			return fmt.Errorf("failed to parse settings file: %w", unmarshalErr)
-		}
-
-		result, err := c.PutJSON[[]settings.SettingDto](cmd.Context(), types.Settings(c.EnvID()), req)
-		if err != nil {
-			return fmt.Errorf("failed to update settings: %w", err)
-		}
-
-		if jsonOutput {
-			return cmdutil.PrintJSON(result.Data)
-		}
-
-		output.Success("Settings updated successfully")
-		return nil
-	},
+			return cmdutil.Run(cmd, c, cmdutil.Spec[[]settings.SettingDto]{
+				Method:         http.MethodPut,
+				Path:           types.Settings(c.EnvID()),
+				Body:           req,
+				FailureMessage: "failed to update settings",
+				Render: func([]settings.SettingDto) error {
+					output.Success("Settings updated successfully")
+					return nil
+				},
+			})
+		},
+	}
+	cmdutil.SetScope(cmdutil.ScopeFleet, cmd)
+	cmd.Flags().StringVarP(&opts.file, "file", "f", "", "Settings JSON file")
+	_ = cmd.MarkFlagRequired("file")
+	return cmd
 }
 
-var publicCmd = &cobra.Command{
-	Use:          "public",
-	Short:        "List public settings",
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		return runSettingsList(cmd, settingsListConfig{
-			endpoint:       types.SettingsPublic,
-			failureMessage: "failed to get public settings",
-			totalLabel:     "public settings",
-		})
-	},
+func newPublicCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:          "public",
+		Short:        "List public settings",
+		SilenceUsage: true,
+		Args:         cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runSettingsList(cmd, settingsListConfig{
+				endpoint:       types.SettingsPublic,
+				failureMessage: "failed to get public settings",
+				totalLabel:     "public settings",
+			})
+		},
+	}
 }
 
 type settingsListConfig struct {
@@ -103,7 +119,7 @@ func runSettingsList(cmd *cobra.Command, cfg settingsListConfig) error {
 		return fmt.Errorf("%s: %w", cfg.failureMessage, err)
 	}
 
-	if jsonOutput {
+	if cmdutil.JSONOutputEnabled(cmd) {
 		return cmdutil.PrintJSON(result)
 	}
 
@@ -113,24 +129,5 @@ func runSettingsList(cmd *cobra.Command, cfg settingsListConfig) error {
 		rows[i] = []string{s.Key, s.Type, s.Value}
 	}
 
-	if tableErr := cmdutil.PrintTable(cmd, headers, rows, cmdutil.TableSummary{Resource: cfg.totalLabel}); tableErr != nil {
-		return tableErr
-	}
-	return nil
-}
-
-func init() {
-	cmdutil.SetScope(cmdutil.ScopeRead, SettingsCmd)
-	cmdutil.SetScope(cmdutil.ScopeFleet, updateCmd)
-	SettingsCmd.AddCommand(listCmd)
-	SettingsCmd.AddCommand(updateCmd)
-	SettingsCmd.AddCommand(publicCmd)
-
-	listCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
-
-	updateCmd.Flags().StringVarP(&settingsUpdateFile, "file", "f", "", "Settings JSON file")
-	updateCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
-	_ = updateCmd.MarkFlagRequired("file")
-
-	publicCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
+	return cmdutil.PrintTable(cmd, headers, rows, cmdutil.TableSummary{Resource: cfg.totalLabel})
 }

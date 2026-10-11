@@ -107,10 +107,10 @@ func TestTemplatesListAllRejectsExplicitPaginationFlags(t *testing.T) {
 	require.Error(t, err,
 		"expected command error, got nil")
 
-	require.Contains(t, err.Error(), "--all cannot be combined with explicit pagination flags",
+	require.Contains(t, err.Error(), "flags --all and --limit cannot be used together",
 		"unexpected error: %v", err)
 
-	require.Contains(t, errOut, "--all cannot be combined with explicit pagination flags",
+	require.Contains(t, errOut, "flags --all and --limit cannot be used together",
 		"unexpected stderr output: %s", errOut)
 
 	mu.Lock()

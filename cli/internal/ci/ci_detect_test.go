@@ -10,7 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestDetectFederatedTokenFromGitHubActionsInternal(t *testing.T) {
+func TestDetectFederatedTokenFromGitHubActions(t *testing.T) {
 	t.Parallel()
 
 	var gotAudience string
@@ -26,7 +26,7 @@ func TestDetectFederatedTokenFromGitHubActionsInternal(t *testing.T) {
 		"ACTIONS_ID_TOKEN_REQUEST_URL":   server.URL + "?api-version=2",
 		"ACTIONS_ID_TOKEN_REQUEST_TOKEN": "request-token",
 	}
-	token, provider, err := DetectToken(t.Context(), "auto", "https://arcane.example.com", envGetterFromMapInternal(env), server.Client())
+	token, provider, err := DetectToken(t.Context(), "auto", "https://arcane.example.com", envGetterFromMap(env), server.Client())
 
 	require.NoError(t, err)
 	require.Equal(t, "github.jwt", token)
@@ -35,10 +35,10 @@ func TestDetectFederatedTokenFromGitHubActionsInternal(t *testing.T) {
 	require.Equal(t, "Bearer request-token", gotAuth)
 }
 
-func TestDetectFederatedTokenFromGitLabLegacyInternal(t *testing.T) {
+func TestDetectFederatedTokenFromGitLabLegacy(t *testing.T) {
 	t.Parallel()
 
-	token, provider, err := DetectToken(t.Context(), "auto", "https://arcane.example.com", envGetterFromMapInternal(map[string]string{
+	token, provider, err := DetectToken(t.Context(), "auto", "https://arcane.example.com", envGetterFromMap(map[string]string{
 		"CI_JOB_JWT_V2": "gitlab.jwt",
 	}), http.DefaultClient)
 
@@ -47,17 +47,17 @@ func TestDetectFederatedTokenFromGitLabLegacyInternal(t *testing.T) {
 	require.Equal(t, "gitlab", provider)
 }
 
-func TestDetectFederatedTokenProviderMismatchInternal(t *testing.T) {
+func TestDetectFederatedTokenProviderMismatch(t *testing.T) {
 	t.Parallel()
 
-	_, _, err := DetectToken(t.Context(), "github", "aud", envGetterFromMapInternal(map[string]string{
+	_, _, err := DetectToken(t.Context(), "github", "aud", envGetterFromMap(map[string]string{
 		"CI_JOB_JWT_V2": "gitlab.jwt",
 	}), http.DefaultClient)
 
 	require.Error(t, err)
 }
 
-func envGetterFromMapInternal(values map[string]string) func(string) string {
+func envGetterFromMap(values map[string]string) func(string) string {
 	return func(key string) string {
 		return values[key]
 	}

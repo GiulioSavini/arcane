@@ -68,14 +68,14 @@ func (h *EventHandler) ListEvents(ctx context.Context, input *ListEventsInput) (
 }
 
 // GetEventStats returns global event counts grouped by severity.
-func (h *EventHandler) GetEventStats(ctx context.Context, _ *GetEventStatsInput) (*handlerutil.Out[EventSeverityCounts], error) {
+func (h *EventHandler) GetEventStats(ctx context.Context, _ *GetEventStatsInput) (*handlerutil.Out[event.SeverityCounts], error) {
 	counts, err := h.eventService.GetEventSeverityCounts(ctx)
 	if err != nil {
 		return nil, huma.Error500InternalServerError("Failed to load event statistics: " + err.Error())
 	}
 
-	return &handlerutil.Out[EventSeverityCounts]{
-		Body: base.ApiResponse[EventSeverityCounts]{
+	return &handlerutil.Out[event.SeverityCounts]{
+		Body: base.ApiResponse[event.SeverityCounts]{
 			Success: true,
 			Data:    counts,
 		},

@@ -1,11 +1,13 @@
 package doctor
 
 import (
+	"cmp"
 	"errors"
-	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/spf13/cobra"
+	kit "go.getarcane.app/kit/pkg"
 
 	"github.com/getarcaneapp/arcane/cli/v2/internal/cmdutil"
 	"github.com/getarcaneapp/arcane/cli/v2/internal/config"
@@ -24,113 +26,94 @@ type report struct {
 	Checks  []checkResult `json:"checks"`
 }
 
-var jsonOutput bool
-
-// DoctorCmd runs environment and connection diagnostics.
-var DoctorCmd = &cobra.Command{
-	Use:          "doctor",
-	Short:        "Run CLI diagnostics",
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		app, ok := runtime.From(cmd.Context())
-		if !ok {
-			created, err := runtime.New(runtime.Options{})
-			if err != nil {
-				return err
+// Command runs environment and connection diagnostics.
+func Command() *cobra.Command {
+	return &cobra.Command{
+		Use:          "doctor",
+		Short:        "Run CLI diagnostics",
+		SilenceUsage: true,
+		Args:         cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			app, ok := runtime.From(cmd.Context())
+			if !ok {
+				created, err := runtime.New(runtime.Options{})
+				if err != nil {
+					return err
+				}
+				app = created
 			}
-			app = created
-		}
 
-		cfg := app.Config()
-		if cfg == nil {
-			return errors.New("configuration unavailable")
-		}
+			cfg := app.Config()
+			if cfg == nil {
+				return errors.New("configuration unavailable")
+			}
 
-		rep := report{Healthy: true}
-		path, _ := config.ConfigPath()
-		rep.Checks = append(rep.Checks, checkResult{
-			Name:    "config_path",
-			Status:  "ok",
-			Details: path,
-		})
+			path, _ := config.ConfigPath()
+			env := cmp.Or(app.EnvID(), cfg.DefaultEnvironment)
+			if strings.TrimSpace(env) == "" {
+				env = "0"
+			}
+			serverConfigured, hasAuth := strings.TrimSpace(cfg.ServerURL) != "", cfg.HasAuth()
+			checks := []checkResult{
+				{Name: "config_path", Status: "ok", Details: path},
+				{
+					Name:    "server_url",
+					Status:  kit.Ternary(serverConfigured, "ok", "fail"),
+					Details: kit.Ternary(serverConfigured, cfg.ServerURL, "server_url is not configured (run `arcane config set server-url <url>`)"),
+				},
+				{Name: "environment", Status: "ok", Details: env},
+				{
+					Name:    "auth",
+					Status:  kit.Ternary(hasAuth, "ok", "fail"),
+					Details: kit.Ternary(hasAuth, "credentials configured", "authentication is not configured (run `arcane config set api-key ...` or `arcane auth login`)"),
+				},
+			}
 
-		if strings.TrimSpace(cfg.ServerURL) == "" {
-			rep.Healthy = false
-			rep.Checks = append(rep.Checks, checkResult{
-				Name:    "server_url",
-				Status:  "fail",
-				Details: "server_url is not configured (run `arcane config set server-url <url>`)",
-			})
-		} else {
-			rep.Checks = append(rep.Checks, checkResult{Name: "server_url", Status: "ok", Details: cfg.ServerURL})
-		}
-
-		env := cfg.DefaultEnvironment
-		if app.EnvID() != "" {
-			env = app.EnvID()
-		}
-		if strings.TrimSpace(env) == "" {
-			env = "0"
-		}
-		rep.Checks = append(rep.Checks, checkResult{Name: "environment", Status: "ok", Details: env})
-
-		if cfg.HasAuth() {
-			rep.Checks = append(rep.Checks, checkResult{Name: "auth", Status: "ok", Details: "credentials configured"})
-		} else {
-			rep.Healthy = false
-			rep.Checks = append(rep.Checks, checkResult{
-				Name:    "auth",
-				Status:  "fail",
-				Details: "authentication is not configured (run `arcane config set api-key ...` or `arcane auth login`)",
-			})
-		}
-
-		if strings.TrimSpace(cfg.ServerURL) != "" && cfg.HasAuth() {
-			c, err := app.Client()
-			if err != nil {
-				rep.Healthy = false
-				rep.Checks = append(rep.Checks, checkResult{Name: "api_connection", Status: "fail", Details: err.Error()})
-			} else {
-				if testConnectionErr := c.TestConnection(cmd.Context()); testConnectionErr != nil {
-					rep.Healthy = false
-					rep.Checks = append(rep.Checks, checkResult{Name: "api_connection", Status: "fail", Details: testConnectionErr.Error()})
+			switch {
+			case !serverConfigured:
+				checks = append(checks, checkResult{Name: "api_connection", Status: "skip", Details: "server_url missing"})
+			case !hasAuth:
+				checks = append(checks, checkResult{Name: "api_connection", Status: "skip", Details: "auth missing"})
+			default:
+				c, err := app.Client()
+				if err == nil {
+					err = c.TestConnection(cmd.Context())
+				}
+				if err != nil {
+					checks = append(checks, checkResult{Name: "api_connection", Status: "fail", Details: err.Error()})
 				} else {
-					rep.Checks = append(rep.Checks, checkResult{Name: "api_connection", Status: "ok", Details: "connected"})
+					checks = append(checks, checkResult{Name: "api_connection", Status: "ok", Details: "connected"})
 				}
 			}
-		} else if strings.TrimSpace(cfg.ServerURL) == "" {
-			rep.Checks = append(rep.Checks, checkResult{Name: "api_connection", Status: "skip", Details: "server_url missing"})
-		} else {
-			rep.Checks = append(rep.Checks, checkResult{Name: "api_connection", Status: "skip", Details: "auth missing"})
-		}
+			rep := report{
+				Healthy: !slices.ContainsFunc(checks, func(item checkResult) bool { return item.Status == "fail" }),
+				Checks:  checks,
+			}
 
-		if jsonOutput || app.IsJSON() {
-			if err := cmdutil.PrintJSON(rep); err != nil {
-				return fmt.Errorf("failed to marshal doctor output: %w", err)
-			}
-		} else {
-			output.Header("Arcane CLI Diagnostics")
-			rows := make([][]string, 0, len(rep.Checks))
-			for _, item := range rep.Checks {
-				rows = append(rows, []string{item.Name, item.Status, item.Details})
-			}
-			if tableErr := output.Table([]string{"CHECK", "STATUS", "DETAILS"}, rows); tableErr != nil {
-				return tableErr
-			}
-			if rep.Healthy {
-				output.Success("Doctor checks passed")
+			if cmdutil.JSONOutputEnabled(cmd) {
+				if printErr := cmdutil.PrintJSON(rep); printErr != nil {
+					return printErr
+				}
 			} else {
-				output.Warning("Doctor found issues")
+				output.Header("Arcane CLI Diagnostics")
+				rows := make([][]string, len(rep.Checks))
+				for i, item := range rep.Checks {
+					rows[i] = []string{item.Name, item.Status, item.Details}
+				}
+				if tableErr := output.Table([]string{"CHECK", "STATUS", "DETAILS"}, rows); tableErr != nil {
+					return tableErr
+				}
+				if rep.Healthy {
+					output.Success("Doctor checks passed")
+				} else {
+					output.Warning("Doctor found issues")
+				}
 			}
-		}
 
-		if !rep.Healthy {
-			return errors.New("diagnostics failed")
-		}
-		return nil
-	},
-}
-
-func init() {
-	DoctorCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
+			if !rep.Healthy {
+				return errors.New("diagnostics failed")
+			}
+			return nil
+		},
+	}
 }

@@ -1,36 +1,16 @@
-// Package logger provides logging configuration and access for the CLI.
-//
-// This package wraps charmbracelet/log to provide consistent logging across
-// the CLI. It supports configurable log levels and JSON output format for
-// machine parsing.
-//
-// # Setup
-//
-// Call Setup early in the application lifecycle:
-//
-//	log.Setup(cmd.ErrOrStderr(), "debug", false) // debug level, text format
-//	log.Setup(cmd.ErrOrStderr(), "info", true)   // info level, JSON format
-//
-// # Usage
-//
-//	log := logger.GetLogger()
-//	log.Debug("detailed information")
-//	log.Info("general information")
-//	log.Error("error occurred")
+// Package logger configures shared CLI logging.
 package logger
 
 import (
 	"io"
 
 	charmlog "charm.land/log/v2"
+	kit "go.getarcane.app/kit/pkg"
 
 	"github.com/getarcaneapp/arcane/cli/v2/internal/output"
 )
 
-// Setup configures the global logger with the specified level and format.
-// Valid log levels are: debug, info, warn, error, fatal.
-// If an invalid level is provided, it defaults to info.
-// When jsonFormat is true, logs are output as JSON for machine parsing.
+// Setup configures the global logger level and format, defaulting invalid levels to info.
 func Setup(w io.Writer, level string, jsonFormat bool) {
 	lvl, err := charmlog.ParseLevel(level)
 	if err != nil {
@@ -42,11 +22,7 @@ func Setup(w io.Writer, level string, jsonFormat bool) {
 	log.SetOutput(output.CoordinatedWriter(w))
 	log.SetReportTimestamp(true)
 
-	if jsonFormat {
-		log.SetFormatter(charmlog.JSONFormatter)
-	} else {
-		log.SetFormatter(charmlog.TextFormatter)
-	}
+	log.SetFormatter(kit.Ternary(jsonFormat, charmlog.JSONFormatter, charmlog.TextFormatter))
 }
 
 // GetLogger returns the global logger instance.

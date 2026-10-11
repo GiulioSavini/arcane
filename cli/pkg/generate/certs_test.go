@@ -13,13 +13,13 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	gen "github.com/getarcaneapp/arcane/cli/v2/pkg/generate"
+	"github.com/getarcaneapp/arcane/cli/v2/pkg/generate"
 )
 
 func TestGenerateMTLSCommandWritesMLDSA87Assets(t *testing.T) {
 	outDir := t.TempDir()
 
-	cmd := gen.GenerateCmd
+	cmd := generate.Command()
 	cmd.SetArgs([]string{"mtls", "--out-dir", outDir, "--env-id", "env-123", "--app-url", "https://manager.example.com"})
 
 	_, err := captureOutput(func() error {
@@ -42,7 +42,7 @@ func TestGenerateMTLSCommandWritesMLDSA87Assets(t *testing.T) {
 func TestGenerateTLSCommandWritesECDSAP384ServerCert(t *testing.T) {
 	outDir := t.TempDir()
 
-	cmd := gen.GenerateCmd
+	cmd := generate.Command()
 	cmd.SetArgs([]string{"tls", "--out-dir", outDir, "--common-name", "localhost", "--host", "localhost", "--host", "127.0.0.1", "--cert-name", "local-manager.crt", "--key-name", "local-manager.key"})
 
 	_, err := captureOutput(func() error {
@@ -56,8 +56,8 @@ func TestGenerateTLSCommandWritesECDSAP384ServerCert(t *testing.T) {
 	assertECDSAP384PrivateKey(t, filepath.Join(outDir, "local-manager.key"))
 	cert := assertECDSAP384Certificate(t, filepath.Join(outDir, "local-manager.crt"))
 
-	require.False(t, len(cert.DNSNames) == 0 || cert.DNSNames[0] != "localhost",
-		"expected localhost DNS SAN, got %v", cert.DNSNames)
+	require.Equal(t, []string{"localhost"}, cert.DNSNames,
+		"expected only localhost DNS SAN, got %v", cert.DNSNames)
 
 	require.False(t, len(cert.IPAddresses) == 0 || !cert.IPAddresses[0].Equal(net.ParseIP("127.0.0.1")),
 		"expected 127.0.0.1 IP SAN, got %v", cert.IPAddresses)
@@ -66,7 +66,7 @@ func TestGenerateTLSCommandWritesECDSAP384ServerCert(t *testing.T) {
 func TestGenerateTLSCommandOverwritesCertificateAtomically(t *testing.T) {
 	outDir := t.TempDir()
 
-	cmd := gen.GenerateCmd
+	cmd := generate.Command()
 	cmd.SetArgs([]string{"tls", "--out-dir", outDir, "--common-name", "localhost", "--host", "localhost", "--cert-name", "server.crt", "--key-name", "server.key"})
 	_, err := captureOutput(func() error {
 		_, err := cmd.ExecuteC()
@@ -78,11 +78,13 @@ func TestGenerateTLSCommandOverwritesCertificateAtomically(t *testing.T) {
 
 	certPath := filepath.Join(outDir, "server.crt")
 	keyPath := filepath.Join(outDir, "server.key")
+	require.Equal(t, []string{"localhost"}, assertECDSAP384Certificate(t, certPath).DNSNames)
 	firstCert, err := os.ReadFile(certPath)
 
 	require.NoError(t, err,
 		"failed to read first cert: %v", err)
 
+	cmd = generate.Command()
 	cmd.SetArgs([]string{"tls", "--out-dir", outDir, "--common-name", "localhost", "--host", "localhost", "--cert-name", "server.crt", "--key-name", "server.key"})
 	_, err = captureOutput(func() error {
 		_, executeCErr := cmd.ExecuteC()
@@ -100,7 +102,7 @@ func TestGenerateTLSCommandOverwritesCertificateAtomically(t *testing.T) {
 	require.NotEqual(t, string(secondCert), string(firstCert),
 		"expected certificate to be replaced on second generation")
 
-	assertECDSAP384Certificate(t, certPath)
+	require.Equal(t, []string{"localhost"}, assertECDSAP384Certificate(t, certPath).DNSNames)
 	assertECDSAP384PrivateKey(t, keyPath)
 
 	tmpFiles, err := filepath.Glob(filepath.Join(outDir, "*.tmp-*"))

@@ -2,160 +2,138 @@ package events
 
 import (
 	"fmt"
+	"net/http"
 
-	"github.com/getarcaneapp/arcane/types/v2/base"
 	"github.com/getarcaneapp/arcane/types/v2/event"
 	"github.com/spf13/cobra"
+	"go.getarcane.app/kit/pkg"
 
 	"github.com/getarcaneapp/arcane/cli/v2/internal/cmdutil"
 	"github.com/getarcaneapp/arcane/cli/v2/internal/output"
 	"github.com/getarcaneapp/arcane/cli/v2/internal/types"
 )
 
-var (
-	limitFlag   int
-	startFlag   int
-	allFlag     bool
-	forceFlag   bool
-	jsonOutput  bool
-	envOnlyFlag bool
-)
-
-// EventsCmd is the parent command for event operations
-var EventsCmd = &cobra.Command{
-	Use:     "events",
-	Aliases: []string{"event", "evt"},
-	Short:   "Manage events",
+// Command is the parent command for event operations
+func Command() *cobra.Command {
+	command := &cobra.Command{
+		Use:     "events",
+		Aliases: []string{"event", "evt"},
+		Short:   "Manage events",
+	}
+	command.AddCommand(newListCmd())
+	command.AddCommand(newDeleteCmd())
+	command.AddCommand(newStatsCmd())
+	return command
 }
 
-var listCmd = &cobra.Command{
-	Use:          "list",
-	Aliases:      []string{"ls"},
-	Short:        "List events",
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := cmdutil.ClientFromCommand(cmd)
-		if err != nil {
-			return err
-		}
-
-		endpoint := types.Events()
-		if envOnlyFlag {
-			endpoint = types.EventsEnvironment(c.EnvID())
-		}
-
-		return cmdutil.RunList(cmd, c, cmdutil.ListSpec[event.Event]{
-			Resource: "events",
-			Endpoint: endpoint,
-			Params:   cmdutil.ListParams{Resource: "events", Limit: limitFlag, FallbackDefault: 20, Start: startFlag, All: allFlag},
-			JSON:     jsonOutput,
-			Headers:  []string{"ID", "TYPE", "RESOURCE", "USER", "TIMESTAMP"},
-			Row: func(evt event.Event) []string {
-				resource := ""
-				if evt.ResourceName != nil && evt.ResourceType != nil {
-					resource = fmt.Sprintf("%s (%s)", *evt.ResourceName, *evt.ResourceType)
-				}
-				username := ""
-				if evt.Username != nil {
-					username = *evt.Username
-				}
-				return []string{
-					evt.ID,
-					evt.Type,
-					resource,
-					username,
-					evt.Timestamp.String(),
-				}
-			},
-		})
-	},
-}
-
-var deleteCmd = &cobra.Command{
-	Use:          "delete <event-id>",
-	Aliases:      []string{"rm", "remove"},
-	Short:        "Delete event",
-	Args:         cobra.ExactArgs(1),
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		if !forceFlag {
-			confirmed, err := cmdutil.Confirm(cmd, fmt.Sprintf("Are you sure you want to delete event %s?", args[0]))
+func newListCmd() *cobra.Command {
+	var opts struct {
+		limit   int
+		start   int
+		all     bool
+		envOnly bool
+	}
+	command := &cobra.Command{
+		Use:          "list",
+		Aliases:      []string{"ls"},
+		Short:        "List events",
+		SilenceUsage: true,
+		Args:         cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := cmdutil.ClientFromCommand(cmd)
 			if err != nil {
 				return err
 			}
-			if !confirmed {
-				_, _ = fmt.Fprintln(output.Stdout(), "Cancelled")
-				return nil
+
+			endpoint := types.Events()
+			if opts.envOnly {
+				endpoint = types.EventsEnvironment(c.EnvID())
 			}
-		}
 
-		c, err := cmdutil.ClientFromCommand(cmd)
-		if err != nil {
-			return err
-		}
-
-		if _, deleteEventErr := c.DeleteJSON[base.MessageResponse](cmd.Context(), types.Event(args[0])); deleteEventErr != nil {
-			return fmt.Errorf("failed to delete event: %w", deleteEventErr)
-		}
-
-		output.Success("Event deleted successfully")
-		return nil
-	},
+			return cmdutil.RunList(cmd, c, cmdutil.ListSpec[event.Event]{
+				Resource: "events",
+				Endpoint: endpoint,
+				Params:   cmdutil.ListParams{Resource: "events", Limit: opts.limit, FallbackDefault: 20, Start: opts.start, All: opts.all},
+				Headers:  []string{"ID", "TYPE", "RESOURCE", "USER", "TIMESTAMP"},
+				Row: func(evt event.Event) []string {
+					resource := ""
+					if evt.ResourceName != nil && evt.ResourceType != nil {
+						resource = fmt.Sprintf("%s (%s)", *evt.ResourceName, *evt.ResourceType)
+					}
+					return []string{
+						evt.ID,
+						evt.Type,
+						resource,
+						kit.FromPtr(evt.Username),
+						evt.Timestamp.String(),
+					}
+				},
+			})
+		},
+	}
+	cmdutil.SetScope(cmdutil.ScopeRead, command)
+	command.Annotations["arcane:scope-flag"] = "environment"
+	command.Flags().IntVarP(&opts.limit, "limit", "n", 20, "Number of events to show")
+	command.Flags().IntVar(&opts.start, "start", 0, cmdutil.StartFlagUsage)
+	command.Flags().BoolVarP(&opts.all, "all", "a", false, cmdutil.AllFlagUsage)
+	command.Flags().BoolVar(&opts.envOnly, "environment", false, "Only list events for the current environment")
+	return command
 }
 
-var statsCmd = &cobra.Command{
-	Use:          "stats",
-	Short:        "Show global event counts by severity",
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := cmdutil.ClientFromCommand(cmd)
-		if err != nil {
-			return err
-		}
-
-		// The severity counts DTO lives only in the backend's internal event
-		// package, so mirror its wire shape here.
-		result, err := c.GetJSON[struct {
-			Total   int64 `json:"total"`
-			Info    int64 `json:"info"`
-			Success int64 `json:"success"`
-			Warning int64 `json:"warning"`
-			Error   int64 `json:"error"`
-		}](cmd.Context(), types.EventsStats())
-		if err != nil {
-			return fmt.Errorf("failed to get event stats: %w", err)
-		}
-
-		if jsonOutput {
-			return cmdutil.PrintJSON(result.Data)
-		}
-
-		output.Header("Event Stats")
-		output.KeyValue("Total", result.Data.Total)
-		output.KeyValue("Info", result.Data.Info)
-		output.KeyValue("Success", result.Data.Success)
-		output.KeyValue("Warning", result.Data.Warning)
-		output.KeyValue("Error", result.Data.Error)
-		return nil
-	},
+func newDeleteCmd() *cobra.Command {
+	var opts struct {
+		force bool
+	}
+	command := &cobra.Command{
+		Use:          "delete <event-id>",
+		Aliases:      []string{"rm", "remove"},
+		Short:        "Delete event",
+		Args:         cobra.ExactArgs(1),
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := cmdutil.ClientFromCommand(cmd)
+			if err != nil {
+				return err
+			}
+			return cmdutil.RunDelete(cmd, c, cmdutil.DeleteSpec{
+				Force:          opts.force,
+				Prompt:         fmt.Sprintf("Are you sure you want to delete event %s?", args[0]),
+				Path:           types.Event(args[0]),
+				FailureMessage: "failed to delete event",
+				SuccessMessage: "Event deleted successfully",
+			})
+		},
+	}
+	command.Flags().BoolVarP(&opts.force, "force", "f", false, "Force deletion without confirmation")
+	return command
 }
 
-func init() {
-	cmdutil.SetScope(cmdutil.ScopeRead, listCmd)
-	listCmd.Annotations["arcane:scope-flag"] = "environment"
-	EventsCmd.AddCommand(listCmd)
-	EventsCmd.AddCommand(deleteCmd)
-	EventsCmd.AddCommand(statsCmd)
+func newStatsCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:          "stats",
+		Short:        "Show global event counts by severity",
+		SilenceUsage: true,
+		Args:         cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := cmdutil.ClientFromCommand(cmd)
+			if err != nil {
+				return err
+			}
 
-	listCmd.Flags().IntVarP(&limitFlag, "limit", "n", 20, "Number of events to show")
-	listCmd.Flags().IntVar(&startFlag, "start", 0, cmdutil.StartFlagUsage)
-	listCmd.Flags().BoolVarP(&allFlag, "all", "a", false, cmdutil.AllFlagUsage)
-	listCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
-
-	listCmd.Flags().BoolVar(&envOnlyFlag, "environment", false, "Only list events for the current environment")
-
-	deleteCmd.Flags().BoolVarP(&forceFlag, "force", "f", false, "Force deletion without confirmation")
-	deleteCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
-
-	statsCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
+			return cmdutil.Run(cmd, c, cmdutil.Spec[event.SeverityCounts]{
+				Method:         http.MethodGet,
+				Path:           types.EventsStats(),
+				FailureMessage: "failed to get event stats",
+				Render: func(data event.SeverityCounts) error {
+					output.Header("Event Stats")
+					output.KeyValue("Total", data.Total)
+					output.KeyValue("Info", data.Info)
+					output.KeyValue("Success", data.Success)
+					output.KeyValue("Warning", data.Warning)
+					output.KeyValue("Error", data.Error)
+					return nil
+				},
+			})
+		},
+	}
 }

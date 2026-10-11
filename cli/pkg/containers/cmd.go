@@ -5,8 +5,10 @@ import (
 	"encoding/json/v2"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -15,578 +17,493 @@ import (
 	"github.com/getarcaneapp/arcane/types/v2/container"
 	"github.com/getarcaneapp/arcane/types/v2/updater"
 	"github.com/spf13/cobra"
+	"go.getarcane.app/docker"
+	kit "go.getarcane.app/kit/pkg"
 
 	"github.com/getarcaneapp/arcane/cli/v2/internal/cmdutil"
 	"github.com/getarcaneapp/arcane/cli/v2/internal/output"
-	"github.com/getarcaneapp/arcane/cli/v2/internal/prompt"
 	"github.com/getarcaneapp/arcane/cli/v2/internal/types"
 )
 
-var (
-	containersLimit         int
-	containersStart         int
-	containersAll           bool
-	containersUpdatesFilter string
-	containersStandalone    string
-	containersLabelFilter   string
-	containersInclude       bool
-	containersIncludeHidden bool
-	containersDeleteVolumes bool
-	forceFlag               bool
-	jsonOutput              bool
-
-	containerCreateFile       string
-	containerCreateName       string
-	containerCreateImage      string
-	containerCreateEnv        []string
-	containerCreatePort       []string
-	containerCreateVolume     []string
-	containerCreateLabel      []string
-	containerCreateNetwork    []string
-	containerCreateRestart    string
-	containerCreateMemory     int64
-	containerCreateCPUs       float64
-	containerCreatePrivileged bool
-	containerCreateHostname   string
-	containerCreateUser       string
-	containerCreateWorkdir    string
-	containerCreateEntrypoint string
-	containerCreateCmd        string
-)
-
-// ContainersCmd is the parent command for container operations
-var ContainersCmd = &cobra.Command{
-	Use:     "containers",
-	Aliases: []string{"container", "c"},
-	Short:   "Manage containers",
+// Command builds the containers command tree.
+func Command() *cobra.Command {
+	command := &cobra.Command{
+		Annotations: map[string]string{"arcane:scope": cmdutil.ScopeResource},
+		Use:         "containers",
+		Aliases:     []string{"container", "c"},
+		Short:       "Manage containers",
+	}
+	command.AddCommand(
+		newListCmd(),
+		newUpdatesCmd(),
+		newGetCmd(),
+		newStartCmd(),
+		newStopCmd(),
+		newRestartCmd(),
+		newUpdateCmd(),
+		newRedeployCmd(),
+		newDeleteCmd(),
+		newCountsCmd(),
+		newCreateCmd(),
+		newKillCmd(),
+		newPauseCmd(),
+		newUnpauseCmd(),
+		newCommitCmd(),
+		newEditCmd(),
+		newAutoUpdateCmd(),
+	)
+	return command
 }
 
-var containersListCmd = &cobra.Command{
-	Use:          "list",
-	Aliases:      []string{"ls"},
-	Short:        "List containers",
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		return runContainersList(cmd, false)
-	},
+func newListCmd() *cobra.Command {
+	return newContainerListCmd(false)
 }
 
-var containersUpdatesCmd = &cobra.Command{
-	Use:          "updates",
-	Short:        "List containers with available updates",
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		return runContainersList(cmd, true)
-	},
-}
-
-func runContainersList(cmd *cobra.Command, forceHasUpdateFilter bool) error {
-	c, err := cmdutil.ClientFromCommand(cmd)
-	if err != nil {
-		return err
+func newContainerListCmd(updatesOnly bool) *cobra.Command {
+	var opts struct {
+		limit         int
+		start         int
+		all           bool
+		updatesFilter string
+		standalone    string
+		labelFilter   string
+		include       bool
+		includeHidden bool
 	}
-
-	query := url.Values{}
-	if containersStandalone != "" {
-		query.Set("standalone", containersStandalone)
-	}
-	if containersIncludeHidden {
-		query.Set("includeHidden", "true")
-	}
-	if containersInclude {
-		query.Set("include", "true")
-	}
-	updatesFilter := strings.TrimSpace(containersUpdatesFilter)
-	if forceHasUpdateFilter {
-		updatesFilter = "has_update"
-	}
-	if updatesFilter != "" {
-		query.Set("updates", updatesFilter)
-	}
-	if labelFilter := strings.TrimSpace(containersLabelFilter); labelFilter != "" {
-		query.Set("label", labelFilter)
-	}
-
-	spec := cmdutil.ListSpec[container.Summary]{
-		Resource: "containers",
-		Endpoint: types.Containers(c.EnvID()),
-		Params:   cmdutil.ListParams{Resource: "containers", Limit: containersLimit, FallbackDefault: 20, Start: containersStart, All: containersAll},
-		Query:    query,
-		JSON:     jsonOutput,
-		Headers:  []string{"ID", "NAME", "IMAGE", "STATE", "STATUS"},
-		Row: func(item container.Summary) []string {
-			return []string{
-				shortID(item.ID),
-				containerSummaryName(item),
-				item.Image,
-				item.State,
-				item.Status,
+	command := &cobra.Command{
+		Annotations:  map[string]string{"arcane:scope": cmdutil.ScopeRead},
+		Use:          kit.Ternary(updatesOnly, "updates", "list"),
+		Aliases:      kit.Ternary(updatesOnly, []string(nil), []string{"ls"}),
+		Short:        kit.Ternary(updatesOnly, "List containers with available updates", "List containers"),
+		SilenceUsage: true,
+		Args:         cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := cmdutil.ClientFromCommand(cmd)
+			if err != nil {
+				return err
 			}
+
+			query := url.Values{}
+			if opts.standalone != "" {
+				query.Set("standalone", opts.standalone)
+			}
+			if opts.includeHidden {
+				query.Set("includeHidden", "true")
+			}
+			if opts.include {
+				query.Set("include", "true")
+			}
+			updatesFilter := kit.Ternary(cmd.Name() == "updates", "has_update", strings.TrimSpace(opts.updatesFilter))
+			if updatesFilter != "" {
+				query.Set("updates", updatesFilter)
+			}
+			if labelFilter := strings.TrimSpace(opts.labelFilter); labelFilter != "" {
+				query.Set("label", labelFilter)
+			}
+
+			if updatesFilter != "" && !cmdutil.JSONOutputEnabled(cmd) {
+				output.Header("Container Updates")
+			}
+
+			return cmdutil.RunList(cmd, c, cmdutil.ListSpec[container.Summary]{
+				Resource: "containers",
+				Endpoint: types.Containers(c.EnvID()),
+				Params:   cmdutil.ListParams{Resource: "containers", Limit: opts.limit, FallbackDefault: 20, Start: opts.start, All: opts.all},
+				Query:    query,
+				Headers:  kit.Ternary(updatesFilter != "", []string{"ID", "NAME", "IMAGE", "STATE", "UPDATES", "LATEST"}, []string{"ID", "NAME", "IMAGE", "STATE", "STATUS"}),
+				Row: func(item container.Summary) []string {
+					if updatesFilter == "" {
+						return []string{
+							item.ID[:min(len(item.ID), 12)],
+							docker.ContainerNameFromNames(item.Names),
+							item.Image,
+							item.State,
+							item.Status,
+						}
+					}
+					status, latest := "unknown", "-"
+					if item.UpdateInfo != nil {
+						switch {
+						case item.UpdateInfo.Error != "":
+							status = "error"
+						case item.UpdateInfo.HasUpdate:
+							status = "has_update"
+						default:
+							status = "up_to_date"
+						}
+						switch {
+						case strings.TrimSpace(item.UpdateInfo.LatestVersion) != "":
+							latest = item.UpdateInfo.LatestVersion
+						case strings.TrimSpace(item.UpdateInfo.LatestDigest) != "":
+							latest = item.UpdateInfo.LatestDigest
+						}
+					}
+					return []string{
+						item.ID[:min(len(item.ID), 12)],
+						docker.ContainerNameFromNames(item.Names),
+						item.Image,
+						item.State,
+						status,
+						latest,
+					}
+				},
+			})
 		},
 	}
-	if updatesFilter != "" {
-		if !jsonOutput {
-			output.Header("Container Updates")
-		}
-		spec.Headers = []string{"ID", "NAME", "IMAGE", "STATE", "UPDATES", "LATEST"}
-		spec.Row = func(item container.Summary) []string {
-			status, latest := "unknown", "-"
-			if item.UpdateInfo != nil {
-				switch {
-				case item.UpdateInfo.Error != "":
-					status = "error"
-				case item.UpdateInfo.HasUpdate:
-					status = "has_update"
-				default:
-					status = "up_to_date"
-				}
-				if strings.TrimSpace(item.UpdateInfo.LatestVersion) != "" {
-					latest = item.UpdateInfo.LatestVersion
-				} else if strings.TrimSpace(item.UpdateInfo.LatestDigest) != "" {
-					latest = item.UpdateInfo.LatestDigest
-				}
-			}
-			return []string{
-				shortID(item.ID),
-				containerSummaryName(item),
-				item.Image,
-				item.State,
-				status,
-				latest,
-			}
-		}
+	command.Flags().IntVarP(&opts.limit, "limit", "n", 20, "Number of containers to show")
+	command.Flags().IntVar(&opts.start, "start", 0, cmdutil.StartFlagUsage)
+	command.Flags().BoolVarP(&opts.all, "all", "a", false, cmdutil.AllFlagUsage)
+	if !updatesOnly {
+		cmdutil.EnumVarP(command, command.Flags(), &opts.updatesFilter, "updates", "", "", "Filter by update status", "has_update", "up_to_date", "error", "unknown")
+		cmdutil.EnumVarP(command, command.Flags(), &opts.standalone, "standalone", "", "", "Filter standalone containers only", "true", "false")
+		command.Flags().StringVar(&opts.labelFilter, "label", "", "Filter by label (key or key=value)")
+		command.Flags().BoolVar(&opts.includeHidden, "include-hidden", false, "Include hidden containers")
+		command.Flags().BoolVar(&opts.include, "include-internal", false, "Include Arcane-internal containers")
 	}
-	return cmdutil.RunList(cmd, c, spec)
+
+	return command
 }
 
-var containersGetCmd = &cobra.Command{
-	Use:          "get <container-id|name>",
-	Short:        "Get detailed container information",
-	Args:         cobra.ExactArgs(1),
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := cmdutil.ClientFromCommand(cmd)
-		if err != nil {
-			return err
-		}
+func newUpdatesCmd() *cobra.Command {
+	return newContainerListCmd(true)
+}
 
-		allowPrompt := !jsonOutput && prompt.IsInteractive()
-		resolved, complete, err := ContainerRef.Resolve(cmd.Context(), c, args[0], allowPrompt)
-		if err != nil {
-			return err
-		}
-
-		if !complete {
-			result, getContainerErr := c.GetJSON[container.Details](cmd.Context(), types.Container(c.EnvID(), resolved.ID))
-			if getContainerErr != nil {
-				return fmt.Errorf("failed to get container: %w", getContainerErr)
+func newGetCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:          "get <container-id|name>",
+		Short:        "Get detailed container information",
+		Args:         cobra.ExactArgs(1),
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := cmdutil.ClientFromCommand(cmd)
+			if err != nil {
+				return err
 			}
-			resolved = &result.Data
-		}
 
-		if jsonOutput {
-			return cmdutil.PrintJSON(resolved)
-		}
-
-		output.Header("Container Details")
-		output.KeyValue("ID", resolved.ID)
-		output.KeyValue("Name", resolved.Name)
-		output.KeyValue("Image", resolved.Image)
-		output.KeyValue("State", fmt.Sprintf("%s (Running: %v)", resolved.State.Status, resolved.State.Running))
-		output.KeyValue("Created", resolved.Created)
-		return nil
-	},
-}
-
-var containersStartCmd = &cobra.Command{
-	Use:          "start <container-id|name>",
-	Short:        "Start a container",
-	Args:         cobra.ExactArgs(1),
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := cmdutil.ClientFromCommand(cmd)
-		if err != nil {
-			return err
-		}
-
-		resolved, _, err := ContainerRef.Resolve(cmd.Context(), c, args[0], false)
-		if err != nil {
-			return err
-		}
-
-		return cmdutil.RunPostAction[base.MessageResponse](cmd, c, cmdutil.PostActionSpec{
-			Path:           types.ContainerStart(c.EnvID(), resolved.ID),
-			FailureMessage: "failed to start container",
-			SuccessMessage: fmt.Sprintf("Container %s started successfully", containerDisplayName(resolved)),
-			JSON:           jsonOutput,
-		})
-	},
-}
-
-var containersStopCmd = &cobra.Command{
-	Use:          "stop <container-id|name>",
-	Short:        "Stop a container",
-	Args:         cobra.ExactArgs(1),
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := cmdutil.ClientFromCommand(cmd)
-		if err != nil {
-			return err
-		}
-
-		resolved, _, err := ContainerRef.Resolve(cmd.Context(), c, args[0], false)
-		if err != nil {
-			return err
-		}
-
-		return cmdutil.RunPostAction[base.MessageResponse](cmd, c, cmdutil.PostActionSpec{
-			Path:           types.ContainerStop(c.EnvID(), resolved.ID),
-			FailureMessage: "failed to stop container",
-			SuccessMessage: fmt.Sprintf("Container %s stopped successfully", containerDisplayName(resolved)),
-			JSON:           jsonOutput,
-		})
-	},
-}
-
-var containersRestartCmd = &cobra.Command{
-	Use:          "restart <container-id|name>",
-	Short:        "Restart a container",
-	Args:         cobra.ExactArgs(1),
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := cmdutil.ClientFromCommand(cmd)
-		if err != nil {
-			return err
-		}
-
-		resolved, _, err := ContainerRef.Resolve(cmd.Context(), c, args[0], false)
-		if err != nil {
-			return err
-		}
-
-		return cmdutil.RunPostAction[base.MessageResponse](cmd, c, cmdutil.PostActionSpec{
-			Path:           types.ContainerRestart(c.EnvID(), resolved.ID),
-			FailureMessage: "failed to restart container",
-			SuccessMessage: fmt.Sprintf("Container %s restarted successfully", containerDisplayName(resolved)),
-			JSON:           jsonOutput,
-		})
-	},
-}
-
-var containersUpdateCmd = &cobra.Command{
-	Use:          "update <container-id|name>",
-	Short:        "Update a container",
-	Args:         cobra.ExactArgs(1),
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := cmdutil.ClientFromCommand(cmd)
-		if err != nil {
-			return err
-		}
-
-		resolved, _, err := ContainerRef.Resolve(cmd.Context(), c, args[0], false)
-		if err != nil {
-			return err
-		}
-
-		// This route is served by the updater handler, so it answers with an
-		// updater.Result rather than a container.ActionResult.
-		return cmdutil.RunPostAction[updater.Result](cmd, c, cmdutil.PostActionSpec{
-			Path:           types.ContainerUpdate(c.EnvID(), resolved.ID),
-			FailureMessage: "failed to update container",
-			SuccessMessage: fmt.Sprintf("Container %s updated successfully", containerDisplayName(resolved)),
-			Timeout:        30 * time.Minute,
-			JSON:           jsonOutput,
-		})
-	},
-}
-
-var containersRedeployCmd = &cobra.Command{
-	Use:          "redeploy <container-id|name>",
-	Short:        "Redeploy a container (pull image and recreate)",
-	Args:         cobra.ExactArgs(1),
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := cmdutil.ClientFromCommand(cmd)
-		if err != nil {
-			return err
-		}
-
-		resolved, _, err := ContainerRef.Resolve(cmd.Context(), c, args[0], false)
-		if err != nil {
-			return err
-		}
-
-		return cmdutil.RunPostAction[container.Details](cmd, c, cmdutil.PostActionSpec{
-			Path:           types.ContainerRedeploy(c.EnvID(), resolved.ID),
-			FailureMessage: "failed to redeploy container",
-			SuccessMessage: fmt.Sprintf("Container %s redeployed successfully", containerDisplayName(resolved)),
-			Timeout:        30 * time.Minute,
-			JSON:           jsonOutput,
-		})
-	},
-}
-
-var containersDeleteCmd = &cobra.Command{
-	Use:          "delete <container-id|name>",
-	Aliases:      []string{"rm", "remove"},
-	Short:        "Delete a container",
-	Args:         cobra.ExactArgs(1),
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := cmdutil.ClientFromCommand(cmd)
-		if err != nil {
-			return err
-		}
-
-		resolved, _, err := ContainerRef.Resolve(cmd.Context(), c, args[0], false)
-		if err != nil {
-			return err
-		}
-
-		displayName := containerDisplayName(resolved)
-
-		if !forceFlag {
-			confirmed, confirmErr := cmdutil.Confirm(cmd, fmt.Sprintf("Are you sure you want to delete container %s?", displayName))
-			if confirmErr != nil {
-				return confirmErr
+			resolved, err := ContainerRef.Fetch(cmd.Context(), c, args[0], cmdutil.AllowPrompt(cmd))
+			if err != nil {
+				return err
 			}
-			if !confirmed {
-				_, _ = fmt.Fprintln(output.Stdout(), "Cancelled")
-				return nil
+
+			if cmdutil.JSONOutputEnabled(cmd) {
+				return cmdutil.PrintJSON(resolved)
 			}
-		}
 
-		query := url.Values{}
-		query.Set("force", strconv.FormatBool(forceFlag))
-		query.Set("volumes", strconv.FormatBool(containersDeleteVolumes))
-		path := types.Container(c.EnvID(), resolved.ID) + "?" + query.Encode()
-		result, err := c.DeleteJSON[base.MessageResponse](cmd.Context(), path)
-		if err != nil {
-			return fmt.Errorf("failed to delete container: %w", err)
-		}
-
-		if jsonOutput {
-			return cmdutil.PrintJSON(result.Data)
-		}
-
-		output.Success("Container %s deleted successfully", displayName)
-		return nil
-	},
-}
-
-var containersCountsCmd = &cobra.Command{
-	Use:          "counts",
-	Short:        "Get container status counts",
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := cmdutil.ClientFromCommand(cmd)
-		if err != nil {
-			return err
-		}
-
-		result, err := c.GetJSON[container.StatusCounts](cmd.Context(), types.ContainersCounts(c.EnvID()))
-		if err != nil {
-			return fmt.Errorf("failed to get container counts: %w", err)
-		}
-
-		if jsonOutput {
-			return cmdutil.PrintJSON(result.Data)
-		}
-
-		output.Header("Container Status Counts")
-		output.KeyValue("Running", result.Data.RunningContainers)
-		output.KeyValue("Stopped", result.Data.StoppedContainers)
-		output.KeyValue("Total", result.Data.TotalContainers)
-		return nil
-	},
-}
-
-var containersCreateCmd = &cobra.Command{
-	Use:          "create",
-	Short:        "Create a new container",
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := cmdutil.ClientFromCommand(cmd)
-		if err != nil {
-			return err
-		}
-
-		c.SetTimeout(30 * time.Minute)
-
-		var req container.Create
-
-		// File mode: read base config from file
-		if containerCreateFile != "" {
-			data, readFileErr := os.ReadFile(containerCreateFile)
-			if readFileErr != nil {
-				return fmt.Errorf("failed to read file %s: %w", containerCreateFile, readFileErr)
-			}
-			if unmarshalErr := json.Unmarshal(data, &req); unmarshalErr != nil {
-				return fmt.Errorf("failed to parse config file: %w", unmarshalErr)
-			}
-		}
-
-		// Flag overrides
-		if cmd.Flags().Changed("name") {
-			req.Name = containerCreateName
-		}
-		if cmd.Flags().Changed("image") {
-			req.Image = containerCreateImage
-		}
-		if cmd.Flags().Changed("env") {
-			req.Env = containerCreateEnv
-		}
-		if cmd.Flags().Changed("port") {
-			// Parse "HOST:CONTAINER" format into ports map
-			req.Ports = make(map[string]string)
-			for _, p := range containerCreatePort {
-				parts := strings.SplitN(p, ":", 2)
-				if len(parts) == 2 {
-					req.Ports[parts[1]] = parts[0]
-				}
-			}
-		}
-		if cmd.Flags().Changed("volume") {
-			req.Volumes = containerCreateVolume
-		}
-		if cmd.Flags().Changed("label") {
-			req.Labels = make(map[string]string)
-			for _, l := range containerCreateLabel {
-				parts := strings.SplitN(l, "=", 2)
-				if len(parts) == 2 {
-					req.Labels[parts[0]] = parts[1]
-				}
-			}
-		}
-		if cmd.Flags().Changed("network") {
-			req.Networks = containerCreateNetwork
-		}
-		if cmd.Flags().Changed("restart") {
-			req.RestartPolicy = containerCreateRestart
-		}
-		if cmd.Flags().Changed("memory") {
-			req.Memory = containerCreateMemory
-		}
-		if cmd.Flags().Changed("cpus") {
-			req.CPUs = containerCreateCPUs
-		}
-		if cmd.Flags().Changed("privileged") {
-			req.Privileged = containerCreatePrivileged
-		}
-		if cmd.Flags().Changed("hostname") {
-			req.Hostname = containerCreateHostname
-		}
-		if cmd.Flags().Changed("user") {
-			req.User = containerCreateUser
-		}
-		if cmd.Flags().Changed("workdir") {
-			req.WorkingDir = containerCreateWorkdir
-		}
-		if cmd.Flags().Changed("entrypoint") {
-			req.Entrypoint = []string{containerCreateEntrypoint}
-		}
-		if cmd.Flags().Changed("cmd") {
-			req.Cmd = []string{containerCreateCmd}
-		}
-
-		// Validate required fields
-		if req.Name == "" {
-			return errors.New("--name is required")
-		}
-		if req.Image == "" {
-			return errors.New("--image is required")
-		}
-
-		result, err := c.PostJSON[container.Created](cmd.Context(), types.Containers(c.EnvID()), req)
-		if err != nil {
-			return fmt.Errorf("failed to create container: %w", err)
-		}
-
-		if jsonOutput {
-			return cmdutil.PrintJSON(result.Data)
-		}
-
-		output.Success("Container %s created successfully", result.Data.Name)
-		output.KeyValue("ID", result.Data.ID)
-		output.KeyValue("Name", result.Data.Name)
-		output.KeyValue("Image", result.Data.Image)
-		output.KeyValue("Status", result.Data.Status)
-		return nil
-	},
-}
-
-func init() {
-	cmdutil.SetScope(cmdutil.ScopeResource, ContainersCmd)
-	cmdutil.SetScope(cmdutil.ScopeRead, containersListCmd, containersUpdatesCmd, containersCountsCmd)
-	cmdutil.SetScope(cmdutil.ScopeDestination, containersCreateCmd)
-	ContainersCmd.AddCommand(containersListCmd)
-	ContainersCmd.AddCommand(containersUpdatesCmd)
-	ContainersCmd.AddCommand(containersGetCmd)
-	ContainersCmd.AddCommand(containersStartCmd)
-	ContainersCmd.AddCommand(containersStopCmd)
-	ContainersCmd.AddCommand(containersRestartCmd)
-	ContainersCmd.AddCommand(containersUpdateCmd)
-	ContainersCmd.AddCommand(containersRedeployCmd)
-	ContainersCmd.AddCommand(containersDeleteCmd)
-	ContainersCmd.AddCommand(containersCountsCmd)
-	ContainersCmd.AddCommand(containersCreateCmd)
-
-	// Create command flags
-	containersCreateCmd.Flags().StringVarP(&containerCreateFile, "file", "f", "", "JSON config file for container creation")
-	containersCreateCmd.Flags().StringVar(&containerCreateName, "name", "", "Container name")
-	containersCreateCmd.Flags().StringVar(&containerCreateImage, "image", "", "Docker image")
-	containersCreateCmd.Flags().StringArrayVarP(&containerCreateEnv, "env", "e", nil, "Environment variable (KEY=VALUE)")
-	containersCreateCmd.Flags().StringArrayVarP(&containerCreatePort, "port", "p", nil, "Port mapping (HOST:CONTAINER)")
-	containersCreateCmd.Flags().StringArrayVarP(&containerCreateVolume, "volume", "v", nil, "Volume mount (SRC:DST)")
-	containersCreateCmd.Flags().StringArrayVarP(&containerCreateLabel, "label", "l", nil, "Label (KEY=VALUE)")
-	containersCreateCmd.Flags().StringArrayVar(&containerCreateNetwork, "network", nil, "Networks to connect to")
-	containersCreateCmd.Flags().StringVar(&containerCreateRestart, "restart", "", "Restart policy (no, always, unless-stopped, on-failure)")
-	containersCreateCmd.Flags().Int64Var(&containerCreateMemory, "memory", 0, "Memory limit in bytes")
-	containersCreateCmd.Flags().Float64Var(&containerCreateCPUs, "cpus", 0, "Number of CPUs")
-	containersCreateCmd.Flags().BoolVar(&containerCreatePrivileged, "privileged", false, "Run in privileged mode")
-	containersCreateCmd.Flags().StringVar(&containerCreateHostname, "hostname", "", "Container hostname")
-	containersCreateCmd.Flags().StringVar(&containerCreateUser, "user", "", "User to run as")
-	containersCreateCmd.Flags().StringVar(&containerCreateWorkdir, "workdir", "", "Working directory")
-	containersCreateCmd.Flags().StringVar(&containerCreateEntrypoint, "entrypoint", "", "Entrypoint command")
-	containersCreateCmd.Flags().StringVar(&containerCreateCmd, "cmd", "", "Command to run")
-	containersCreateCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
-
-	// List command flags
-	containersListCmd.Flags().IntVarP(&containersLimit, "limit", "n", 20, "Number of containers to show")
-	containersListCmd.Flags().IntVar(&containersStart, "start", 0, cmdutil.StartFlagUsage)
-	containersListCmd.Flags().BoolVarP(&containersAll, "all", "a", false, cmdutil.AllFlagUsage)
-	containersListCmd.Flags().StringVar(&containersUpdatesFilter, "updates", "", "Filter by update status (has_update, up_to_date, error, unknown)")
-	containersListCmd.Flags().StringVar(&containersStandalone, "standalone", "", "Filter standalone containers only (true/false)")
-	containersListCmd.Flags().StringVar(&containersLabelFilter, "label", "", "Filter by label (key or key=value)")
-	containersListCmd.Flags().BoolVar(&containersIncludeHidden, "include-hidden", false, "Include hidden containers")
-	containersListCmd.Flags().BoolVar(&containersInclude, "include-internal", false, "Include Arcane-internal containers")
-	containersListCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
-	containersUpdatesCmd.Flags().IntVarP(&containersLimit, "limit", "n", 20, "Number of containers to show")
-	containersUpdatesCmd.Flags().IntVar(&containersStart, "start", 0, cmdutil.StartFlagUsage)
-	containersUpdatesCmd.Flags().BoolVarP(&containersAll, "all", "a", false, cmdutil.AllFlagUsage)
-	containersUpdatesCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
-
-	// Delete command flags
-	containersDeleteCmd.Flags().BoolVarP(&forceFlag, "force", "f", false, "Force removal of a running container and skip the confirmation prompt")
-	containersDeleteCmd.Flags().BoolVar(&containersDeleteVolumes, "volumes", false, "Remove anonymous volumes associated with the container")
-
-	// Global JSON output flags
-	containersGetCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
-	containersStartCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
-	containersStopCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
-	containersRestartCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
-	containersUpdateCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
-	containersRedeployCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
-	containersDeleteCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
-	containersCountsCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
-}
-
-func shortID(id string) string {
-	if len(id) > 12 {
-		return id[:12]
+			output.Header("Container Details")
+			output.KeyValue("ID", resolved.ID)
+			output.KeyValue("Name", resolved.Name)
+			output.KeyValue("Image", resolved.Image)
+			output.KeyValue("State", fmt.Sprintf("%s (Running: %v)", resolved.State.Status, resolved.State.Running))
+			output.KeyValue("Created", resolved.Created)
+			return nil
+		},
 	}
-	return id
+}
+
+func newStartCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:          "start <container-id|name>",
+		Short:        "Start a container",
+		Args:         cobra.ExactArgs(1),
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := cmdutil.ClientFromCommand(cmd)
+			if err != nil {
+				return err
+			}
+
+			resolved, _, err := ContainerRef.Resolve(cmd.Context(), c, args[0], false)
+			if err != nil {
+				return err
+			}
+
+			return cmdutil.Run(cmd, c, cmdutil.Spec[base.MessageResponse]{
+				Method:         http.MethodPost,
+				Path:           types.ContainerStart(c.EnvID(), resolved.ID),
+				FailureMessage: "failed to start container",
+				Render: func(base.MessageResponse) error {
+					output.Success("Container %s started successfully", containerDisplayName(resolved))
+					return nil
+				},
+			})
+		},
+	}
+}
+
+func newStopCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:          "stop <container-id|name>",
+		Short:        "Stop a container",
+		Args:         cobra.ExactArgs(1),
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := cmdutil.ClientFromCommand(cmd)
+			if err != nil {
+				return err
+			}
+
+			resolved, _, err := ContainerRef.Resolve(cmd.Context(), c, args[0], false)
+			if err != nil {
+				return err
+			}
+
+			return cmdutil.Run(cmd, c, cmdutil.Spec[base.MessageResponse]{
+				Method:         http.MethodPost,
+				Path:           types.ContainerStop(c.EnvID(), resolved.ID),
+				FailureMessage: "failed to stop container",
+				Render: func(base.MessageResponse) error {
+					output.Success("Container %s stopped successfully", containerDisplayName(resolved))
+					return nil
+				},
+			})
+		},
+	}
+}
+
+func newRestartCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:          "restart <container-id|name>",
+		Short:        "Restart a container",
+		Args:         cobra.ExactArgs(1),
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := cmdutil.ClientFromCommand(cmd)
+			if err != nil {
+				return err
+			}
+
+			resolved, _, err := ContainerRef.Resolve(cmd.Context(), c, args[0], false)
+			if err != nil {
+				return err
+			}
+
+			return cmdutil.Run(cmd, c, cmdutil.Spec[base.MessageResponse]{
+				Method:         http.MethodPost,
+				Path:           types.ContainerRestart(c.EnvID(), resolved.ID),
+				FailureMessage: "failed to restart container",
+				Render: func(base.MessageResponse) error {
+					output.Success("Container %s restarted successfully", containerDisplayName(resolved))
+					return nil
+				},
+			})
+		},
+	}
+}
+
+func newUpdateCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:          "update <container-id|name>",
+		Short:        "Update a container",
+		Args:         cobra.ExactArgs(1),
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := cmdutil.ClientFromCommand(cmd)
+			if err != nil {
+				return err
+			}
+
+			resolved, _, err := ContainerRef.Resolve(cmd.Context(), c, args[0], false)
+			if err != nil {
+				return err
+			}
+
+			// This route is served by the updater handler, so it answers with an
+			// updater.Result rather than a container.ActionResult.
+			return cmdutil.Run(cmd, c, cmdutil.Spec[updater.Result]{
+				Method:         http.MethodPost,
+				Path:           types.ContainerUpdate(c.EnvID(), resolved.ID),
+				FailureMessage: "failed to update container",
+				Render: func(updater.Result) error {
+					output.Success("Container %s updated successfully", containerDisplayName(resolved))
+					return nil
+				},
+				Timeout: 30 * time.Minute,
+			})
+		},
+	}
+}
+
+func newRedeployCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:          "redeploy <container-id|name>",
+		Short:        "Redeploy a container (pull image and recreate)",
+		Args:         cobra.ExactArgs(1),
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := cmdutil.ClientFromCommand(cmd)
+			if err != nil {
+				return err
+			}
+
+			resolved, _, err := ContainerRef.Resolve(cmd.Context(), c, args[0], false)
+			if err != nil {
+				return err
+			}
+
+			return cmdutil.Run(cmd, c, cmdutil.Spec[container.Details]{
+				Method:         http.MethodPost,
+				Path:           types.ContainerRedeploy(c.EnvID(), resolved.ID),
+				FailureMessage: "failed to redeploy container",
+				Render: func(container.Details) error {
+					output.Success("Container %s redeployed successfully", containerDisplayName(resolved))
+					return nil
+				},
+				Timeout: 30 * time.Minute,
+			})
+		},
+	}
+}
+
+func newDeleteCmd() *cobra.Command {
+	var opts struct {
+		deleteVolumes bool
+		force         bool
+	}
+	command := &cobra.Command{
+		Use:          "delete <container-id|name>",
+		Aliases:      []string{"rm", "remove"},
+		Short:        "Delete a container",
+		Args:         cobra.ExactArgs(1),
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := cmdutil.ClientFromCommand(cmd)
+			if err != nil {
+				return err
+			}
+
+			resolved, _, err := ContainerRef.Resolve(cmd.Context(), c, args[0], false)
+			if err != nil {
+				return err
+			}
+
+			displayName := containerDisplayName(resolved)
+
+			query := url.Values{
+				"force":   {strconv.FormatBool(opts.force)},
+				"volumes": {strconv.FormatBool(opts.deleteVolumes)},
+			}
+			path := types.Container(c.EnvID(), resolved.ID) + "?" + query.Encode()
+			return cmdutil.RunDelete(cmd, c, cmdutil.DeleteSpec{
+				Force:          opts.force,
+				Prompt:         fmt.Sprintf("Are you sure you want to delete container %s?", displayName),
+				Path:           path,
+				FailureMessage: "failed to delete container",
+				SuccessMessage: fmt.Sprintf("Container %s deleted successfully", displayName),
+			})
+		},
+	}
+	command.Flags().BoolVarP(&opts.force, "force", "f", false, "Force removal of a running container and skip the confirmation prompt")
+	command.Flags().BoolVar(&opts.deleteVolumes, "volumes", false, "Remove anonymous volumes associated with the container")
+	return command
+}
+
+func newCountsCmd() *cobra.Command {
+	return &cobra.Command{
+		Annotations:  map[string]string{"arcane:scope": cmdutil.ScopeRead},
+		Use:          "counts",
+		Short:        "Get container status counts",
+		SilenceUsage: true,
+		Args:         cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := cmdutil.ClientFromCommand(cmd)
+			if err != nil {
+				return err
+			}
+
+			return cmdutil.Run(cmd, c, cmdutil.Spec[container.StatusCounts]{
+				Method:         http.MethodGet,
+				Path:           types.ContainersCounts(c.EnvID()),
+				FailureMessage: "failed to get container counts",
+				Render: func(data container.StatusCounts) error {
+					output.Header("Container Status Counts")
+					output.KeyValue("Running", data.RunningContainers)
+					output.KeyValue("Stopped", data.StoppedContainers)
+					output.KeyValue("Total", data.TotalContainers)
+					return nil
+				},
+			})
+		},
+	}
+}
+
+type createOptions struct {
+	file       string
+	name       string
+	image      string
+	env        []string
+	port       []string
+	volume     []string
+	label      []string
+	network    []string
+	restart    string
+	memory     int64
+	cpus       float64
+	privileged bool
+	hostname   string
+	user       string
+	workdir    string
+	entrypoint string
+	cmd        string
+}
+
+func newCreateCmd() *cobra.Command {
+	opts := &createOptions{}
+	command := &cobra.Command{
+		Annotations:  map[string]string{"arcane:scope": cmdutil.ScopeDestination},
+		Use:          "create",
+		Short:        "Create a new container",
+		Example:      "  arcane containers create --name web --image nginx --env-var KEY=VALUE\n  arcane containers create --name web --image nginx -e KEY=VALUE",
+		SilenceUsage: true,
+		Args:         cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := cmdutil.ClientFromCommand(cmd)
+			if err != nil {
+				return err
+			}
+
+			c.SetTimeout(30 * time.Minute)
+
+			req, requestErr := opts.request(cmd)
+			if requestErr != nil {
+				return requestErr
+			}
+
+			return cmdutil.Run(cmd, c, cmdutil.Spec[container.Created]{
+				Method:         http.MethodPost,
+				Path:           types.Containers(c.EnvID()),
+				Body:           req,
+				FailureMessage: "failed to create container",
+				Render: func(data container.Created) error {
+					output.Success("Container %s created successfully", data.Name)
+					output.KeyValue("ID", data.ID)
+					output.KeyValue("Name", data.Name)
+					output.KeyValue("Image", data.Image)
+					output.KeyValue("Status", data.Status)
+					return nil
+				},
+			})
+		},
+	}
+	command.Flags().StringVarP(&opts.file, "file", "f", "", "JSON config file for container creation")
+	command.Flags().StringVar(&opts.name, "name", "", "Container name")
+	command.Flags().StringVar(&opts.image, "image", "", "Docker image")
+	command.Flags().StringArrayVarP(&opts.env, "env-var", "e", nil, "Environment variable (KEY=VALUE)")
+	command.Flags().Var(command.Flags().Lookup("env-var").Value, "env", "Environment variable (KEY=VALUE)")
+	_ = command.Flags().MarkDeprecated("env", "use --env-var or -e")
+	command.Flags().StringArrayVarP(&opts.port, "port", "p", nil, "Port mapping (HOST:CONTAINER)")
+	command.Flags().StringArrayVarP(&opts.volume, "volume", "v", nil, "Volume mount (SRC:DST)")
+	command.Flags().StringArrayVarP(&opts.label, "label", "l", nil, "Label (KEY=VALUE)")
+	command.Flags().StringArrayVar(&opts.network, "network", nil, "Networks to connect to")
+	cmdutil.EnumVarP(command, command.Flags(), &opts.restart, "restart", "", "", "Restart policy", "no", "always", "unless-stopped", "on-failure")
+	command.Flags().Int64Var(&opts.memory, "memory", 0, "Memory limit in bytes")
+	command.Flags().Float64Var(&opts.cpus, "cpus", 0, "Number of CPUs")
+	command.Flags().BoolVar(&opts.privileged, "privileged", false, "Run in privileged mode")
+	command.Flags().StringVar(&opts.hostname, "hostname", "", "Container hostname")
+	command.Flags().StringVar(&opts.user, "user", "", "User to run as")
+	command.Flags().StringVar(&opts.workdir, "workdir", "", "Working directory")
+	command.Flags().StringVar(&opts.entrypoint, "entrypoint", "", "Entrypoint command")
+	command.Flags().StringVar(&opts.cmd, "cmd", "", "Command to run")
+	return command
 }
 
 func containerDisplayName(details *container.Details) string {
@@ -596,10 +513,7 @@ func containerDisplayName(details *container.Details) string {
 	if strings.TrimSpace(details.Name) != "" {
 		return details.Name
 	}
-	if details.ID != "" {
-		return shortID(details.ID)
-	}
-	return ""
+	return details.ID[:min(len(details.ID), 12)]
 }
 
 var ContainerRef = cmdutil.ResourceRef[container.Details, container.Summary]{
@@ -611,48 +525,109 @@ var ContainerRef = cmdutil.ResourceRef[container.Details, container.Summary]{
 	GetPath:           types.Container,
 	ListPath:          types.Containers,
 	Matches: func(item container.Summary, identifierLower, original string) bool {
-		idLower := strings.ToLower(item.ID)
-		if idLower == identifierLower || (len(identifierLower) >= 4 && strings.HasPrefix(idLower, identifierLower)) {
-			return true
-		}
-		if strings.Contains(idLower, identifierLower) {
-			return true
-		}
-		if strings.Contains(strings.ToLower(item.Image), identifierLower) {
-			return true
-		}
-		for _, name := range item.Names {
-			trimmedName := strings.TrimPrefix(name, "/")
-			if strings.Contains(strings.ToLower(trimmedName), identifierLower) {
-				return true
-			}
-			if strings.EqualFold(trimmedName, original) || strings.EqualFold(name, original) {
-				return true
-			}
-		}
-		return false
+		return strings.Contains(strings.ToLower(item.ID), identifierLower) ||
+			strings.Contains(strings.ToLower(item.Image), identifierLower) ||
+			slices.ContainsFunc(item.Names, func(name string) bool {
+				trimmedName := strings.TrimPrefix(name, "/")
+				return strings.Contains(strings.ToLower(trimmedName), identifierLower) || strings.EqualFold(trimmedName, original) || strings.EqualFold(name, original)
+			})
 	},
 	Label: func(item container.Summary) string {
-		name := ""
-		if len(item.Names) > 0 {
-			name = strings.TrimPrefix(item.Names[0], "/")
-		}
-		if name == "" {
-			name = shortID(item.ID)
-		}
+		name := cmp.Or(docker.ContainerNameFromNames(item.Names), item.ID[:min(len(item.ID), 12)])
 		image := cmp.Or(item.Image, "<unknown>")
 		state := cmp.Or(item.State, "unknown")
-		return fmt.Sprintf("%s (%s, %s)", name, shortID(item.ID), image+" / "+state)
+		return fmt.Sprintf("%s (%s, %s)", name, item.ID[:min(len(item.ID), 12)], image+" / "+state)
 	},
 	Promote: func(summary container.Summary) *container.Details {
-		return &container.Details{ID: summary.ID, Name: containerSummaryName(summary)}
+		return &container.Details{ID: summary.ID, Name: docker.ContainerNameFromNames(summary.Names)}
 	},
-	IDOf: func(item container.Summary) string { return item.ID },
+	IDOf:         func(item container.Summary) string { return item.ID },
+	IdentifierOf: func(details container.Details) string { return details.ID },
 }
 
-func containerSummaryName(summary container.Summary) string {
-	if len(summary.Names) == 0 {
-		return ""
+func (opts *createOptions) request(cmd *cobra.Command) (container.Create, error) {
+	var req container.Create
+
+	// File mode: read base config from file
+	if opts.file != "" {
+		data, readFileErr := os.ReadFile(opts.file)
+		if readFileErr != nil {
+			return req, fmt.Errorf("failed to read file %s: %w", opts.file, readFileErr)
+		}
+		if unmarshalErr := json.Unmarshal(data, &req); unmarshalErr != nil {
+			return req, fmt.Errorf("failed to parse config file: %w", unmarshalErr)
+		}
 	}
-	return strings.TrimPrefix(summary.Names[0], "/")
+
+	// Flag overrides
+	if cmd.Flags().Changed("name") {
+		req.Name = opts.name
+	}
+	if cmd.Flags().Changed("image") {
+		req.Image = opts.image
+	}
+	if cmd.Flags().Changed("env-var") || cmd.Flags().Changed("env") {
+		req.Env = opts.env
+	}
+	if cmd.Flags().Changed("port") {
+		// Parse "HOST:CONTAINER" format into ports map
+		req.Ports = make(map[string]string)
+		for _, p := range opts.port {
+			parts := strings.SplitN(p, ":", 2)
+			if len(parts) == 2 {
+				req.Ports[parts[1]] = parts[0]
+			}
+		}
+	}
+	if cmd.Flags().Changed("volume") {
+		req.Volumes = opts.volume
+	}
+	if cmd.Flags().Changed("label") {
+		req.Labels = make(map[string]string)
+		for _, l := range opts.label {
+			parts := strings.SplitN(l, "=", 2)
+			if len(parts) == 2 {
+				req.Labels[parts[0]] = parts[1]
+			}
+		}
+	}
+	if cmd.Flags().Changed("network") {
+		req.Networks = opts.network
+	}
+	if cmd.Flags().Changed("restart") {
+		req.RestartPolicy = opts.restart
+	}
+	if cmd.Flags().Changed("memory") {
+		req.Memory = opts.memory
+	}
+	if cmd.Flags().Changed("cpus") {
+		req.CPUs = opts.cpus
+	}
+	if cmd.Flags().Changed("privileged") {
+		req.Privileged = opts.privileged
+	}
+	if cmd.Flags().Changed("hostname") {
+		req.Hostname = opts.hostname
+	}
+	if cmd.Flags().Changed("user") {
+		req.User = opts.user
+	}
+	if cmd.Flags().Changed("workdir") {
+		req.WorkingDir = opts.workdir
+	}
+	if cmd.Flags().Changed("entrypoint") {
+		req.Entrypoint = []string{opts.entrypoint}
+	}
+	if cmd.Flags().Changed("cmd") {
+		req.Cmd = []string{opts.cmd}
+	}
+
+	// Validate required fields
+	if req.Name == "" {
+		return req, errors.New("--name is required")
+	}
+	if req.Image == "" {
+		return req, errors.New("--image is required")
+	}
+	return req, nil
 }

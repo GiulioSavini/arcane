@@ -13,20 +13,20 @@ import (
 	"github.com/getarcaneapp/arcane/cli/v2/pkg/backups"
 )
 
-// AdminCmd is the parent command for administrative operations.
-var AdminCmd = &cobra.Command{
-	Use:     "admin",
-	Aliases: []string{"adm"},
-	Short:   "Administration & platform management",
-}
-
-func init() {
-	AdminCmd.AddCommand(backups.BackupsCmd)
-	AdminCmd.AddCommand(users.UsersCmd)
-	AdminCmd.AddCommand(roles.RolesCmd)
-	AdminCmd.AddCommand(oidcmappings.OidcMappingsCmd)
-	AdminCmd.AddCommand(apikeys.ApiKeysCmd)
-	AdminCmd.AddCommand(federatedcredentials.FederatedCredentialsCmd)
-	AdminCmd.AddCommand(events.EventsCmd)
-	AdminCmd.AddCommand(notifications.NotificationsCmd)
+// Command is the parent command for administrative operations.
+func Command() *cobra.Command {
+	command := &cobra.Command{
+		Use:     "admin",
+		Aliases: []string{"adm"},
+		Short:   "Administration & platform management",
+	}
+	command.AddCommand(backups.Command())
+	command.AddCommand(users.Command())
+	command.AddCommand(roles.Command())
+	command.AddCommand(oidcmappings.Command())
+	command.AddCommand(apikeys.Command())
+	command.AddCommand(federatedcredentials.Command())
+	command.AddCommand(events.Command())
+	command.AddCommand(notifications.Command())
+	return command
 }

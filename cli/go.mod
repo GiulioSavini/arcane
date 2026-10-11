@@ -13,6 +13,7 @@ require (
 	github.com/charmbracelet/colorprofile v0.4.3
 	github.com/charmbracelet/x/ansi v0.11.9
 	github.com/charmbracelet/x/term v0.2.2
+	github.com/creack/pty v1.1.24
 	github.com/docker/go-units v0.5.0
 	github.com/getarcaneapp/arcane/types/v2 v2.14.0
 	github.com/mattn/go-runewidth v0.0.31
@@ -22,11 +23,14 @@ require (
 	github.com/spf13/pflag v1.0.10
 	github.com/stretchr/testify v1.12.1
 	go.getarcane.app/acfs v0.6.2
+	go.getarcane.app/builds v0.4.4
+	go.getarcane.app/docker v0.1.0
 	go.getarcane.app/kit v0.4.0
 	go.yaml.in/yaml/v4 v4.0.0-rc.6
 )
 
 require (
+	github.com/Azure/go-ansiterm v0.0.0-20261006220739-8c912ac31dd4 // indirect
 	github.com/DmitriyVTitov/size v1.5.0 // indirect
 	github.com/Microsoft/go-winio v0.6.3-0.20251027160822-ad3df93bed29 // indirect
 	github.com/atotto/clipboard v0.1.4 // indirect
@@ -56,6 +60,7 @@ require (
 	github.com/moby/docker-image-spec v1.3.1 // indirect
 	github.com/moby/moby/api v1.56.1 // indirect
 	github.com/moby/moby/client v0.6.2 // indirect
+	github.com/moby/term v0.5.2 // indirect
 	github.com/muesli/mango v0.2.0 // indirect
 	github.com/muesli/mango-cobra v1.3.0 // indirect
 	github.com/muesli/mango-pflag v0.2.0 // indirect
@@ -70,10 +75,10 @@ require (
 	github.com/rivo/uniseg v0.4.7 // indirect
 	github.com/sahilm/fuzzy v0.1.3 // indirect
 	github.com/samber/go-singleflightx v0.3.2 // indirect
+	github.com/samber/mo v1.17.0 // indirect
 	github.com/sirupsen/logrus v1.10.2 // indirect
 	github.com/xhit/go-str2duration/v2 v2.1.0 // indirect
 	github.com/xo/terminfo v1.0.0 // indirect
-	go.getarcane.app/builds v0.4.4 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.71.0 // indirect
 	go.opentelemetry.io/otel v1.46.0 // indirect

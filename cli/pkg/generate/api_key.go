@@ -4,7 +4,6 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
-	"io"
 
 	"github.com/spf13/cobra"
 )
@@ -14,18 +13,27 @@ const (
 	apiKeyLength = 32
 )
 
-var apiKeyCmd = &cobra.Command{
-	Use:     "apikey",
-	Aliases: []string{"api-key"},
-	Short:   "Generate a static admin API key",
-	Long:    `Generate a static Arcane API key suitable for ADMIN_STATIC_API_KEY. This is just a local generation, nothing is stored to the database with these commands.`,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		return generateAPIKeyOutputInternal(cmd.OutOrStdout())
-	},
-}
-
-func init() {
-	GenerateCmd.AddCommand(apiKeyCmd)
+func newAPIKeyCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:     "apikey",
+		Aliases: []string{"api-key"},
+		Short:   "Generate a static admin API key",
+		Long:    `Generate a static Arcane API key suitable for ADMIN_STATIC_API_KEY. This is just a local generation, nothing is stored to the database with these commands.`,
+		Args:    cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			apiKey, err := GenerateAPIKey()
+			if err != nil {
+				return err
+			}
+			if jsonOutput(cmd) {
+				return printJSON(cmd, struct {
+					Key string `json:"key"`
+				}{Key: apiKey})
+			}
+			_, _ = fmt.Fprintln(cmd.OutOrStdout(), apiKey)
+			return nil
+		},
+	}
 }
 
 func GenerateAPIKey() (string, error) {
@@ -35,14 +43,4 @@ func GenerateAPIKey() (string, error) {
 	}
 
 	return apiKeyPrefix + hex.EncodeToString(keyBytes), nil
-}
-
-func generateAPIKeyOutputInternal(w io.Writer) error {
-	apiKey, err := GenerateAPIKey()
-	if err != nil {
-		return err
-	}
-
-	_, _ = fmt.Fprintln(w, apiKey)
-	return nil
 }

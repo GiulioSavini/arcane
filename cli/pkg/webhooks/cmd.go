@@ -4,258 +4,233 @@ package webhooks
 
 import (
 	"cmp"
+	"encoding/json/jsontext"
 	"errors"
 	"fmt"
 	"net/http"
 	"strings"
 	"time"
 
-	"github.com/getarcaneapp/arcane/types/v2/base"
 	"github.com/getarcaneapp/arcane/types/v2/webhook"
 	"github.com/spf13/cobra"
+	"go.getarcane.app/kit/pkg"
 
 	"github.com/getarcaneapp/arcane/cli/v2/internal/cmdutil"
 	"github.com/getarcaneapp/arcane/cli/v2/internal/output"
 	"github.com/getarcaneapp/arcane/cli/v2/internal/types"
 )
 
-var (
-	forceFlag      bool
-	jsonOutput     bool
-	createName     string
-	createTarget   string
-	createAction   string
-	createTargetID string
-	updateEnabled  bool
-)
-
-// WebhooksCmd is the parent command for webhook operations.
-var WebhooksCmd = &cobra.Command{
-	Use:     "webhooks",
-	Aliases: []string{"webhook", "wh"},
-	Short:   "Manage inbound webhooks",
+// Command is the parent command for webhook operations.
+func Command() *cobra.Command {
+	command := &cobra.Command{
+		Use:     "webhooks",
+		Aliases: []string{"webhook", "wh"},
+		Short:   "Manage inbound webhooks",
+	}
+	cmdutil.SetScope(cmdutil.ScopeResource, command)
+	command.AddCommand(newListCmd())
+	command.AddCommand(newCreateCmd())
+	command.AddCommand(newUpdateCmd())
+	command.AddCommand(newDeleteCmd())
+	command.AddCommand(newTriggerCmd())
+	return command
 }
 
-var listCmd = &cobra.Command{
-	Use:          "list",
-	Aliases:      []string{"ls"},
-	Short:        "List webhooks",
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := cmdutil.ClientFromCommand(cmd)
-		if err != nil {
-			return err
-		}
-
-		result, err := c.GetJSON[[]webhook.Summary](cmd.Context(), types.Webhooks(c.EnvID()))
-		if err != nil {
-			return fmt.Errorf("failed to list webhooks: %w", err)
-		}
-
-		if jsonOutput {
-			return cmdutil.PrintJSON(result.Data)
-		}
-
-		headers := []string{"ID", "NAME", "ACTION", "TARGET", "TOKEN", "ENABLED", "LAST TRIGGERED"}
-		rows := make([][]string, len(result.Data))
-		for i, item := range result.Data {
-			enabled := "No"
-			if item.Enabled {
-				enabled = "Yes"
-			}
-			lastTriggered := "-"
-			if item.LastTriggeredAt != nil {
-				lastTriggered = item.LastTriggeredAt.Format(time.RFC3339)
-			}
-			target := item.TargetType
-			if name := cmp.Or(item.TargetName, item.TargetID); name != "" {
-				target += "/" + name
-			}
-			rows[i] = []string{
-				item.ID,
-				item.Name,
-				item.ActionType,
-				target,
-				item.TokenPrefix,
-				enabled,
-				lastTriggered,
-			}
-		}
-
-		if tableErr := cmdutil.PrintTable(cmd, headers, rows, cmdutil.TableSummary{Resource: "webhooks", Total: int64(len(result.Data)), Paginated: true}); tableErr != nil {
-			return tableErr
-		}
-		return nil
-	},
-}
-
-var createCmd = &cobra.Command{
-	Use:          "create",
-	Short:        "Create a webhook",
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := cmdutil.ClientFromCommand(cmd)
-		if err != nil {
-			return err
-		}
-
-		req := webhook.CreateInput{
-			Name:       createName,
-			TargetType: createTarget,
-			ActionType: createAction,
-			TargetID:   createTargetID,
-		}
-
-		result, err := c.PostJSON[webhook.Created](cmd.Context(), types.Webhooks(c.EnvID()), req)
-		if err != nil {
-			return fmt.Errorf("failed to create webhook: %w", err)
-		}
-
-		if jsonOutput {
-			return cmdutil.PrintJSON(result.Data)
-		}
-
-		output.Success("Webhook %s created successfully", result.Data.Name)
-		output.KeyValue("ID", result.Data.ID)
-		output.KeyValue("Target Type", result.Data.TargetType)
-		output.KeyValue("Action", result.Data.ActionType)
-		if result.Data.TargetID != "" {
-			output.KeyValue("Target ID", result.Data.TargetID)
-		}
-		if result.Data.Token != "" {
-			output.Warning("Store this token securely — it will not be shown again")
-			output.KeyValue("Token", result.Data.Token)
-		}
-		return nil
-	},
-}
-
-var updateCmd = &cobra.Command{
-	Use:          "update <webhook-id>",
-	Short:        "Update a webhook",
-	Args:         cobra.ExactArgs(1),
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		if !cmd.Flags().Changed("enabled") {
-			return errors.New("no fields to update: specify --enabled")
-		}
-
-		c, err := cmdutil.ClientFromCommand(cmd)
-		if err != nil {
-			return err
-		}
-
-		req := webhook.UpdateInput{Enabled: updateEnabled}
-		if _, updateWebhookErr := c.DoJSON[base.ApiResponse[any]](cmd.Context(), http.MethodPatch, types.Webhook(c.EnvID(), args[0]), req); updateWebhookErr != nil {
-			return fmt.Errorf("failed to update webhook: %w", updateWebhookErr)
-		}
-
-		if jsonOutput {
-			return cmdutil.PrintJSON(map[string]bool{"enabled": updateEnabled})
-		}
-
-		state := "disabled"
-		if updateEnabled {
-			state = "enabled"
-		}
-		output.Success("Webhook %s %s", args[0], state)
-		return nil
-	},
-}
-
-var deleteCmd = &cobra.Command{
-	Use:          "delete <webhook-id>",
-	Aliases:      []string{"rm", "remove"},
-	Short:        "Delete a webhook",
-	Args:         cobra.ExactArgs(1),
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		if !forceFlag {
-			confirmed, err := cmdutil.Confirm(cmd, fmt.Sprintf("Are you sure you want to delete webhook %s?", args[0]))
+func newListCmd() *cobra.Command {
+	command := &cobra.Command{
+		Use:          "list",
+		Aliases:      []string{"ls"},
+		Short:        "List webhooks",
+		SilenceUsage: true,
+		Args:         cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := cmdutil.ClientFromCommand(cmd)
 			if err != nil {
 				return err
 			}
-			if !confirmed {
-				_, _ = fmt.Fprintln(output.Stdout(), "Cancelled")
-				return nil
+
+			return cmdutil.Run(cmd, c, cmdutil.Spec[[]webhook.Summary]{
+				Method:         http.MethodGet,
+				Path:           types.Webhooks(c.EnvID()),
+				FailureMessage: "failed to list webhooks",
+				Render: func(data []webhook.Summary) error {
+					headers := []string{"ID", "NAME", "ACTION", "TARGET", "TOKEN", "ENABLED", "LAST TRIGGERED"}
+					rows := make([][]string, len(data))
+					for i, item := range data {
+						lastTriggered := "-"
+						if item.LastTriggeredAt != nil {
+							lastTriggered = item.LastTriggeredAt.Format(time.RFC3339)
+						}
+						target := item.TargetType
+						if name := cmp.Or(item.TargetName, item.TargetID); name != "" {
+							target += "/" + name
+						}
+						rows[i] = []string{
+							item.ID,
+							item.Name,
+							item.ActionType,
+							target,
+							item.TokenPrefix,
+							kit.Ternary(item.Enabled, "Yes", "No"),
+							lastTriggered,
+						}
+					}
+
+					return cmdutil.PrintTable(cmd, headers, rows, cmdutil.TableSummary{Resource: "webhooks", Total: int64(len(data)), Paginated: true})
+				},
+			})
+		},
+	}
+	cmdutil.SetScope(cmdutil.ScopeRead, command)
+	return command
+}
+
+func newCreateCmd() *cobra.Command {
+	var opts struct {
+		name     string
+		target   string
+		action   string
+		targetID string
+	}
+	command := &cobra.Command{
+		Use:          "create",
+		Short:        "Create a webhook",
+		SilenceUsage: true,
+		Args:         cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := cmdutil.ClientFromCommand(cmd)
+			if err != nil {
+				return err
 			}
-		}
 
-		c, err := cmdutil.ClientFromCommand(cmd)
-		if err != nil {
-			return err
-		}
-
-		if _, deleteWebhookErr := c.DeleteJSON[any](cmd.Context(), types.Webhook(c.EnvID(), args[0])); deleteWebhookErr != nil {
-			return fmt.Errorf("failed to delete webhook: %w", deleteWebhookErr)
-		}
-
-		output.Success("Webhook %s deleted successfully", args[0])
-		return nil
-	},
+			return cmdutil.Run(cmd, c, cmdutil.Spec[webhook.Created]{
+				Method:         http.MethodPost,
+				Path:           types.Webhooks(c.EnvID()),
+				FailureMessage: "failed to create webhook",
+				Body: webhook.CreateInput{
+					Name:       opts.name,
+					TargetType: opts.target,
+					ActionType: opts.action,
+					TargetID:   opts.targetID,
+				},
+				Render: func(data webhook.Created) error {
+					output.Success("Webhook %s created successfully", data.Name)
+					output.KeyValue("ID", data.ID)
+					output.KeyValue("Target Type", data.TargetType)
+					output.KeyValue("Action", data.ActionType)
+					if data.TargetID != "" {
+						output.KeyValue("Target ID", data.TargetID)
+					}
+					if data.Token != "" {
+						output.Warning("Store this token securely — it will not be shown again")
+						output.KeyValue("Token", data.Token)
+					}
+					return nil
+				},
+			})
+		},
+	}
+	cmdutil.SetScope(cmdutil.ScopeDestination, command)
+	command.Flags().StringVar(&opts.name, "name", "", "Webhook name")
+	cmdutil.EnumVarP(command, command.Flags(), &opts.target, "target", "", "", "Target type", "container", "project", "updater", "gitops")
+	cmdutil.EnumVarP(command, command.Flags(), &opts.action, "action", "", "", "Action to run", "update", "start", "stop", "restart", "redeploy", "up", "down", "run", "sync")
+	command.Flags().StringVar(&opts.targetID, "target-id", "", "Container ID, project ID, or GitOps sync ID to target (not needed for updater webhooks)")
+	_ = command.MarkFlagRequired("name")
+	_ = command.MarkFlagRequired("target")
+	_ = command.MarkFlagRequired("action")
+	return command
 }
 
-var triggerCmd = &cobra.Command{
-	Use:          "trigger <token>",
-	Short:        "Trigger a webhook by token",
-	Long:         "Trigger a webhook by its token. The token is the sole authentication mechanism; no login is required. The server accepts the trigger and runs the action in the background.",
-	Args:         cobra.ExactArgs(1),
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := cmdutil.UnauthClientFromCommand(cmd)
-		if err != nil {
-			return err
-		}
+func newUpdateCmd() *cobra.Command {
+	var opts struct {
+		enabled bool
+	}
+	command := &cobra.Command{
+		Use:          "update <webhook-id>",
+		Short:        "Update a webhook",
+		Args:         cobra.ExactArgs(1),
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if !cmd.Flags().Changed("enabled") {
+				return errors.New("no fields to update: specify --enabled")
+			}
+			c, err := cmdutil.ClientFromCommand(cmd)
+			if err != nil {
+				return err
+			}
 
-		body, err := c.DoRaw(cmd.Context(), http.MethodPost, types.WebhookTrigger(args[0]), nil)
-		if err != nil {
-			return fmt.Errorf("failed to trigger webhook: %w", err)
-		}
-
-		if jsonOutput {
-			return cmdutil.PrintRawJSON(body)
-		}
-
-		output.Success("Webhook trigger accepted; the action is running in the background")
-		return nil
-	},
+			return cmdutil.Run(cmd, c, cmdutil.Spec[jsontext.Value]{
+				Method:         http.MethodPatch,
+				Path:           types.Webhook(c.EnvID(), args[0]),
+				Body:           webhook.UpdateInput{Enabled: opts.enabled},
+				FailureMessage: "failed to update webhook",
+				Render: func(jsontext.Value) error {
+					output.Success("Webhook %s %s", args[0], kit.Ternary(opts.enabled, "enabled", "disabled"))
+					return nil
+				},
+			})
+		},
+	}
+	cmdutil.SetResource(webhookRef, command)
+	command.Flags().BoolVar(&opts.enabled, "enabled", true, "Whether the webhook is active")
+	return command
 }
 
-func init() {
-	cmdutil.SetResource(webhookRef, updateCmd, deleteCmd)
-	cmdutil.SetScope(cmdutil.ScopeResource, WebhooksCmd)
-	cmdutil.SetScope(cmdutil.ScopeRead, listCmd)
-	cmdutil.SetScope(cmdutil.ScopeDestination, createCmd)
-	cmdutil.SetScope(cmdutil.ScopeGlobal, triggerCmd)
-	WebhooksCmd.AddCommand(listCmd)
-	WebhooksCmd.AddCommand(createCmd)
-	WebhooksCmd.AddCommand(updateCmd)
-	WebhooksCmd.AddCommand(deleteCmd)
-	WebhooksCmd.AddCommand(triggerCmd)
+func newDeleteCmd() *cobra.Command {
+	var opts struct {
+		force bool
+	}
+	command := &cobra.Command{
+		Use:          "delete <webhook-id>",
+		Aliases:      []string{"rm", "remove"},
+		Short:        "Delete a webhook",
+		Args:         cobra.ExactArgs(1),
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := cmdutil.ClientFromCommand(cmd)
+			if err != nil {
+				return err
+			}
+			return cmdutil.RunDelete(cmd, c, cmdutil.DeleteSpec{
+				Force:          opts.force,
+				Prompt:         fmt.Sprintf("Are you sure you want to delete webhook %s?", args[0]),
+				Path:           types.Webhook(c.EnvID(), args[0]),
+				FailureMessage: "failed to delete webhook",
+				SuccessMessage: fmt.Sprintf("Webhook %s deleted successfully", args[0]),
+			})
+		},
+	}
+	cmdutil.SetResource(webhookRef, command)
+	command.Flags().BoolVarP(&opts.force, "force", "f", false, "Delete without confirmation")
+	return command
+}
 
-	// List command flags
-	listCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
+func newTriggerCmd() *cobra.Command {
+	command := &cobra.Command{
+		Use:          "trigger <token>",
+		Short:        "Trigger a webhook by token",
+		Long:         "Trigger a webhook by its token. The token is the sole authentication mechanism; no login is required. The server accepts the trigger and runs the action in the background.",
+		Args:         cobra.ExactArgs(1),
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := cmdutil.UnauthClientFromCommand(cmd)
+			if err != nil {
+				return err
+			}
 
-	// Create command flags
-	createCmd.Flags().StringVar(&createName, "name", "", "Webhook name")
-	createCmd.Flags().StringVar(&createTarget, "target", "", "Target type: container, project, updater, or gitops")
-	createCmd.Flags().StringVar(&createAction, "action", "", "Action to run: update, start, stop, restart, redeploy, up, down, run, or sync")
-	createCmd.Flags().StringVar(&createTargetID, "target-id", "", "Container ID, project ID, or GitOps sync ID to target (not needed for updater webhooks)")
-	createCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
-	_ = createCmd.MarkFlagRequired("name")
-	_ = createCmd.MarkFlagRequired("target")
-	_ = createCmd.MarkFlagRequired("action")
-
-	// Update command flags
-	updateCmd.Flags().BoolVar(&updateEnabled, "enabled", true, "Whether the webhook is active")
-	updateCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
-
-	// Delete command flags
-	deleteCmd.Flags().BoolVarP(&forceFlag, "force", "f", false, "Delete without confirmation")
-	deleteCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
-
-	// Trigger command flags
-	triggerCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
+			return cmdutil.Run(cmd, c, cmdutil.Spec[jsontext.Value]{
+				Method:         http.MethodPost,
+				Path:           types.WebhookTrigger(args[0]),
+				FailureMessage: "failed to trigger webhook",
+				Render: func(jsontext.Value) error {
+					output.Success("Webhook trigger accepted; the action is running in the background")
+					return nil
+				},
+			})
+		},
+	}
+	cmdutil.SetScope(cmdutil.ScopeGlobal, command)
+	return command
 }
 
 var webhookRef = cmdutil.ResourceRef[webhook.Summary, webhook.Summary]{
@@ -263,7 +238,8 @@ var webhookRef = cmdutil.ResourceRef[webhook.Summary, webhook.Summary]{
 	Singular:          "webhook", Plural: "webhooks",
 	IDHint: "the identifier", ListCmd: "arcane-cli webhooks list",
 	GetPath: nil, ListPath: types.Webhooks,
-	Matches: func(item webhook.Summary, lower, original string) bool { return strings.EqualFold(item.ID, original) },
-	Label:   func(item webhook.Summary) string { return item.Name + " (" + item.ID + ")" },
-	Promote: func(item webhook.Summary) *webhook.Summary { return &item },
+	Matches:      func(item webhook.Summary, lower, original string) bool { return strings.EqualFold(item.ID, original) },
+	Label:        func(item webhook.Summary) string { return item.Name + " (" + item.ID + ")" },
+	Promote:      func(item webhook.Summary) *webhook.Summary { return &item },
+	IdentifierOf: func(item webhook.Summary) string { return item.ID },
 }

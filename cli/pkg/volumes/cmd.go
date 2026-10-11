@@ -1,390 +1,368 @@
 package volumes
 
 import (
-	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
 
 	"github.com/getarcaneapp/arcane/types/v2/volume"
 	"github.com/spf13/cobra"
+	"go.getarcane.app/kit/pkg"
 
 	"github.com/getarcaneapp/arcane/cli/v2/internal/cmdutil"
 	"github.com/getarcaneapp/arcane/cli/v2/internal/output"
-	"github.com/getarcaneapp/arcane/cli/v2/internal/prompt"
 	"github.com/getarcaneapp/arcane/cli/v2/internal/types"
 )
 
-var (
-	limitFlag           int
-	startFlag           int
-	allFlag             bool
-	forceFlag           bool
-	jsonOutput          bool
-	inUseOnlyFlag       bool
-	unusedOnlyFlag      bool
-	includeInternalFlag bool
-)
-
-var (
-	volumeCreateName   string
-	volumeCreateDriver string
-	volumeCreateOpts   []string
-	volumeCreateLabels []string
-)
-
-// VolumesCmd is the parent command for volume operations
-var VolumesCmd = &cobra.Command{
-	Use:     "volumes",
-	Aliases: []string{"volume", "vol", "v"},
-	Short:   "Manage volumes",
+func Command() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:     "volumes",
+		Aliases: []string{"volume", "vol", "v"},
+		Short:   "Manage volumes",
+	}
+	cmd.AddCommand(
+		newWorkspaceCmd(),
+		newRenameCmd(),
+		newBackupsCmd(),
+		newListCmd(),
+		newGetCmd(),
+		newDeleteCmd(),
+		newCountsCmd(),
+		newPruneCmd(),
+		newSizesCmd(),
+		newUsageCmd(),
+		newCreateCmd(),
+	)
+	cmdutil.SetScope(cmdutil.ScopeResource, cmd)
+	return cmd
 }
 
-var listCmd = &cobra.Command{
-	Use:          "list",
-	Aliases:      []string{"ls"},
-	Short:        "List volumes",
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		if inUseOnlyFlag && unusedOnlyFlag {
-			return errors.New("--inuse and --unused cannot be used together")
-		}
-		c, err := cmdutil.ClientFromCommand(cmd)
-		if err != nil {
-			return err
-		}
-
-		// Filter server-side so that pagination and the reported totals apply to
-		// the matching set rather than to whichever page happened to be fetched.
-		query := url.Values{}
-		if inUseOnlyFlag {
-			query.Set("inUse", "true")
-		}
-		if unusedOnlyFlag {
-			query.Set("inUse", "false")
-		}
-		if includeInternalFlag {
-			query.Set("include", "true")
-		}
-
-		return cmdutil.RunList(cmd, c, cmdutil.ListSpec[volume.Volume]{
-			Resource: "volumes",
-			Endpoint: types.Volumes(c.EnvID()),
-			Params: cmdutil.ListParams{
-				Resource:        "volumes",
-				Limit:           limitFlag,
-				FallbackDefault: 20,
-				Start:           startFlag,
-				All:             allFlag,
-			},
-			Query:   query,
-			JSON:    jsonOutput,
-			Headers: []string{"NAME", "DRIVER", "MOUNTPOINT", "CREATED", "IN USE"},
-			Row: func(vol volume.Volume) []string {
-				inUse := "No"
-				if vol.InUse {
-					inUse = "Yes"
-				}
-				return []string{
-					vol.Name,
-					vol.Driver,
-					vol.Mountpoint,
-					vol.CreatedAt,
-					inUse,
-				}
-			},
-		})
-	},
-}
-
-var getCmd = &cobra.Command{
-	Use:          "get <volume-name>",
-	Short:        "Get volume details",
-	Args:         cobra.ExactArgs(1),
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := cmdutil.ClientFromCommand(cmd)
-		if err != nil {
-			return err
-		}
-
-		allowPrompt := !jsonOutput && prompt.IsInteractive()
-		resolved, _, err := volumeRef.Resolve(cmd.Context(), c, args[0], allowPrompt)
-		if err != nil {
-			return err
-		}
-
-		if jsonOutput {
-			return cmdutil.PrintJSON(resolved)
-		}
-
-		output.Header("Volume Details")
-		output.KeyValue("Name", resolved.Name)
-		output.KeyValue("Driver", resolved.Driver)
-		output.KeyValue("Mountpoint", resolved.Mountpoint)
-		output.KeyValue("Scope", resolved.Scope)
-		output.KeyValue("Created", resolved.CreatedAt)
-		output.KeyValue("In Use", resolved.InUse)
-		if resolved.Size > 0 {
-			output.KeyValue("Size", output.Bytes(resolved.Size))
-		}
-		return nil
-	},
-}
-
-var deleteCmd = &cobra.Command{
-	Use:          "delete <volume-name>",
-	Aliases:      []string{"rm", "remove"},
-	Short:        "Delete a volume",
-	Args:         cobra.ExactArgs(1),
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := cmdutil.ClientFromCommand(cmd)
-		if err != nil {
-			return err
-		}
-
-		allowPrompt := !forceFlag && prompt.IsInteractive()
-		resolved, _, err := volumeRef.Resolve(cmd.Context(), c, args[0], allowPrompt)
-		if err != nil {
-			return err
-		}
-
-		if !forceFlag {
-			confirmed, confirmErr := cmdutil.Confirm(cmd, fmt.Sprintf("Are you sure you want to delete volume %s?", resolved.Name))
-			if confirmErr != nil {
-				return confirmErr
-			}
-			if !confirmed {
-				_, _ = fmt.Fprintln(output.Stdout(), "Cancelled")
-				return nil
-			}
-		}
-
-		deletePath := cmdutil.AppendQuery(
-			types.Volume(c.EnvID(), resolved.Name),
-			url.Values{"force": []string{strconv.FormatBool(forceFlag)}},
-		)
-		resp, err := c.Delete(cmd.Context(), deletePath)
-		if err != nil {
-			return fmt.Errorf("failed to delete volume: %w", err)
-		}
-		defer func() { _ = resp.Body.Close() }()
-		if ensureSuccessStatusErr := cmdutil.EnsureSuccessStatus(resp); ensureSuccessStatusErr != nil {
-			return fmt.Errorf("failed to delete volume: %w", ensureSuccessStatusErr)
-		}
-
-		output.Success("Volume %s deleted successfully", resolved.Name)
-		return nil
-	},
-}
-
-var countsCmd = &cobra.Command{
-	Use:          "counts",
-	Short:        "Get volume usage counts",
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := cmdutil.ClientFromCommand(cmd)
-		if err != nil {
-			return err
-		}
-		result, err := c.GetJSON[any](cmd.Context(), types.VolumesCounts(c.EnvID()))
-		if err != nil {
-			return fmt.Errorf("failed to get volume counts: %w", err)
-		}
-		if !jsonOutput {
-			output.Header("Volume Usage Counts")
-		}
-		if printErr := cmdutil.PrintJSON(result.Data); printErr != nil {
-			return fmt.Errorf("failed to marshal volume counts: %w", printErr)
-		}
-		return nil
-	},
-}
-
-var pruneCmd = &cobra.Command{
-	Use:          "prune",
-	Short:        "Remove unused volumes",
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		if !forceFlag {
-			confirmed, err := cmdutil.Confirm(cmd, "Are you sure you want to prune unused volumes?")
+func newListCmd() *cobra.Command {
+	var opts struct {
+		limitFlag      int
+		startFlag      int
+		allFlag        bool
+		inUseOnlyFlag  bool
+		unusedOnlyFlag bool
+		includeFlag    bool
+	}
+	cmd := &cobra.Command{
+		Use:          "list",
+		Aliases:      []string{"ls"},
+		Short:        "List volumes",
+		SilenceUsage: true,
+		Args:         cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := cmdutil.ClientFromCommand(cmd)
 			if err != nil {
 				return err
 			}
-			if !confirmed {
-				_, _ = fmt.Fprintln(output.Stdout(), "Cancelled")
-				return nil
+
+			// Filter server-side so that pagination and the reported totals apply to
+			// the matching set rather than to whichever page happened to be fetched.
+			query := url.Values{}
+			if opts.inUseOnlyFlag {
+				query.Set("inUse", "true")
 			}
-		}
+			if opts.unusedOnlyFlag {
+				query.Set("inUse", "false")
+			}
+			if opts.includeFlag {
+				query.Set("include", "true")
+			}
 
-		c, err := cmdutil.ClientFromCommand(cmd)
-		if err != nil {
-			return err
-		}
-
-		return cmdutil.RunPostAction[any](cmd, c, cmdutil.PostActionSpec{
-			Path:           types.VolumesPrune(c.EnvID()),
-			FailureMessage: "failed to prune volumes",
-			SuccessMessage: "Volumes pruned successfully",
-			JSON:           jsonOutput,
-		})
-	},
+			return cmdutil.RunList(cmd, c, cmdutil.ListSpec[volume.Volume]{
+				Resource: "volumes",
+				Endpoint: types.Volumes(c.EnvID()),
+				Params: cmdutil.ListParams{
+					Resource:        "volumes",
+					Limit:           opts.limitFlag,
+					FallbackDefault: 20,
+					Start:           opts.startFlag,
+					All:             opts.allFlag,
+				},
+				Query:   query,
+				Headers: []string{"NAME", "DRIVER", "MOUNTPOINT", "CREATED", "IN USE"},
+				Row: func(vol volume.Volume) []string {
+					return []string{
+						vol.Name,
+						vol.Driver,
+						vol.Mountpoint,
+						vol.CreatedAt,
+						kit.Ternary(vol.InUse, "Yes", "No"),
+					}
+				},
+			})
+		},
+	}
+	cmd.Flags().IntVarP(&opts.limitFlag, "limit", "n", 20, "Number of volumes to show")
+	cmd.Flags().IntVar(&opts.startFlag, "start", 0, cmdutil.StartFlagUsage)
+	cmd.Flags().BoolVarP(&opts.allFlag, "all", "a", false, cmdutil.AllFlagUsage)
+	cmd.Flags().BoolVar(&opts.inUseOnlyFlag, "inuse", false, "Only show volumes currently in use")
+	cmd.Flags().BoolVar(&opts.unusedOnlyFlag, "unused", false, "Only show volumes not in use")
+	cmd.Flags().BoolVar(&opts.includeFlag, "include-internal", false, "Include Arcane-internal volumes")
+	cmdutil.SetScope(cmdutil.ScopeRead, cmd)
+	cmd.PreRunE = func(cmd *cobra.Command, _ []string) error { return cmdutil.ExclusiveFlags(cmd, "inuse", "unused") }
+	return cmd
 }
 
-var sizesCmd = &cobra.Command{
-	Use:          "sizes",
-	Short:        "Get volume sizes",
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := cmdutil.ClientFromCommand(cmd)
-		if err != nil {
-			return err
-		}
-		result, err := c.GetJSON[any](cmd.Context(), types.VolumesSizes(c.EnvID()))
-		if err != nil {
-			return fmt.Errorf("failed to get volume sizes: %w", err)
-		}
-		if !jsonOutput {
-			output.Header("Volume Sizes")
-		}
-		if printErr := cmdutil.PrintJSON(result.Data); printErr != nil {
-			return fmt.Errorf("failed to marshal volume sizes: %w", printErr)
-		}
-		return nil
-	},
+func newGetCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:          "get <volume-name>",
+		Short:        "Get volume details",
+		Args:         cobra.ExactArgs(1),
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := cmdutil.ClientFromCommand(cmd)
+			if err != nil {
+				return err
+			}
+
+			allowPrompt := cmdutil.AllowPrompt(cmd)
+			resolved, err := volumeRef.Fetch(cmd.Context(), c, args[0], allowPrompt)
+			if err != nil {
+				return err
+			}
+
+			if cmdutil.JSONOutputEnabled(cmd) {
+				return cmdutil.PrintJSON(resolved)
+			}
+
+			output.Header("Volume Details")
+			output.KeyValue("Name", resolved.Name)
+			output.KeyValue("Driver", resolved.Driver)
+			output.KeyValue("Mountpoint", resolved.Mountpoint)
+			output.KeyValue("Scope", resolved.Scope)
+			output.KeyValue("Created", resolved.CreatedAt)
+			output.KeyValue("In Use", resolved.InUse)
+			if resolved.Size > 0 {
+				output.KeyValue("Size", output.Bytes(resolved.Size))
+			}
+			return nil
+		},
+	}
 }
 
-var usageCmd = &cobra.Command{
-	Use:          "usage <volume-name>",
-	Short:        "Get specific volume usage",
-	Args:         cobra.ExactArgs(1),
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := cmdutil.ClientFromCommand(cmd)
-		if err != nil {
-			return err
-		}
+func newDeleteCmd() *cobra.Command {
+	var opts struct {
+		forceFlag bool
+	}
+	cmd := &cobra.Command{
+		Use:          "delete <volume-name>",
+		Aliases:      []string{"rm", "remove"},
+		Short:        "Delete a volume",
+		Args:         cobra.ExactArgs(1),
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := cmdutil.ClientFromCommand(cmd)
+			if err != nil {
+				return err
+			}
 
-		allowPrompt := !jsonOutput && prompt.IsInteractive()
-		resolved, _, err := volumeRef.Resolve(cmd.Context(), c, args[0], allowPrompt)
-		if err != nil {
-			return err
-		}
+			allowPrompt := !opts.forceFlag && cmdutil.AllowPrompt(cmd)
+			resolved, _, err := volumeRef.Resolve(cmd.Context(), c, args[0], allowPrompt)
+			if err != nil {
+				return err
+			}
 
-		result, err := c.GetJSON[any](cmd.Context(), types.VolumeUsage(c.EnvID(), resolved.Name))
-		if err != nil {
-			return fmt.Errorf("failed to get volume usage: %w", err)
-		}
-
-		if jsonOutput {
-			return cmdutil.PrintJSON(result.Data)
-		}
-
-		output.Header("Volume Usage: %s", resolved.Name)
-		return cmdutil.PrintJSON(result.Data)
-	},
+			return cmdutil.RunDelete(cmd, c, cmdutil.DeleteSpec{
+				Force:          opts.forceFlag,
+				Prompt:         fmt.Sprintf("Are you sure you want to delete volume %s?", resolved.Name),
+				Path:           cmdutil.AppendQuery(types.Volume(c.EnvID(), resolved.Name), url.Values{"force": []string{strconv.FormatBool(opts.forceFlag)}}),
+				FailureMessage: "failed to delete volume",
+				SuccessMessage: fmt.Sprintf("Volume %s deleted successfully", resolved.Name),
+			})
+		},
+	}
+	cmd.Flags().BoolVarP(&opts.forceFlag, "force", "f", false, "Force removal of a volume that is in use and skip the confirmation prompt")
+	return cmd
 }
 
-var createCmd = &cobra.Command{
-	Use:          "create",
-	Short:        "Create a volume",
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := cmdutil.ClientFromCommand(cmd)
-		if err != nil {
-			return err
-		}
+func newCountsCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:          "counts",
+		Short:        "Get volume usage counts",
+		SilenceUsage: true,
+		Args:         cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := cmdutil.ClientFromCommand(cmd)
+			if err != nil {
+				return err
+			}
+			return cmdutil.Run(cmd, c, cmdutil.Spec[any]{
+				Method:         http.MethodGet,
+				Path:           types.VolumesCounts(c.EnvID()),
+				FailureMessage: "failed to get volume counts",
+				Render: func(data any) error {
+					output.Header("Volume Usage Counts")
+					return cmdutil.PrintJSON(data)
+				},
+			})
+		},
+	}
+	cmdutil.SetScope(cmdutil.ScopeRead, cmd)
+	return cmd
+}
 
-		req := volume.Create{
-			Name:   volumeCreateName,
-			Driver: volumeCreateDriver,
-		}
+func newPruneCmd() *cobra.Command {
+	var opts struct {
+		forceFlag bool
+	}
+	cmd := &cobra.Command{
+		Use:          "prune",
+		Short:        "Remove unused volumes",
+		SilenceUsage: true,
+		Args:         cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			confirmed, confirmationErr := cmdutil.ConfirmOrCancel(cmd, opts.forceFlag, "Are you sure you want to prune unused volumes?")
+			if confirmationErr != nil || !confirmed {
+				return confirmationErr
+			}
 
-		if len(volumeCreateOpts) > 0 {
-			req.DriverOpts = make(map[string]string)
-			for _, opt := range volumeCreateOpts {
-				parts := strings.SplitN(opt, "=", 2)
-				if len(parts) == 2 {
-					req.DriverOpts[parts[0]] = parts[1]
+			c, err := cmdutil.ClientFromCommand(cmd)
+			if err != nil {
+				return err
+			}
+
+			return cmdutil.Run(cmd, c, cmdutil.Spec[any]{
+				Method:         http.MethodPost,
+				Path:           types.VolumesPrune(c.EnvID()),
+				FailureMessage: "failed to prune volumes",
+				Render:         func(any) error { output.Success("%s", "Volumes pruned successfully"); return nil },
+			})
+		},
+	}
+	cmd.Flags().BoolVarP(&opts.forceFlag, "force", "f", false, "Force prune without confirmation")
+	cmdutil.SetScope(cmdutil.ScopeFleet, cmd)
+	return cmd
+}
+
+func newSizesCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:          "sizes",
+		Short:        "Get volume sizes",
+		SilenceUsage: true,
+		Args:         cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := cmdutil.ClientFromCommand(cmd)
+			if err != nil {
+				return err
+			}
+			return cmdutil.Run(cmd, c, cmdutil.Spec[any]{
+				Method:         http.MethodGet,
+				Path:           types.VolumesSizes(c.EnvID()),
+				FailureMessage: "failed to get volume sizes",
+				Render: func(data any) error {
+					output.Header("Volume Sizes")
+					return cmdutil.PrintJSON(data)
+				},
+			})
+		},
+	}
+	cmdutil.SetScope(cmdutil.ScopeRead, cmd)
+	return cmd
+}
+
+func newUsageCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:          "usage <volume-name>",
+		Short:        "Get specific volume usage",
+		Args:         cobra.ExactArgs(1),
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := cmdutil.ClientFromCommand(cmd)
+			if err != nil {
+				return err
+			}
+
+			allowPrompt := cmdutil.AllowPrompt(cmd)
+			resolved, _, err := volumeRef.Resolve(cmd.Context(), c, args[0], allowPrompt)
+			if err != nil {
+				return err
+			}
+
+			return cmdutil.Run(cmd, c, cmdutil.Spec[any]{
+				Method:         http.MethodGet,
+				Path:           types.VolumeUsage(c.EnvID(), resolved.Name),
+				FailureMessage: "failed to get volume usage",
+				Render: func(data any) error {
+					output.Header("Volume Usage: %s", resolved.Name)
+					return cmdutil.PrintJSON(data)
+				},
+			})
+		},
+	}
+}
+
+func newCreateCmd() *cobra.Command {
+	var opts struct {
+		volumeCreateName   string
+		volumeCreateDriver string
+		volumeCreateOpts   []string
+		volumeCreateLabels []string
+	}
+	cmd := &cobra.Command{
+		Use:          "create",
+		Short:        "Create a volume",
+		SilenceUsage: true,
+		Args:         cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := cmdutil.ClientFromCommand(cmd)
+			if err != nil {
+				return err
+			}
+
+			var driverOpts, labels map[string]string
+
+			if len(opts.volumeCreateOpts) > 0 {
+				driverOpts = make(map[string]string)
+				for _, opt := range opts.volumeCreateOpts {
+					parts := strings.SplitN(opt, "=", 2)
+					if len(parts) == 2 {
+						driverOpts[parts[0]] = parts[1]
+					}
 				}
 			}
-		}
 
-		if len(volumeCreateLabels) > 0 {
-			req.Labels = make(map[string]string)
-			for _, lbl := range volumeCreateLabels {
-				parts := strings.SplitN(lbl, "=", 2)
-				if len(parts) == 2 {
-					req.Labels[parts[0]] = parts[1]
+			if len(opts.volumeCreateLabels) > 0 {
+				labels = make(map[string]string)
+				for _, lbl := range opts.volumeCreateLabels {
+					parts := strings.SplitN(lbl, "=", 2)
+					if len(parts) == 2 {
+						labels[parts[0]] = parts[1]
+					}
 				}
 			}
-		}
 
-		result, err := c.PostJSON[volume.Volume](cmd.Context(), types.Volumes(c.EnvID()), req)
-		if err != nil {
-			return fmt.Errorf("failed to create volume: %w", err)
-		}
-
-		if jsonOutput {
-			return cmdutil.PrintJSON(result.Data)
-		}
-
-		output.Success("Volume %s created successfully", result.Data.Name)
-		output.KeyValue("Name", result.Data.Name)
-		output.KeyValue("Driver", result.Data.Driver)
-		output.KeyValue("Mountpoint", result.Data.Mountpoint)
-		return nil
-	},
-}
-
-func init() {
-	cmdutil.SetScope(cmdutil.ScopeResource, VolumesCmd)
-	cmdutil.SetScope(cmdutil.ScopeRead, listCmd, countsCmd, sizesCmd)
-	cmdutil.SetScope(cmdutil.ScopeFleet, pruneCmd)
-	cmdutil.SetScope(cmdutil.ScopeDestination, createCmd)
-	VolumesCmd.AddCommand(listCmd)
-	VolumesCmd.AddCommand(getCmd)
-	VolumesCmd.AddCommand(deleteCmd)
-	VolumesCmd.AddCommand(countsCmd)
-	VolumesCmd.AddCommand(pruneCmd)
-	VolumesCmd.AddCommand(sizesCmd)
-	VolumesCmd.AddCommand(usageCmd)
-	VolumesCmd.AddCommand(createCmd)
-
-	// List command flags
-	listCmd.Flags().IntVarP(&limitFlag, "limit", "n", 20, "Number of volumes to show")
-	listCmd.Flags().IntVar(&startFlag, "start", 0, cmdutil.StartFlagUsage)
-	listCmd.Flags().BoolVarP(&allFlag, "all", "a", false, cmdutil.AllFlagUsage)
-	listCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
-	listCmd.Flags().BoolVar(&inUseOnlyFlag, "inuse", false, "Only show volumes currently in use")
-	listCmd.Flags().BoolVar(&unusedOnlyFlag, "unused", false, "Only show volumes not in use")
-	listCmd.Flags().BoolVar(&includeInternalFlag, "include-internal", false, "Include Arcane-internal volumes")
-
-	// Get command flags
-	getCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
-
-	// Delete command flags
-	deleteCmd.Flags().BoolVarP(&forceFlag, "force", "f", false, "Force removal of a volume that is in use and skip the confirmation prompt")
-	deleteCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
-
-	// Prune command flags
-	pruneCmd.Flags().BoolVarP(&forceFlag, "force", "f", false, "Force prune without confirmation")
-	pruneCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
-
-	// Other command flags
-	countsCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
-	sizesCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
-	usageCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
-
-	// Create command flags
-	createCmd.Flags().StringVar(&volumeCreateName, "name", "", "Volume name")
-	createCmd.Flags().StringVar(&volumeCreateDriver, "driver", "", "Volume driver")
-	createCmd.Flags().StringArrayVar(&volumeCreateOpts, "opt", nil, "Driver option (KEY=VALUE)")
-	createCmd.Flags().StringArrayVar(&volumeCreateLabels, "label", nil, "Label (KEY=VALUE)")
-	createCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
-	_ = createCmd.MarkFlagRequired("name")
+			return cmdutil.Run(cmd, c, cmdutil.Spec[volume.Volume]{
+				Method: http.MethodPost,
+				Path:   types.Volumes(c.EnvID()),
+				Body: volume.Create{
+					Name:       opts.volumeCreateName,
+					Driver:     opts.volumeCreateDriver,
+					DriverOpts: driverOpts,
+					Labels:     labels,
+				},
+				FailureMessage: "failed to create volume",
+				Render: func(data volume.Volume) error {
+					output.Success("Volume %s created successfully", data.Name)
+					output.KeyValue("Name", data.Name)
+					output.KeyValue("Driver", data.Driver)
+					output.KeyValue("Mountpoint", data.Mountpoint)
+					return nil
+				},
+			})
+		},
+	}
+	cmd.Flags().StringVar(&opts.volumeCreateName, "name", "", "Volume name")
+	cmd.Flags().StringVar(&opts.volumeCreateDriver, "driver", "", "Volume driver")
+	cmd.Flags().StringArrayVar(&opts.volumeCreateOpts, "opt", nil, "Driver option (KEY=VALUE)")
+	cmd.Flags().StringArrayVar(&opts.volumeCreateLabels, "label", nil, "Label (KEY=VALUE)")
+	_ = cmd.MarkFlagRequired("name")
+	cmdutil.SetScope(cmdutil.ScopeDestination, cmd)
+	return cmd
 }
 
 var volumeRef = cmdutil.ResourceRef[volume.Volume, volume.Volume]{
@@ -394,16 +372,12 @@ var volumeRef = cmdutil.ResourceRef[volume.Volume, volume.Volume]{
 	IDHint:            "the volume name",
 	ListCmd:           "arcane volumes list",
 	GetPath:           types.Volume,
+	IdentifierOf:      func(data volume.Volume) string { return data.Name },
 	ListPath:          types.Volumes,
 	Matches: func(item volume.Volume, identifierLower, original string) bool {
-		if strings.EqualFold(item.Name, original) {
-			return true
-		}
-		if strings.Contains(strings.ToLower(item.Name), identifierLower) {
-			return true
-		}
 		idLower := strings.ToLower(item.ID)
-		return idLower == identifierLower || (len(identifierLower) >= 4 && strings.HasPrefix(idLower, identifierLower))
+		return strings.EqualFold(item.Name, original) || strings.Contains(strings.ToLower(item.Name), identifierLower) ||
+			idLower == identifierLower || (len(identifierLower) >= 4 && strings.HasPrefix(idLower, identifierLower))
 	},
 	Label: func(match volume.Volume) string {
 		if match.Driver != "" {

@@ -4,11 +4,12 @@ import (
 	"strings"
 	"testing"
 
+	cligenerate "github.com/getarcaneapp/arcane/cli/v2/pkg/generate"
 	"github.com/stretchr/testify/require"
 )
 
 func TestAPIKeyCommandAvailableInBackendCLI(t *testing.T) {
-	cmd := GenerateCmd
+	cmd := cligenerate.Command()
 	cmd.SetArgs([]string{"api-key"})
 
 	out, err := captureOutput(func() error {

@@ -197,9 +197,7 @@ func UploadSessionChunk(envID, kind, uploadID string, index int) string {
 // Image update endpoints
 
 func ImageUpdatesCheck(envID, imageRef string) string {
-	query := url.Values{}
-	query.Set("imageRef", imageRef)
-	return pathf("/api/environments/%s/image-updates/check", envID) + "?" + query.Encode()
+	return pathf("/api/environments/%s/image-updates/check", envID) + "?" + url.Values{"imageRef": {imageRef}}.Encode()
 }
 
 func ImageUpdatesCheckAll(envID string) string {

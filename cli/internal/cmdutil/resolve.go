@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/getarcaneapp/arcane/types/v2/base"
 	"github.com/getarcaneapp/arcane/types/v2/environment"
 
 	"github.com/getarcaneapp/arcane/cli/v2/internal/client"
@@ -72,6 +73,27 @@ type resourceCandidate[D any] struct {
 	exact    bool
 	envID    string
 	label    string
+}
+
+// Fetch resolves an identifier and retrieves full detail when resolution returned only a summary.
+func (ref ResourceRef[D, S]) Fetch(ctx context.Context, c *client.Client, identifier string, allowPrompt bool) (*D, error) {
+	resolved, complete, err := ref.Resolve(ctx, c, identifier, allowPrompt)
+	if err != nil || complete {
+		return resolved, err
+	}
+	if ref.GetPath == nil || ref.IdentifierOf == nil {
+		return nil, fmt.Errorf("%s reference requires GetPath and IdentifierOf to fetch detail", ref.Singular)
+	}
+	result, fetchErr := c.GetJSON[D](ctx, ref.GetPath(c.EnvID(), ref.IdentifierOf(*resolved)))
+	if fetchErr != nil {
+		return nil, fetchErr
+	}
+	if ref.Validate != nil {
+		if validateErr := ref.Validate(result.Data, identifier); validateErr != nil {
+			return nil, validateErr
+		}
+	}
+	return &result.Data, nil
 }
 
 // Resolve finds one resource and pins its environment for subsequent requests.
@@ -226,7 +248,10 @@ func (ref ResourceRef[D, S]) fetchByIdentifier(ctx context.Context, c *client.Cl
 	}
 
 	if resp.StatusCode == http.StatusOK {
-		var result client.APIResponse[D]
+		var result struct {
+			base.ApiResponse[D]
+			base.ErrorResponse
+		}
 		if unmarshalErr := json.Unmarshal(body, &result); unmarshalErr != nil {
 			return nil, false, fmt.Errorf("failed to parse %s response: %w", ref.Singular, unmarshalErr)
 		}
@@ -295,7 +320,10 @@ func (ref ResourceRef[D, S]) listItems(ctx context.Context, c *client.Client, pa
 		return nil, fmt.Errorf("failed to search %s (status %d): %s", ref.Plural, resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 
-	var result client.APIResponse[[]S]
+	var result struct {
+		base.ApiResponse[[]S]
+		base.ErrorResponse
+	}
 	if unmarshalErr := json.Unmarshal(body, &result); unmarshalErr != nil {
 		return nil, fmt.Errorf("failed to parse %s response: %w", ref.Plural, unmarshalErr)
 	}
@@ -308,13 +336,7 @@ func (ref ResourceRef[D, S]) listItems(ctx context.Context, c *client.Client, pa
 // LooksLikeIDPrefix reports whether identifier could be a hex ID prefix worth
 // scanning the full list for.
 func LooksLikeIDPrefix(identifierLower string) bool {
-	if len(identifierLower) < 4 {
-		return false
-	}
-	for _, r := range identifierLower {
-		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
-			return false
-		}
-	}
-	return true
+	return len(identifierLower) >= 4 && strings.IndexFunc(identifierLower, func(r rune) bool {
+		return (r < '0' || r > '9') && (r < 'a' || r > 'f')
+	}) == -1
 }

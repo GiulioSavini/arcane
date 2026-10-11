@@ -17,6 +17,7 @@ import (
 	"uuid"
 
 	activitytypes "github.com/getarcaneapp/arcane/types/v2/activity"
+	"github.com/getarcaneapp/arcane/types/v2/backup"
 	"github.com/getarcaneapp/arcane/types/v2/containerregistry"
 	"github.com/getarcaneapp/arcane/types/v2/environment"
 	"github.com/getarcaneapp/arcane/types/v2/scheduler"
@@ -1377,9 +1378,7 @@ func (s *EnvironmentService) CheckS3DestinationReferences(ctx context.Context, d
 		if env.AccessToken == nil || strings.TrimSpace(*env.AccessToken) == "" {
 			continue
 		}
-		var result struct {
-			InUse bool `json:"inUse"`
-		}
+		var result backup.S3DestinationUsage
 		path := "/api/backups/s3/" + url.PathEscape(destinationID) + "/in-use"
 		if proxyErr := s.ProxyJSONRequestForEnvironment(ctx, env, http.MethodGet, path, nil, &result); proxyErr != nil {
 			return fmt.Errorf("cannot verify S3 destination references on environment %s; restore connectivity before deleting: %w", env.Name, proxyErr)

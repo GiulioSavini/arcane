@@ -2,8 +2,11 @@ package client
 
 import (
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -290,4 +293,64 @@ func TestClient_DoRaw_Success(t *testing.T) {
 
 	require.NotEmpty(t, b,
 		"expected response payload")
+}
+
+func TestClientDoEnvelope(t *testing.T) {
+	type record struct {
+		Name string `json:"name"`
+	}
+	for _, tt := range []struct {
+		name, method, response, wantErr string
+		status                          int
+		body                            any
+	}{
+		{name: "GET", method: http.MethodGet, status: http.StatusOK, response: `{"success":true,"data":{"name":"arcane"}}`},
+		{
+			name: "POST body", method: http.MethodPost, body: map[string]string{"name": "arcane"}, status: http.StatusCreated,
+			response: `{"success":true,"data":{"name":"arcane"}}`,
+		},
+		{
+			name: "PUT body", method: http.MethodPut, body: map[string]string{"name": "arcane"}, status: http.StatusOK,
+			response: `{"success":true,"data":{"name":"arcane"}}`,
+		},
+		{
+			name: "DELETE body", method: http.MethodDelete, body: map[string]string{"name": "arcane"}, status: http.StatusOK,
+			response: `{"success":true,"data":{"name":"arcane"}}`,
+		},
+		{name: "HTTP failure", method: http.MethodGet, status: http.StatusForbidden, response: `{"error":"denied"}`, wantErr: "request failed with status 403"},
+		{name: "API failure", method: http.MethodGet, status: http.StatusOK, response: `{"success":false,"error":"denied"}`, wantErr: "API error: denied"},
+		{name: "failure without message", method: http.MethodGet, status: http.StatusOK, response: `{"success":false}`, wantErr: "API error: request was not successful"},
+		{name: "missing success", method: http.MethodGet, status: http.StatusOK, response: `{"data":{"name":"arcane"}}`, wantErr: "API error: request was not successful"},
+		{name: "invalid JSON", method: http.MethodGet, status: http.StatusOK, response: `invalid`, wantErr: "failed to decode response"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			requests := make(chan string, 1)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requestBody, readErr := io.ReadAll(r.Body)
+				if readErr != nil {
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				requests <- r.Method + " " + r.URL.RequestURI() + " " + string(requestBody)
+				w.WriteHeader(tt.status)
+				_, _ = fmt.Fprint(w, tt.response)
+			}))
+			defer server.Close()
+			c, newErr := NewUnauthenticated(&types.Config{ServerURL: server.URL})
+			require.NoError(t, newErr)
+			result, requestErr := c.DoEnvelope[record](t.Context(), tt.method, "/api/record?full=true", tt.body)
+			if tt.wantErr != "" {
+				require.ErrorContains(t, requestErr, tt.wantErr)
+			} else {
+				require.NoError(t, requestErr)
+				require.True(t, result.Success)
+				require.Equal(t, record{Name: "arcane"}, result.Data)
+			}
+			request := <-requests
+			require.True(t, strings.HasPrefix(request, tt.method+" /api/record?full=true "))
+			if tt.body != nil {
+				require.Contains(t, request, `{"name":"arcane"}`)
+			}
+		})
+	}
 }

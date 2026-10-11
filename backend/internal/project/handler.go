@@ -124,9 +124,7 @@ type RestartProjectInput struct {
 type UpdateProjectServicesInput struct {
 	EnvironmentID string `path:"id" doc:"Environment ID"`
 	ProjectID     string `path:"projectId" doc:"Project ID"`
-	Body          *struct {
-		Services []string `json:"services,omitempty" doc:"Service names to update; empty updates all services"`
-	}
+	Body          *project.UpdateServicesRequest
 }
 
 type ArchiveProjectInput struct {
@@ -147,12 +145,7 @@ type PullProjectImagesInput struct {
 type BuildProjectInput struct {
 	EnvironmentID string `path:"id" doc:"Environment ID"`
 	ProjectID     string `path:"projectId" doc:"Project ID"`
-	Body          *struct {
-		Services []string `json:"services,omitempty" doc:"Service names to build"`
-		Provider string   `json:"provider,omitempty" doc:"Build provider override"`
-		Push     *bool    `json:"push,omitempty" doc:"Push images"`
-		Load     *bool    `json:"load,omitempty" doc:"Load images into Docker"`
-	}
+	Body          *project.BuildRequest
 }
 
 // ListProjects returns a paginated list of projects.
@@ -245,7 +238,7 @@ func (h *ProjectHandler) UpdateProjectTag(ctx context.Context, input *UpdateProj
 		Type:           activitytypes.TypeResourceAction,
 		ResourceType:   "project",
 		ResourceID:     input.ProjectID,
-		ResourceName:   h.projectActivityNameInternal(runtimeCtx, input.ProjectID),
+		ResourceName:   h.projectActivityName(runtimeCtx, input.ProjectID),
 		User:           user,
 		Step:           "Updating project tags",
 		Message:        "Updating project tags",
@@ -277,10 +270,10 @@ func (h *ProjectHandler) UpdateProjectTag(ctx context.Context, input *UpdateProj
 }
 
 // DeployProject deploys a Docker Compose project.
-// projectStreamOperationConfigInternal describes one streamed project
+// projectStreamOperationConfig describes one streamed project
 // operation (deploy, redeploy, pull, build): the activity it records and the
 // action whose raw docker CLI output is streamed to the client.
-type projectStreamOperationConfigInternal struct {
+type projectStreamOperationConfig struct {
 	ActivityType   activitytypes.Type
 	Step           string
 	StartMessage   string
@@ -294,8 +287,8 @@ type projectStreamOperationConfigInternal struct {
 	Action func(ctx context.Context, writer io.Writer) error
 }
 
-// projectActivityNameInternal returns the project's name for activity records, falling back to its ID.
-func (h *ProjectHandler) projectActivityNameInternal(ctx context.Context, projectID string) string {
+// projectActivityName returns the project's name for activity records, falling back to its ID.
+func (h *ProjectHandler) projectActivityName(ctx context.Context, projectID string) string {
 	proj, err := h.projectService.GetProjectFromDatabaseByID(ctx, projectID)
 	if err != nil || proj.Name == "" {
 		return projectID
@@ -303,11 +296,11 @@ func (h *ProjectHandler) projectActivityNameInternal(ctx context.Context, projec
 	return proj.Name
 }
 
-// streamProjectOperationInternal is the shared scaffold for the streamed
+// streamProjectOperation is the shared scaffold for the streamed
 // project endpoints: NDJSON headers, activity lifecycle (started frame, queue
 // slot, completion), the activity-teeing writer, and the terminal done/error
 // frames.
-func (h *ProjectHandler) streamProjectOperationInternal(environmentID, projectID string, user *usertypes.Actor, cfg projectStreamOperationConfigInternal) *huma.StreamResponse {
+func (h *ProjectHandler) streamProjectOperation(environmentID, projectID string, user *usertypes.Actor, cfg projectStreamOperationConfig) *huma.StreamResponse {
 	return &huma.StreamResponse{
 		Body: func(humaCtx huma.Context) {
 			httpx.SetJSONStreamHeaders(humaCtx)
@@ -325,7 +318,7 @@ func (h *ProjectHandler) streamProjectOperationInternal(environmentID, projectID
 				cfg.ActivityType,
 				"project",
 				projectID,
-				h.projectActivityNameInternal(runtimeCtx, projectID),
+				h.projectActivityName(runtimeCtx, projectID),
 				user,
 				cfg.Step,
 				cfg.StartMessage,
@@ -369,7 +362,7 @@ func (h *ProjectHandler) DeployProject(ctx context.Context, input *DeployProject
 	}
 
 	//nolint:contextcheck // the stream body runs on humaCtx.Context(), not the handler ctx
-	return h.streamProjectOperationInternal(input.EnvironmentID, input.ProjectID, user, projectStreamOperationConfigInternal{
+	return h.streamProjectOperation(input.EnvironmentID, input.ProjectID, user, projectStreamOperationConfig{
 		ActivityType:   activitytypes.TypeProjectDeploy,
 		Step:           "Starting deployment",
 		StartMessage:   "Project deployment started",
@@ -397,7 +390,7 @@ func (h *ProjectHandler) DownProject(ctx context.Context, input *DownProjectInpu
 		activitytypes.TypeProjectDown,
 		"project",
 		input.ProjectID,
-		h.projectActivityNameInternal(
+		h.projectActivityName(
 			runtimeCtx,
 			input.ProjectID,
 		),
@@ -425,7 +418,7 @@ func (h *ProjectHandler) DownProject(ctx context.Context, input *DownProjectInpu
 	return handlerutil.MessageOutput("Project brought down successfully", activityID), nil
 }
 
-func projectUpdateHTTPErrorInternal(err error) error {
+func projectUpdateHTTPError(err error) error {
 	if conflictErr, ok := errors.AsType[*volume.ProjectVolumeRenameConflictError](err); ok {
 		return huma.Error409Conflict(conflictErr.Error())
 	}
@@ -435,12 +428,12 @@ func projectUpdateHTTPErrorInternal(err error) error {
 	if spaceErr, ok := errors.AsType[*volume.ProjectVolumeRenameInsufficientSpaceError](err); ok {
 		return huma.NewError(http.StatusInsufficientStorage, spaceErr.Error())
 	}
-	return projectWorkspaceRequestHTTPErrorInternal(err)
+	return projectWorkspaceRequestHTTPError(err)
 }
 
-// projectWorkspaceRequestHTTPErrorInternal maps workspace validation errors that
+// projectWorkspaceRequestHTTPError maps workspace validation errors that
 // can also surface during atomic project creation or configuration updates.
-func projectWorkspaceRequestHTTPErrorInternal(err error) error {
+func projectWorkspaceRequestHTTPError(err error) error {
 	if errors.Is(err, common.ErrProjectWorkspaceConflict) {
 		return huma.Error409Conflict(err.Error())
 	}
@@ -505,7 +498,7 @@ func (h *ProjectHandler) CreateProject(ctx context.Context, input *CreateProject
 		return createErr
 	})
 	if err != nil {
-		if httpErr := projectWorkspaceRequestHTTPErrorInternal(err); httpErr != nil {
+		if httpErr := projectWorkspaceRequestHTTPError(err); httpErr != nil {
 			return nil, httpErr
 		}
 		return nil, huma.Error500InternalServerError("Failed to create project: " + err.Error())
@@ -557,7 +550,7 @@ func (h *ProjectHandler) GetProject(ctx context.Context, input *GetProjectInput)
 	}, nil
 }
 
-func (h *ProjectHandler) getProjectDetailsWithOptionsInternal(ctx context.Context, input *GetProjectInput, opts project.DetailsOptions) (*handlerutil.Out[project.Details], error) {
+func (h *ProjectHandler) getProjectDetailsWithOptions(ctx context.Context, input *GetProjectInput, opts project.DetailsOptions) (*handlerutil.Out[project.Details], error) {
 	if input.ProjectID == "" {
 		return nil, huma.Error400BadRequest("Project ID is required")
 	}
@@ -576,7 +569,7 @@ func (h *ProjectHandler) getProjectDetailsWithOptionsInternal(ctx context.Contex
 }
 
 func (h *ProjectHandler) GetProjectCompose(ctx context.Context, input *GetProjectInput) (*handlerutil.Out[project.Details], error) {
-	return h.getProjectDetailsWithOptionsInternal(ctx, input, project.DetailsOptions{
+	return h.getProjectDetailsWithOptions(ctx, input, project.DetailsOptions{
 		IncludeComposeContent: true,
 		IncludeEnvState:       true,
 		IncludeIncludeFiles:   true,
@@ -585,13 +578,13 @@ func (h *ProjectHandler) GetProjectCompose(ctx context.Context, input *GetProjec
 }
 
 func (h *ProjectHandler) GetProjectRuntime(ctx context.Context, input *GetProjectInput) (*handlerutil.Out[project.Details], error) {
-	return h.getProjectDetailsWithOptionsInternal(ctx, input, project.DetailsOptions{
+	return h.getProjectDetailsWithOptions(ctx, input, project.DetailsOptions{
 		IncludeRuntimeServices: true,
 	})
 }
 
 func (h *ProjectHandler) GetProjectUpdates(ctx context.Context, input *GetProjectInput) (*handlerutil.Out[project.Details], error) {
-	return h.getProjectDetailsWithOptionsInternal(ctx, input, project.DetailsOptions{
+	return h.getProjectDetailsWithOptions(ctx, input, project.DetailsOptions{
 		IncludeServiceConfigs: true,
 		IncludeUpdateInfo:     true,
 	})
@@ -611,7 +604,7 @@ func (h *ProjectHandler) RedeployProject(ctx context.Context, input *RedeployPro
 	}
 
 	//nolint:contextcheck // the stream body runs on humaCtx.Context(), not the handler ctx
-	return h.streamProjectOperationInternal(input.EnvironmentID, input.ProjectID, user, projectStreamOperationConfigInternal{
+	return h.streamProjectOperation(input.EnvironmentID, input.ProjectID, user, projectStreamOperationConfig{
 		ActivityType:   activitytypes.TypeProjectRedeploy,
 		Step:           "Starting redeploy",
 		StartMessage:   "Project redeploy started",
@@ -655,7 +648,7 @@ func (h *ProjectHandler) DestroyProject(ctx context.Context, input *DestroyProje
 		activitytypes.TypeProjectDestroy,
 		"project",
 		input.ProjectID,
-		h.projectActivityNameInternal(
+		h.projectActivityName(
 			runtimeCtx,
 			input.ProjectID,
 		),
@@ -710,7 +703,7 @@ func (h *ProjectHandler) UpdateProject(ctx context.Context, input *UpdateProject
 		return updateErr
 	})
 	if err != nil {
-		if httpErr := projectUpdateHTTPErrorInternal(err); httpErr != nil {
+		if httpErr := projectUpdateHTTPError(err); httpErr != nil {
 			return nil, httpErr
 		}
 		return nil, huma.Error400BadRequest("Failed to update project: " + err.Error())
@@ -740,7 +733,7 @@ func (h *ProjectHandler) UpdateProject(ctx context.Context, input *UpdateProject
 // RestartProject restarts the given services in a project (all services when none
 // are specified).
 func (h *ProjectHandler) RestartProject(ctx context.Context, input *RestartProjectInput) (*handlerutil.Out[base.MessageResponse], error) {
-	response, err := h.runProjectActivityActionResponseInternal(ctx, input.EnvironmentID, input.ProjectID, h.restartProjectActivityConfigInternal(input.Services))
+	response, err := h.runProjectActivityActionResponse(ctx, input.EnvironmentID, input.ProjectID, h.restartProjectActivityConfig(input.Services))
 	if err != nil {
 		return nil, err
 	}
@@ -757,7 +750,7 @@ func (h *ProjectHandler) UpdateProjectServices(ctx context.Context, input *Updat
 		serviceNames = input.Body.Services
 	}
 
-	response, err := h.runProjectActivityActionResponseInternal(ctx, input.EnvironmentID, input.ProjectID, h.updateProjectServicesActivityConfigInternal(serviceNames))
+	response, err := h.runProjectActivityActionResponse(ctx, input.EnvironmentID, input.ProjectID, h.updateProjectServicesActivityConfig(serviceNames))
 	if err != nil {
 		return nil, err
 	}
@@ -767,7 +760,7 @@ func (h *ProjectHandler) UpdateProjectServices(ctx context.Context, input *Updat
 	}, nil
 }
 
-type projectActivityActionConfigInternal struct {
+type projectActivityActionConfig struct {
 	ActivityType    activitytypes.Type
 	Step            string
 	StartMessage    string
@@ -782,8 +775,8 @@ type projectActivityActionConfigInternal struct {
 	Error  func(error) error
 }
 
-func (h *ProjectHandler) updateProjectServicesActivityConfigInternal(services []string) projectActivityActionConfigInternal {
-	return projectActivityActionConfigInternal{
+func (h *ProjectHandler) updateProjectServicesActivityConfig(services []string) projectActivityActionConfig {
+	return projectActivityActionConfig{
 		ActivityType:    activitytypes.TypeAutoUpdate,
 		Step:            "Updating project services",
 		StartMessage:    "Project services update requested",
@@ -795,14 +788,14 @@ func (h *ProjectHandler) updateProjectServicesActivityConfigInternal(services []
 		Action: func(runtimeCtx context.Context, projectID string, user usertypes.Actor) error {
 			return h.projectService.UpdateProjectServices(runtimeCtx, projectID, services, user, true)
 		},
-		Error: projectArchivedActionErrorInternal(func(err error) error {
+		Error: projectArchivedActionError(func(err error) error {
 			return huma.Error400BadRequest("Failed to update project: " + err.Error())
 		}),
 	}
 }
 
-func (h *ProjectHandler) restartProjectActivityConfigInternal(services []string) projectActivityActionConfigInternal {
-	return projectActivityActionConfigInternal{
+func (h *ProjectHandler) restartProjectActivityConfig(services []string) projectActivityActionConfig {
+	return projectActivityActionConfig{
 		ActivityType:    activitytypes.TypeProjectRestart,
 		Step:            "Restarting project",
 		StartMessage:    "Project restart requested",
@@ -813,13 +806,13 @@ func (h *ProjectHandler) restartProjectActivityConfigInternal(services []string)
 		Action: func(runtimeCtx context.Context, projectID string, user usertypes.Actor) error {
 			return h.projectService.RestartProject(runtimeCtx, projectID, services, user)
 		},
-		Error: projectArchivedActionErrorInternal(func(err error) error {
+		Error: projectArchivedActionError(func(err error) error {
 			return huma.Error400BadRequest("Failed to restart project: " + err.Error())
 		}),
 	}
 }
 
-func projectArchivedActionErrorInternal(fallback func(error) error) func(error) error {
+func projectArchivedActionError(fallback func(error) error) func(error) error {
 	return func(err error) error {
 		if errors.Is(err, common.ErrProjectArchived) {
 			return huma.Error400BadRequest(err.Error())
@@ -828,13 +821,13 @@ func projectArchivedActionErrorInternal(fallback func(error) error) func(error) 
 	}
 }
 
-func (h *ProjectHandler) runProjectActivityActionResponseInternal(
+func (h *ProjectHandler) runProjectActivityActionResponse(
 	ctx context.Context,
 	environmentID string,
 	projectID string,
-	cfg projectActivityActionConfigInternal,
+	cfg projectActivityActionConfig,
 ) (base.ApiResponse[base.MessageResponse], error) {
-	message, err := h.runProjectActivityActionInternal(ctx, environmentID, projectID, cfg)
+	message, err := h.runProjectActivityAction(ctx, environmentID, projectID, cfg)
 	if err != nil {
 		return base.ApiResponse[base.MessageResponse]{}, err
 	}
@@ -845,7 +838,7 @@ func (h *ProjectHandler) runProjectActivityActionResponseInternal(
 	}, nil
 }
 
-func (h *ProjectHandler) runProjectActivityActionInternal(ctx context.Context, environmentID, projectID string, cfg projectActivityActionConfigInternal) (base.MessageResponse, error) {
+func (h *ProjectHandler) runProjectActivityAction(ctx context.Context, environmentID, projectID string, cfg projectActivityActionConfig) (base.MessageResponse, error) {
 	if projectID == "" {
 		return base.MessageResponse{}, huma.Error400BadRequest("Project ID is required")
 	}
@@ -856,7 +849,7 @@ func (h *ProjectHandler) runProjectActivityActionInternal(ctx context.Context, e
 	}
 
 	runtimeCtx := utils.ActivityRuntimeContext(ctx, h.appCtx)
-	projectName := h.projectActivityNameInternal(runtimeCtx, projectID)
+	projectName := h.projectActivityName(runtimeCtx, projectID)
 	var activityID string
 	if cfg.Queue {
 		activityID, runtimeCtx = activitylib.StartHandlerActivity(
@@ -959,7 +952,7 @@ func (h *ProjectHandler) PullProjectImages(ctx context.Context, input *PullProje
 	}
 
 	//nolint:contextcheck // the stream body runs on humaCtx.Context(), not the handler ctx
-	return h.streamProjectOperationInternal(input.EnvironmentID, input.ProjectID, user, projectStreamOperationConfigInternal{
+	return h.streamProjectOperation(input.EnvironmentID, input.ProjectID, user, projectStreamOperationConfig{
 		ActivityType:   activitytypes.TypeProjectPull,
 		Step:           "Pulling project images",
 		StartMessage:   "Project image pull started",
@@ -992,7 +985,7 @@ func (h *ProjectHandler) BuildProjectImages(ctx context.Context, input *BuildPro
 	}
 
 	//nolint:contextcheck // the stream body runs on humaCtx.Context(), not the handler ctx
-	return h.streamProjectOperationInternal(input.EnvironmentID, input.ProjectID, user, projectStreamOperationConfigInternal{
+	return h.streamProjectOperation(input.EnvironmentID, input.ProjectID, user, projectStreamOperationConfig{
 		ActivityType:   activitytypes.TypeProjectBuild,
 		Step:           "Building project images",
 		StartMessage:   "Project image build started",
@@ -1023,7 +1016,7 @@ type UpdateProjectWorkspaceInput struct {
 	RawBody       multipart.Form `contentType:"multipart/form-data"`
 }
 
-func projectWorkspaceHTTPErrorInternal(err error) error {
+func projectWorkspaceHTTPError(err error) error {
 	switch {
 	case errors.Is(err, common.ErrProjectWorkspaceConflict):
 		return huma.Error409Conflict(err.Error())
@@ -1043,7 +1036,7 @@ func projectWorkspaceHTTPErrorInternal(err error) error {
 func (h *ProjectHandler) GetProjectWorkspace(ctx context.Context, input *GetProjectWorkspaceInput) (*handlerutil.Out[workspacetypes.Workspace], error) {
 	result, err := h.projectService.GetProjectWorkspace(ctx, input.ProjectID)
 	if err != nil {
-		return nil, projectWorkspaceHTTPErrorInternal(err)
+		return nil, projectWorkspaceHTTPError(err)
 	}
 	return &handlerutil.Out[workspacetypes.Workspace]{Body: base.ApiResponse[workspacetypes.Workspace]{Success: true, Data: *result}}, nil
 }
@@ -1051,7 +1044,7 @@ func (h *ProjectHandler) GetProjectWorkspace(ctx context.Context, input *GetProj
 func (h *ProjectHandler) GetProjectWorkspaceFile(ctx context.Context, input *GetProjectWorkspaceFileInput) (*handlerutil.Out[workspacetypes.FileContent], error) {
 	result, err := h.projectService.GetProjectWorkspaceFile(ctx, input.ProjectID, input.RelativePath)
 	if err != nil {
-		return nil, projectWorkspaceHTTPErrorInternal(err)
+		return nil, projectWorkspaceHTTPError(err)
 	}
 	return &handlerutil.Out[workspacetypes.FileContent]{Body: base.ApiResponse[workspacetypes.FileContent]{Success: true, Data: *result}}, nil
 }
@@ -1059,7 +1052,7 @@ func (h *ProjectHandler) GetProjectWorkspaceFile(ctx context.Context, input *Get
 func (h *ProjectHandler) DownloadProjectWorkspaceFile(ctx context.Context, input *GetProjectWorkspaceFileInput) (*huma.StreamResponse, error) {
 	reader, size, name, err := h.projectService.DownloadProjectWorkspaceFile(ctx, input.ProjectID, input.RelativePath)
 	if err != nil {
-		return nil, projectWorkspaceHTTPErrorInternal(err)
+		return nil, projectWorkspaceHTTPError(err)
 	}
 	return handlerutil.DownloadResponse(reader, size, name), nil
 }
@@ -1084,7 +1077,7 @@ func (h *ProjectHandler) UpdateProjectWorkspace(ctx context.Context, input *Upda
 	var result *workspacetypes.Workspace
 	runtimeCtx := utils.ActivityRuntimeContext(ctx, h.appCtx)
 	activityID, err := activitylib.RunHandlerActivity(runtimeCtx, h.activityService, activitylib.HandlerOptions{
-		EnvironmentID: input.EnvironmentID, Type: activitytypes.TypeResourceAction, ResourceType: "project", ResourceID: input.ProjectID, ResourceName: h.projectActivityNameInternal(
+		EnvironmentID: input.EnvironmentID, Type: activitytypes.TypeResourceAction, ResourceType: "project", ResourceID: input.ProjectID, ResourceName: h.projectActivityName(
 			runtimeCtx,
 			input.ProjectID,
 		), User: user,
@@ -1096,7 +1089,7 @@ func (h *ProjectHandler) UpdateProjectWorkspace(ctx context.Context, input *Upda
 		return updateErr
 	})
 	if err != nil {
-		return nil, projectWorkspaceHTTPErrorInternal(err)
+		return nil, projectWorkspaceHTTPError(err)
 	}
 	result.ActivityID = mo.EmptyableToOption(strings.TrimSpace(activityID)).ToPointer()
 	return &handlerutil.Out[workspacetypes.Workspace]{Body: base.ApiResponse[workspacetypes.Workspace]{Success: true, Data: *result}}, nil

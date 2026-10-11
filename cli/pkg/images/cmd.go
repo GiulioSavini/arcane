@@ -7,592 +7,411 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/url"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 
+	"github.com/getarcaneapp/arcane/types/v2/base"
 	"github.com/getarcaneapp/arcane/types/v2/image"
-	uploadtypes "github.com/getarcaneapp/arcane/types/v2/upload"
+	"github.com/getarcaneapp/arcane/types/v2/upload"
 	"github.com/spf13/cobra"
+	kit "go.getarcane.app/kit/pkg"
 
 	"github.com/getarcaneapp/arcane/cli/v2/internal/client"
 	"github.com/getarcaneapp/arcane/cli/v2/internal/cmdutil"
 	"github.com/getarcaneapp/arcane/cli/v2/internal/logger"
 	"github.com/getarcaneapp/arcane/cli/v2/internal/output"
-	"github.com/getarcaneapp/arcane/cli/v2/internal/prompt"
 	"github.com/getarcaneapp/arcane/cli/v2/internal/types"
 	"github.com/getarcaneapp/arcane/cli/v2/pkg/images/updates"
 )
 
-var (
-	imagesLimit      int
-	imagesStart      int
-	imagesSort       string
-	imagesOrder      string
-	imagesSearch     string
-	imagesInUseOnly  bool
-	imagesUnusedOnly bool
-	imagesAll        bool
-
-	imagesUpdatesFilter string
-)
-
-// ImagesCmd is the parent command for image operations
-var ImagesCmd = &cobra.Command{
-	Use:     "images",
-	Aliases: []string{"image", "i"},
-	Short:   "Manage images",
-}
-
-var imagesListCmd = &cobra.Command{
-	Use:          "list",
-	Aliases:      []string{"ls"},
-	Short:        "List images",
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := cmdutil.ClientFromCommand(cmd)
-		if err != nil {
-			return err
-		}
-		if imagesInUseOnly && imagesUnusedOnly {
-			return errors.New("--inuse and --unused cannot be used together")
-		}
-
-		query := url.Values{}
-		if imagesSort != "" {
-			query.Set("sort", imagesSort)
-		}
-		if imagesOrder != "" {
-			query.Set("order", imagesOrder)
-		}
-		if imagesSearch != "" {
-			query.Set("search", imagesSearch)
-		}
-		// Filter server-side so that pagination and the reported totals apply to
-		// the matching set rather than to whichever page happened to be fetched.
-		if imagesInUseOnly {
-			query.Set("inUse", "true")
-		}
-		if imagesUnusedOnly {
-			query.Set("inUse", "false")
-		}
-		if imagesUpdatesFilter != "" {
-			query.Set("updates", imagesUpdatesFilter)
-		}
-
-		return cmdutil.RunList(cmd, c, cmdutil.ListSpec[image.Summary]{
-			Resource: "images",
-			Endpoint: types.Images(c.EnvID()),
-			Params: cmdutil.ListParams{
-				Resource:        "images",
-				Limit:           imagesLimit,
-				FallbackDefault: 0,
-				Start:           imagesStart,
-				All:             imagesAll,
-			},
-			Query:   query,
-			JSON:    cmdutil.JSONOutputEnabled(cmd),
-			Headers: []string{"ID", "REPOSITORY:TAG", "SIZE", "IN USE"},
-			Row: func(img image.Summary) []string {
-				tag := "<none>"
-				if len(img.RepoTags) > 0 {
-					tag = img.RepoTags[0]
-				}
-				inUse := "No"
-				if img.InUse {
-					inUse = "Yes"
-				}
-				return []string{img.ID, tag, output.Bytes(img.Size), inUse}
-			},
-		})
-	},
-}
-
-var imagesGetCmd = &cobra.Command{
-	Use:          "get <image-id|name>",
-	Short:        "Get image details by ID or name",
-	Args:         cobra.ExactArgs(1),
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		log := logger.GetLogger()
-		c, err := cmdutil.ClientFromCommand(cmd)
-		if err != nil {
-			return err
-		}
-
-		jsonOutput := cmdutil.JSONOutputEnabled(cmd)
-		allowPrompt := !jsonOutput && prompt.IsInteractive()
-
-		resolved, _, err := ImageRef.Resolve(cmd.Context(), c, args[0], allowPrompt)
-		if err != nil {
-			return err
-		}
-		path := types.Image(c.EnvID(), resolved.ID)
-
-		log.Debugf("Getting image details from: %s", path)
-
-		resp, err := c.Get(cmd.Context(), path)
-		if err != nil {
-			return fmt.Errorf("failed to get image: %w", err)
-		}
-		defer func() { _ = resp.Body.Close() }()
-
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return fmt.Errorf("failed to read response: %w", err)
-		}
-
-		log.Debugf("Response body: %s", string(body))
-
-		if jsonOutput {
-			_, _ = fmt.Fprintln(output.Stdout(), string(body))
-			return nil
-		}
-
-		var result struct {
-			Success bool                `json:"success"`
-			Data    image.DetailSummary `json:"data"`
-		}
-
-		if unmarshalErr := json.Unmarshal(body, &result); unmarshalErr != nil {
-			return fmt.Errorf("failed to parse response: %w", unmarshalErr)
-		}
-
-		output.Header("Image Details")
-		output.KeyValue("ID", result.Data.ID)
-		if len(result.Data.RepoTags) > 0 {
-			output.KeyValue("Tags", strings.Join(result.Data.RepoTags, ", "))
-		}
-		output.KeyValue("Size", output.Bytes(result.Data.Size))
-		output.KeyValue("Architecture", result.Data.Architecture)
-		output.KeyValue("OS", result.Data.Os)
-		if result.Data.Created != "" {
-			output.KeyValue("Created", result.Data.Created)
-		}
-		if result.Data.Author != "" {
-			output.KeyValue("Author", result.Data.Author)
-		}
-
-		if result.Data.Config.WorkingDir != "" {
-			output.KeyValue("Working Dir", result.Data.Config.WorkingDir)
-		}
-
-		if len(result.Data.Config.Cmd) > 0 {
-			output.KeyValue("Cmd", strings.Join(result.Data.Config.Cmd, " "))
-		}
-
-		if len(result.Data.Config.Env) > 0 {
-			output.Header("Environment Variables")
-			for _, env := range result.Data.Config.Env {
-				_, _ = fmt.Fprintln(output.Stdout(), env)
-			}
-		}
-
-		if len(result.Data.Config.ExposedPorts) > 0 {
-			output.Header("Exposed Ports")
-			var ports []string
-			for p := range result.Data.Config.ExposedPorts {
-				ports = append(ports, p)
-			}
-			sort.Strings(ports)
-			for _, p := range ports {
-				_, _ = fmt.Fprintln(output.Stdout(), p)
-			}
-		}
-
-		return nil
-	},
-}
-
-var removeForce bool
-
-var imagesRemoveCmd = &cobra.Command{
-	Use:          "remove <image-id|name>",
-	Aliases:      []string{"rm", "delete"},
-	Short:        "Remove an image",
-	Args:         cobra.ExactArgs(1),
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		log := logger.GetLogger()
-		c, err := cmdutil.ClientFromCommand(cmd)
-		if err != nil {
-			return err
-		}
-
-		resolved, _, err := ImageRef.Resolve(cmd.Context(), c, args[0], false)
-		if err != nil {
-			return err
-		}
-		path := types.Image(c.EnvID(), resolved.ID)
-
-		if removeForce {
-			u, parseErr := url.Parse(path)
-			if parseErr != nil {
-				return fmt.Errorf("failed to parse path: %w", parseErr)
-			}
-			q := u.Query()
-			q.Set("force", "true")
-			u.RawQuery = q.Encode()
-			path = u.String()
-		}
-
-		log.Debugf("Removing image from: %s", path)
-
-		resp, err := c.Delete(cmd.Context(), path)
-		if err != nil {
-			return fmt.Errorf("failed to remove image: %w", err)
-		}
-		defer func() { _ = resp.Body.Close() }()
-		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-			return fmt.Errorf("failed to remove image (status %d): %s", resp.StatusCode, strings.TrimSpace(string(errBody)))
-		}
-
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return fmt.Errorf("failed to read response: %w", err)
-		}
-
-		log.Debugf("Response body: %s", string(body))
-
-		if cmdutil.JSONOutputEnabled(cmd) {
-			_, _ = fmt.Fprintln(output.Stdout(), string(body))
-			return nil
-		}
-
-		var result struct {
-			Success bool `json:"success"`
-			Data    struct {
-				Message string `json:"message"`
-			} `json:"data"`
-		}
-
-		if unmarshalErr := json.Unmarshal(body, &result); unmarshalErr != nil {
-			return fmt.Errorf("failed to parse response: %w", unmarshalErr)
-		}
-
-		output.Success("%s", result.Data.Message)
-
-		return nil
-	},
-}
-
-var imagesPullCmd = &cobra.Command{
-	Use:          "pull [IMAGE_NAME]",
-	Short:        "Pull an image from a registry",
-	Args:         cobra.ExactArgs(1),
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		log := logger.GetLogger()
-		c, err := cmdutil.ClientFromCommand(cmd)
-		if err != nil {
-			return err
-		}
-
-		// Pulling large images can take a long time
-		c.SetTimeout(30 * time.Minute)
-
-		imageName := args[0]
-		path := types.ImagesPull(c.EnvID())
-
-		log.Debugf("Pulling image from: %s", path)
-
-		requestBody := map[string]any{
-			"imageName": imageName,
-		}
-
-		resp, err := c.Post(cmd.Context(), path, requestBody)
-		if err != nil {
-			return fmt.Errorf("failed to pull image: %w", err)
-		}
-		defer func() { _ = resp.Body.Close() }()
-		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-			return fmt.Errorf("failed to pull image (status %d): %s", resp.StatusCode, strings.TrimSpace(string(errBody)))
-		}
-
-		// Stream the response
-		if cmdutil.JSONOutputEnabled(cmd) {
-			_, err = io.Copy(cmd.OutOrStdout(), resp.Body)
-			if err != nil {
-				return fmt.Errorf("failed to read pull stream: %w", err)
-			}
-			return nil
-		}
-
-		output.Info("Pulling image: %s", imageName)
-
-		decoder := jsontext.NewDecoder(resp.Body)
-		loading := output.StartTracker(cmd.Context(), cmd.ErrOrStderr(), true)
-		defer loading.Stop()
-
-		for {
-			var event struct {
-				Type           string `json:"type"`
-				Status         string `json:"status"`
-				Error          string `json:"error"`
-				ID             string `json:"id"`
-				ProgressDetail struct {
-					Current int64 `json:"current"`
-					Total   int64 `json:"total"`
-				} `json:"progressDetail"`
-			}
-
-			if unmarshalDecodeErr := json.UnmarshalDecode(decoder, &event); unmarshalDecodeErr != nil {
-				if errors.Is(unmarshalDecodeErr, io.EOF) {
-					break
-				}
-				return fmt.Errorf("failed to decode stream: %w", unmarshalDecodeErr)
-			}
-
-			// The stream opens with an activity frame that carries no Docker
-			// status; printing it would emit a blank line per pull.
-			if event.Type != "" && event.Status == "" && event.Error == "" {
-				continue
-			}
-
-			if event.Error != "" {
-				pullErr := fmt.Errorf("pull error: %s", event.Error)
-				loading.Finish(event.ID, pullErr)
-				return pullErr
-			}
-			if event.ID != "" {
-				label := event.Status + " " + event.ID
-				loading.SetProgress(event.ID, label, event.ProgressDetail.Current, event.ProgressDetail.Total, true)
-				if event.Status == "Download complete" || event.Status == "Pull complete" || event.Status == "Already exists" {
-					loading.Finish(event.ID, nil)
-				}
-			}
-			if !output.IsTerminal(cmd.ErrOrStderr()) || !output.IsTerminal(cmd.OutOrStdout()) || event.ID == "" {
-				if event.Status != "Downloading" && event.Status != "Extracting" {
-					deferResume := output.SuspendProgress()
-					if event.ID != "" {
-						_, _ = fmt.Fprintf(cmd.OutOrStdout(), "%s: %s\n", event.ID, event.Status)
-					} else {
-						_, _ = fmt.Fprintln(cmd.OutOrStdout(), event.Status)
-					}
-					deferResume()
-				}
-			}
-		}
-		loading.Stop()
-
-		output.Success("Image pulled successfully")
-
-		return nil
-	},
-}
-
-var pruneDangling bool
-
-var imagesPruneCmd = &cobra.Command{
-	Use:          "prune",
-	Short:        "Remove unused images",
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		log := logger.GetLogger()
-		c, err := cmdutil.ClientFromCommand(cmd)
-		if err != nil {
-			return err
-		}
-
-		path := types.ImagesPrune(c.EnvID())
-
-		log.Debugf("Pruning images from: %s", path)
-
-		requestBody := map[string]any{
-			"dangling": pruneDangling,
-		}
-
-		jsonOutput := cmdutil.JSONOutputEnabled(cmd)
-		loading := output.StartTracker(cmd.Context(), cmd.ErrOrStderr(), !jsonOutput, "Pruning images")
-		loading.NextStep()
-		defer loading.Stop()
-		resp, err := c.Post(cmd.Context(), path, requestBody)
-		if err != nil {
-			return fmt.Errorf("failed to prune images: %w", err)
-		}
-		defer func() { _ = resp.Body.Close() }()
-		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-			return fmt.Errorf("failed to prune images (status %d): %s", resp.StatusCode, strings.TrimSpace(string(errBody)))
-		}
-
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return fmt.Errorf("failed to read response: %w", err)
-		}
-
-		log.Debugf("Response body: %s", string(body))
-
-		if cmdutil.JSONOutputEnabled(cmd) {
-			_, _ = fmt.Fprintln(output.Stdout(), string(body))
-			return nil
-		}
-
-		var result struct {
-			Success bool `json:"success"`
-			Data    struct {
-				ImagesDeleted  []string `json:"imagesDeleted"`
-				SpaceReclaimed int64    `json:"spaceReclaimed"`
-			} `json:"data"`
-		}
-
-		if unmarshalErr := json.Unmarshal(body, &result); unmarshalErr != nil {
-			return fmt.Errorf("failed to parse response: %w", unmarshalErr)
-		}
-
-		output.Success("Pruned %d images, reclaimed %s", len(result.Data.ImagesDeleted), output.Bytes(result.Data.SpaceReclaimed))
-
-		return nil
-	},
-}
-
-var imagesCountsCmd = &cobra.Command{
-	Use:          "counts",
-	Short:        "Get image usage counts",
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		log := logger.GetLogger()
-		c, err := cmdutil.ClientFromCommand(cmd)
-		if err != nil {
-			return err
-		}
-
-		path := types.ImagesCounts(c.EnvID())
-
-		log.Debugf("Getting image counts from: %s", path)
-
-		resp, err := c.Get(cmd.Context(), path)
-		if err != nil {
-			return fmt.Errorf("failed to get image counts: %w", err)
-		}
-		defer func() { _ = resp.Body.Close() }()
-
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return fmt.Errorf("failed to read response: %w", err)
-		}
-
-		log.Debugf("Response body: %s", string(body))
-
-		if cmdutil.JSONOutputEnabled(cmd) {
-			_, _ = fmt.Fprintln(output.Stdout(), string(body))
-			return nil
-		}
-
-		var result struct {
-			Success bool              `json:"success"`
-			Data    image.UsageCounts `json:"data"`
-		}
-
-		if unmarshalErr := json.Unmarshal(body, &result); unmarshalErr != nil {
-			return fmt.Errorf("failed to parse response: %w", unmarshalErr)
-		}
-
-		output.Header("Image Usage Counts")
-		output.KeyValue("In Use", result.Data.Inuse)
-		output.KeyValue("Unused", result.Data.Unused)
-		output.KeyValue("Total", result.Data.Total)
-		output.KeyValue("Total Size", output.Bytes(result.Data.TotalSize))
-
-		return nil
-	},
-}
-
-var imagesUploadCmd = &cobra.Command{
-	Use:          "upload [FILE]",
-	Short:        "Upload a Docker image from a tar archive",
-	Args:         cobra.ExactArgs(1),
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		log := logger.GetLogger()
-		c, err := cmdutil.ClientFromCommand(cmd)
-		if err != nil {
-			return err
-		}
-
-		// Uploading large images can take a long time
-		c.SetTimeout(30 * time.Minute)
-
-		filePath := args[0]
-		output.Info("Uploading image: %s", filePath)
-
-		jsonOutput := cmdutil.JSONOutputEnabled(cmd)
-		sessionID, err := cmdutil.UploadFileInChunks(cmd.Context(), c, uploadtypes.KindImage, filePath, !jsonOutput)
-		if err != nil {
-			return err
-		}
-
-		respBody, err := c.DoRaw(cmd.Context(), http.MethodPost, types.ImagesUpload(c.EnvID()), uploadtypes.ConsumeRequest{UploadID: sessionID})
-		if err != nil {
-			cmdutil.AbortUploadSession(cmd.Context(), c, uploadtypes.KindImage, sessionID)
-			return fmt.Errorf("failed to upload image: %w", err)
-		}
-
-		log.Debugf("Response body: %s", string(respBody))
-
-		if jsonOutput {
-			_, _ = fmt.Fprintln(output.Stdout(), string(respBody))
-			return nil
-		}
-
-		var result struct {
-			Success bool             `json:"success"`
-			Data    image.LoadResult `json:"data"`
-		}
-
-		if unmarshalErr := json.Unmarshal(respBody, &result); unmarshalErr != nil {
-			return fmt.Errorf("failed to parse response: %w", unmarshalErr)
-		}
-
-		if !result.Success {
-			return fmt.Errorf("upload failed: %s", string(respBody))
-		}
-
-		output.Success("Image uploaded successfully")
-
-		return nil
-	},
-}
-
-func init() {
-	cmdutil.SetScope(cmdutil.ScopeResource, ImagesCmd)
-	cmdutil.SetScope(cmdutil.ScopeRead, imagesListCmd, imagesCountsCmd)
-	cmdutil.SetScope(cmdutil.ScopeFleet, imagesPruneCmd)
-	cmdutil.SetScope(cmdutil.ScopeDestination, imagesPullCmd, imagesUploadCmd)
-	ImagesCmd.AddCommand(imagesListCmd)
-	imagesListCmd.Flags().IntVarP(&imagesLimit, "limit", "n", 0, "Number of images to show (server default 20)")
-	imagesListCmd.Flags().IntVar(&imagesStart, "start", 0, cmdutil.StartFlagUsage)
-	imagesListCmd.Flags().BoolVarP(&imagesAll, "all", "a", false, cmdutil.AllFlagUsage)
-	imagesListCmd.Flags().StringVar(&imagesUpdatesFilter, "updates", "", "Filter by update status (has_update, up_to_date, error, unknown)")
-	imagesListCmd.Flags().StringVar(&imagesSort, "sort", "", "Field to sort by")
-	imagesListCmd.Flags().StringVar(&imagesOrder, "order", "", "Sort order (asc/desc)")
-	imagesListCmd.Flags().StringVar(&imagesSearch, "search", "", "Search query")
-	imagesListCmd.Flags().BoolVar(&imagesInUseOnly, "inuse", false, "Only show images currently in use")
-	imagesListCmd.Flags().BoolVar(&imagesUnusedOnly, "unused", false, "Only show images not in use")
-
-	ImagesCmd.AddCommand(imagesGetCmd)
-
-	ImagesCmd.AddCommand(imagesRemoveCmd)
-	imagesRemoveCmd.Flags().BoolVarP(&removeForce, "force", "f", false, "Force removal of image")
-
-	ImagesCmd.AddCommand(imagesPullCmd)
-
-	ImagesCmd.AddCommand(imagesPruneCmd)
-	imagesPruneCmd.Flags().BoolVar(&pruneDangling, "dangling", false, "Only remove dangling images")
-
-	ImagesCmd.AddCommand(imagesCountsCmd)
-	ImagesCmd.AddCommand(updates.UpdatesCmd)
-	for _, command := range updates.UpdatesCmd.Commands() {
-		if command.Name() == "check-image" {
-			cmdutil.SetResource(ImageRef, command)
+// Command builds the images command tree.
+func Command() *cobra.Command {
+	command := &cobra.Command{
+		Annotations: map[string]string{"arcane:scope": cmdutil.ScopeResource},
+		Use:         "images",
+		Aliases:     []string{"image", "i"},
+		Short:       "Manage images",
+	}
+	updateCommand := updates.Command()
+	for _, child := range updateCommand.Commands() {
+		if child.Name() == "check-image" {
+			cmdutil.SetResource(ImageRef, child)
 		}
 	}
+	command.AddCommand(
+		newListCmd(), newGetCmd(), newRemoveCmd(), newPullCmd(), newPruneCmd(),
+		newCountsCmd(), newUploadCmd(), newSearchCmd(), newHistoryCmd(), newTagCmd(),
+		newExportCmd(), newAttestationsCmd(), newBuildCmd(), newBuildsCmd(), updateCommand,
+	)
+	return command
+}
 
-	ImagesCmd.AddCommand(imagesUploadCmd)
+func newListCmd() *cobra.Command {
+	var opts struct {
+		limit         int
+		start         int
+		sort          string
+		order         string
+		search        string
+		inUseOnly     bool
+		unusedOnly    bool
+		all           bool
+		updatesFilter string
+	}
+	command := &cobra.Command{
+		Annotations:  map[string]string{"arcane:scope": cmdutil.ScopeRead},
+		Use:          "list",
+		Aliases:      []string{"ls"},
+		Short:        "List images",
+		SilenceUsage: true,
+		Args:         cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := cmdutil.ClientFromCommand(cmd)
+			if err != nil {
+				return err
+			}
+
+			query := url.Values{}
+			if opts.sort != "" {
+				query.Set("sort", opts.sort)
+			}
+			if opts.order != "" {
+				query.Set("order", opts.order)
+			}
+			if opts.search != "" {
+				query.Set("search", opts.search)
+			}
+			// Filter server-side so that pagination and the reported totals apply to
+			// the matching set rather than to whichever page happened to be fetched.
+			if opts.inUseOnly {
+				query.Set("inUse", "true")
+			}
+			if opts.unusedOnly {
+				query.Set("inUse", "false")
+			}
+			if opts.updatesFilter != "" {
+				query.Set("updates", opts.updatesFilter)
+			}
+
+			return cmdutil.RunList(cmd, c, cmdutil.ListSpec[image.Summary]{
+				Resource: "images",
+				Endpoint: types.Images(c.EnvID()),
+				Params: cmdutil.ListParams{
+					Resource:        "images",
+					Limit:           opts.limit,
+					FallbackDefault: 0,
+					Start:           opts.start,
+					All:             opts.all,
+				},
+				Query:   query,
+				Headers: []string{"ID", "REPOSITORY:TAG", "SIZE", "IN USE"},
+				Row: func(img image.Summary) []string {
+					tag := "<none>"
+					if len(img.RepoTags) > 0 {
+						tag = img.RepoTags[0]
+					}
+					return []string{img.ID, tag, output.Bytes(img.Size), kit.Ternary(img.InUse, "Yes", "No")}
+				},
+			})
+		},
+	}
+	command.Flags().IntVarP(&opts.limit, "limit", "n", 0, "Number of images to show (server default 20)")
+	command.Flags().IntVar(&opts.start, "start", 0, cmdutil.StartFlagUsage)
+	command.Flags().BoolVarP(&opts.all, "all", "a", false, cmdutil.AllFlagUsage)
+	cmdutil.EnumVarP(command, command.Flags(), &opts.updatesFilter, "updates", "", "", "Filter by update status", "has_update", "up_to_date", "error", "unknown")
+	command.Flags().StringVar(&opts.sort, "sort", "", "Field to sort by")
+	cmdutil.EnumVarP(command, command.Flags(), &opts.order, "order", "", "", "Sort order", "asc", "desc")
+	command.Flags().StringVar(&opts.search, "search", "", "Search query")
+	command.Flags().BoolVar(&opts.inUseOnly, "inuse", false, "Only show images currently in use")
+	command.Flags().BoolVar(&opts.unusedOnly, "unused", false, "Only show images not in use")
+	command.PreRunE = func(cmd *cobra.Command, _ []string) error { return cmdutil.ExclusiveFlags(cmd, "inuse", "unused") }
+	return command
+}
+
+func newGetCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:          "get <image-id|name>",
+		Short:        "Get image details by ID or name",
+		Args:         cobra.ExactArgs(1),
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			log := logger.GetLogger()
+			c, err := cmdutil.ClientFromCommand(cmd)
+			if err != nil {
+				return err
+			}
+
+			allowPrompt := cmdutil.AllowPrompt(cmd)
+
+			resolved, _, err := ImageRef.Resolve(cmd.Context(), c, args[0], allowPrompt)
+			if err != nil {
+				return err
+			}
+			path := types.Image(c.EnvID(), resolved.ID)
+
+			log.Debugf("Getting image details from: %s", path)
+
+			return cmdutil.Run(cmd, c, cmdutil.Spec[image.DetailSummary]{
+				Method: http.MethodGet, Path: path, Body: nil, FailureMessage: "failed to get image",
+				Render: func(data image.DetailSummary) error {
+					output.Header("Image Details")
+					output.KeyValue("ID", data.ID)
+					if len(data.RepoTags) > 0 {
+						output.KeyValue("Tags", strings.Join(data.RepoTags, ", "))
+					}
+					output.KeyValue("Size", output.Bytes(data.Size))
+					output.KeyValue("Architecture", data.Architecture)
+					output.KeyValue("OS", data.Os)
+					if data.Created != "" {
+						output.KeyValue("Created", data.Created)
+					}
+					if data.Author != "" {
+						output.KeyValue("Author", data.Author)
+					}
+
+					if data.Config.WorkingDir != "" {
+						output.KeyValue("Working Dir", data.Config.WorkingDir)
+					}
+
+					if len(data.Config.Cmd) > 0 {
+						output.KeyValue("Cmd", strings.Join(data.Config.Cmd, " "))
+					}
+
+					if len(data.Config.Env) > 0 {
+						output.Header("Environment Variables")
+						for _, env := range data.Config.Env {
+							_, _ = fmt.Fprintln(output.Stdout(), env)
+						}
+					}
+
+					if len(data.Config.ExposedPorts) > 0 {
+						output.Header("Exposed Ports")
+						for _, p := range slices.Sorted(maps.Keys(data.Config.ExposedPorts)) {
+							_, _ = fmt.Fprintln(output.Stdout(), p)
+						}
+					}
+
+					return nil
+				},
+			})
+		},
+	}
+}
+
+func newRemoveCmd() *cobra.Command {
+	var opts struct {
+		force bool
+	}
+	command := &cobra.Command{
+		Use:          "remove <image-id|name>",
+		Aliases:      []string{"rm", "delete"},
+		Short:        "Remove an image",
+		Args:         cobra.ExactArgs(1),
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			log := logger.GetLogger()
+			c, err := cmdutil.ClientFromCommand(cmd)
+			if err != nil {
+				return err
+			}
+
+			resolved, _, err := ImageRef.Resolve(cmd.Context(), c, args[0], false)
+			if err != nil {
+				return err
+			}
+			path := types.Image(c.EnvID(), resolved.ID)
+
+			if opts.force {
+				u, parseErr := url.Parse(path)
+				if parseErr != nil {
+					return fmt.Errorf("failed to parse path: %w", parseErr)
+				}
+				q := u.Query()
+				q.Set("force", "true")
+				u.RawQuery = q.Encode()
+				path = u.String()
+			}
+
+			log.Debugf("Removing image from: %s", path)
+
+			confirmed, confirmErr := cmdutil.ConfirmOrCancel(cmd, opts.force, fmt.Sprintf("Are you sure you want to remove image %s?", args[0]))
+			if confirmErr != nil || !confirmed {
+				return confirmErr
+			}
+			return cmdutil.Run(cmd, c, cmdutil.Spec[base.MessageResponse]{
+				Method: http.MethodDelete, Path: path, FailureMessage: "failed to remove image",
+				Render: func(data base.MessageResponse) error {
+					output.Success("%s", data.Message)
+					return nil
+				},
+			})
+		},
+	}
+	command.Flags().BoolVarP(&opts.force, "force", "f", false, "Force removal of image")
+	return command
+}
+
+func newPullCmd() *cobra.Command {
+	return &cobra.Command{
+		Annotations:  map[string]string{"arcane:scope": cmdutil.ScopeDestination},
+		Use:          "pull <image>",
+		Short:        "Pull an image from a registry",
+		Args:         cobra.ExactArgs(1),
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			log := logger.GetLogger()
+			c, err := cmdutil.ClientFromCommand(cmd)
+			if err != nil {
+				return err
+			}
+
+			// Pulling large images can take a long time
+			c.SetTimeout(30 * time.Minute)
+
+			imageName := args[0]
+			path := types.ImagesPull(c.EnvID())
+
+			log.Debugf("Pulling image from: %s", path)
+
+			requestBody := image.PullOptions{ImageName: imageName}
+
+			resp, err := c.Post(cmd.Context(), path, requestBody)
+			if err != nil {
+				return fmt.Errorf("failed to pull image: %w", err)
+			}
+			defer func() { _ = resp.Body.Close() }()
+			if statusErr := cmdutil.EnsureSuccessStatus(resp); statusErr != nil {
+				return fmt.Errorf("failed to pull image: %w", statusErr)
+			}
+
+			if !cmdutil.JSONOutputEnabled(cmd) {
+				output.Info("Pulling image: %s", imageName)
+			}
+			return readPullStream(cmd, resp.Body)
+		},
+	}
+}
+
+func newPruneCmd() *cobra.Command {
+	var opts struct {
+		dangling bool
+	}
+	command := &cobra.Command{
+		Annotations:  map[string]string{"arcane:scope": cmdutil.ScopeFleet},
+		Use:          "prune",
+		Short:        "Remove unused images",
+		SilenceUsage: true,
+		Args:         cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			log := logger.GetLogger()
+			c, err := cmdutil.ClientFromCommand(cmd)
+			if err != nil {
+				return err
+			}
+
+			path := types.ImagesPrune(c.EnvID())
+
+			log.Debugf("Pruning images from: %s", path)
+
+			requestBody := map[string]any{
+				"dangling": opts.dangling,
+			}
+
+			confirmed, confirmErr := cmdutil.ConfirmOrCancel(cmd, false, "Are you sure you want to remove unused images?")
+			if confirmErr != nil || !confirmed {
+				return confirmErr
+			}
+			return cmdutil.Run(cmd, c, cmdutil.Spec[image.PruneReport]{
+				Method: http.MethodPost, Path: path, Body: requestBody, FailureMessage: "failed to prune images",
+				Render: func(data image.PruneReport) error {
+					output.Success("Pruned %d images, reclaimed %s", len(data.ImagesDeleted), output.Bytes(data.SpaceReclaimed))
+
+					return nil
+				},
+			})
+		},
+	}
+	command.Flags().BoolVar(&opts.dangling, "dangling", false, "Only remove dangling images")
+	return command
+}
+
+func newCountsCmd() *cobra.Command {
+	return &cobra.Command{
+		Annotations:  map[string]string{"arcane:scope": cmdutil.ScopeRead},
+		Use:          "counts",
+		Short:        "Get image usage counts",
+		SilenceUsage: true,
+		Args:         cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			log := logger.GetLogger()
+			c, err := cmdutil.ClientFromCommand(cmd)
+			if err != nil {
+				return err
+			}
+
+			path := types.ImagesCounts(c.EnvID())
+
+			log.Debugf("Getting image counts from: %s", path)
+
+			return cmdutil.Run(cmd, c, cmdutil.Spec[image.UsageCounts]{
+				Method: http.MethodGet, Path: path, Body: nil, FailureMessage: "failed to get image counts",
+				Render: func(data image.UsageCounts) error {
+					output.Header("Image Usage Counts")
+					output.KeyValue("In Use", data.Inuse)
+					output.KeyValue("Unused", data.Unused)
+					output.KeyValue("Total", data.Total)
+					output.KeyValue("Total Size", output.Bytes(data.TotalSize))
+
+					return nil
+				},
+			})
+		},
+	}
+}
+
+func newUploadCmd() *cobra.Command {
+	return &cobra.Command{
+		Annotations:  map[string]string{"arcane:scope": cmdutil.ScopeDestination},
+		Use:          "upload <file>",
+		Short:        "Upload a Docker image from a tar archive",
+		Args:         cobra.ExactArgs(1),
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := cmdutil.ClientFromCommand(cmd)
+			if err != nil {
+				return err
+			}
+
+			// Uploading large images can take a long time
+			c.SetTimeout(30 * time.Minute)
+
+			filePath := args[0]
+			output.Info("Uploading image: %s", filePath)
+
+			jsonOutput := cmdutil.JSONOutputEnabled(cmd)
+			sessionID, err := cmdutil.UploadFileInChunks(cmd.Context(), c, upload.KindImage, filePath, !jsonOutput)
+			if err != nil {
+				return err
+			}
+
+			uploadErr := cmdutil.Run(cmd, c, cmdutil.Spec[image.LoadResult]{
+				Method: http.MethodPost, Path: types.ImagesUpload(c.EnvID()),
+				Body: upload.ConsumeRequest{UploadID: sessionID}, FailureMessage: "failed to upload image",
+				Render: func(image.LoadResult) error {
+					output.Success("Image uploaded successfully")
+					return nil
+				},
+			})
+			if uploadErr != nil {
+				cmdutil.AbortUploadSession(cmd.Context(), c, upload.KindImage, sessionID)
+			}
+			return uploadErr
+		},
+	}
 }
 
 var ImageRef = cmdutil.ResourceRef[image.DetailSummary, image.Summary]{
@@ -607,9 +426,10 @@ var ImageRef = cmdutil.ResourceRef[image.DetailSummary, image.Summary]{
 	Matches:           imageMatches,
 	Label: func(match image.Summary) string {
 		label := match.ID
-		if len(match.RepoTags) > 0 {
+		switch {
+		case len(match.RepoTags) > 0:
 			label = match.RepoTags[0]
-		} else if match.Repo != "" && match.Tag != "" {
+		case match.Repo != "" && match.Tag != "":
 			label = match.Repo + ":" + match.Tag
 		}
 		return fmt.Sprintf("%s (%s)", label, match.ID)
@@ -635,26 +455,13 @@ var ImageRef = cmdutil.ResourceRef[image.DetailSummary, image.Summary]{
 
 func searchImageCandidates(ctx context.Context, c *client.Client, identifier string) ([]image.Summary, error) {
 	terms := []string{identifier}
-	separator := ":"
-	if strings.Contains(identifier, "@") {
-		separator = "@"
-	}
+	separator := kit.Ternary(strings.Contains(identifier, "@"), "@", ":")
 	if separator == "@" || !strings.HasPrefix(strings.ToLower(identifier), "sha256:") {
 		if repository, _, ok := strings.Cut(identifier, separator); ok && repository != "" {
 			terms = append(terms, repository)
 		}
 	}
-	seenTerms := make(map[string]struct{}, len(terms))
-	for _, term := range terms {
-		term = strings.TrimSpace(term)
-		if term == "" {
-			continue
-		}
-		if _, ok := seenTerms[term]; ok {
-			continue
-		}
-		seenTerms[term] = struct{}{}
-
+	for _, term := range kit.Unique(kit.TrimNonEmpty(terms)) {
 		searchPath := fmt.Sprintf("%s?search=%s&limit=%d", types.Images(c.EnvID()), url.QueryEscape(term), cmdutil.ShowAllLimit)
 		result, err := c.GetJSON[[]image.Summary](ctx, searchPath)
 		if err != nil {
@@ -678,37 +485,78 @@ func searchImageCandidates(ctx context.Context, c *client.Client, identifier str
 
 func imageMatches(item image.Summary, identifierLower, original string) bool {
 	hasSeparator := strings.Contains(original, ":") || strings.Contains(original, "@")
-
 	idLower := strings.ToLower(item.ID)
-	if idLower == identifierLower || (len(identifierLower) >= 4 && strings.HasPrefix(idLower, identifierLower)) {
-		return true
+	// Qualified refs match exactly or by registry/namespace suffix, so repo:1 never matches repo:10.
+	refMatches := func(ref string) bool {
+		refLower := strings.ToLower(ref)
+		return refLower == identifierLower || (hasSeparator && strings.HasSuffix(refLower, "/"+identifierLower)) ||
+			(!hasSeparator && strings.Contains(refLower, identifierLower))
 	}
+	return idLower == identifierLower || (len(identifierLower) >= 4 && strings.HasPrefix(idLower, identifierLower)) ||
+		(!hasSeparator && strings.Contains(strings.ToLower(item.Repo), identifierLower)) ||
+		slices.ContainsFunc(item.RepoTags, refMatches) ||
+		(item.Repo != "" && item.Tag != "" && refMatches(item.Repo+":"+item.Tag)) ||
+		slices.ContainsFunc(item.RepoDigests, func(digest string) bool { return strings.Contains(strings.ToLower(digest), identifierLower) })
+}
 
-	if !hasSeparator && strings.Contains(strings.ToLower(item.Repo), identifierLower) {
-		return true
-	}
-
-	for _, tag := range item.RepoTags {
-		tagLower := strings.ToLower(tag)
-		if (!hasSeparator && strings.Contains(tagLower, identifierLower)) || strings.EqualFold(tag, original) {
-			return true
+func readPullStream(cmd *cobra.Command, reader io.Reader) error {
+	jsonMode := cmdutil.JSONOutputEnabled(cmd)
+	frames := make([]jsontext.Value, 0)
+	decoder := jsontext.NewDecoder(reader)
+	loading := output.StartTracker(cmd.Context(), cmd.ErrOrStderr(), !jsonMode)
+	defer loading.Stop()
+	for {
+		frame, readErr := decoder.ReadValue()
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				break
+			}
+			return fmt.Errorf("failed to decode stream: %w", readErr)
+		}
+		var event struct {
+			Type           string `json:"type"`
+			Status         string `json:"status"`
+			Error          string `json:"error"`
+			ID             string `json:"id"`
+			ProgressDetail struct {
+				Current int64 `json:"current"`
+				Total   int64 `json:"total"`
+			} `json:"progressDetail"`
+		}
+		if decodeErr := json.Unmarshal(frame, &event); decodeErr != nil {
+			return fmt.Errorf("failed to decode stream: %w", decodeErr)
+		}
+		if jsonMode {
+			frames = append(frames, frame.Clone())
+		}
+		if event.Error != "" {
+			pullErr := fmt.Errorf("pull error: %s", event.Error)
+			loading.Finish(event.ID, pullErr)
+			return pullErr
+		}
+		if jsonMode || event.Type != "" && event.Status == "" {
+			continue
+		}
+		if event.ID != "" {
+			loading.SetProgress(event.ID, event.Status+" "+event.ID, event.ProgressDetail.Current, event.ProgressDetail.Total, true)
+			if slices.Contains([]string{"Download complete", "Pull complete", "Already exists"}, event.Status) {
+				loading.Finish(event.ID, nil)
+			}
+		}
+		if (!output.IsTerminal(cmd.ErrOrStderr()) || !output.IsTerminal(cmd.OutOrStdout()) || event.ID == "") && event.Status != "Downloading" && event.Status != "Extracting" {
+			resume := output.SuspendProgress()
+			if event.ID != "" {
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "%s: %s\n", event.ID, event.Status)
+			} else {
+				_, _ = fmt.Fprintln(cmd.OutOrStdout(), event.Status)
+			}
+			resume()
 		}
 	}
-
-	if item.Repo != "" && item.Tag != "" {
-		combined := item.Repo + ":" + item.Tag
-		combinedLower := strings.ToLower(combined)
-		if strings.EqualFold(combined, original) || (hasSeparator && strings.Contains(combinedLower, identifierLower)) {
-			return true
-		}
+	loading.Stop()
+	if jsonMode {
+		return cmdutil.PrintJSON(frames)
 	}
-
-	for _, digest := range item.RepoDigests {
-		digestLower := strings.ToLower(digest)
-		if strings.EqualFold(digest, original) || strings.Contains(digestLower, identifierLower) {
-			return true
-		}
-	}
-
-	return false
+	output.Success("Image pulled successfully")
+	return nil
 }

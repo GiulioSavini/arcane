@@ -44,7 +44,7 @@ func TestSystemContainersStartAllSurfacesServerError(t *testing.T) {
 		partial bool
 		cancel  bool
 	}{
-		{name: "fleet succeeds"}, {name: "fleet continues after failure", partial: true}, {name: "fleet confirmation cancelled", cancel: true},
+		{name: "fleet succeeds"}, {name: "fleet continues after failure", partial: true}, {name: "fleet requires consent without a terminal", cancel: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var mu sync.Mutex
@@ -76,10 +76,10 @@ func TestSystemContainersStartAllSurfacesServerError(t *testing.T) {
 			paths := append([]string(nil), mutations...)
 			mu.Unlock()
 			if tc.cancel {
-				require.NoError(t, runErr)
+				require.ErrorContains(t, runErr, "re-run with --yes")
 				require.Empty(t, paths)
 				require.Empty(t, out)
-				require.Contains(t, diagnostics, "Local (0), Remote (remote)")
+				require.Contains(t, diagnostics, "Local, Remote")
 				return
 			}
 			require.Equal(t, []string{"/api/environments/0/system/containers/start-all", "/api/environments/remote/system/containers/start-all"}, paths)

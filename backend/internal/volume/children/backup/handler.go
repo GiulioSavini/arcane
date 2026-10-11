@@ -45,15 +45,8 @@ type ListBackupsInput struct {
 	Type          string `query:"type" doc:"Management origin filter"`
 }
 
-type VolumeBackupPaginatedResponse struct {
-	Success    bool                    `json:"success"`
-	Data       []volume.Backup         `json:"data"`
-	Pagination base.PaginationResponse `json:"pagination"`
-	Warnings   []string                `json:"warnings,omitempty"`
-}
-
 type ListBackupsOutput struct {
-	Body VolumeBackupPaginatedResponse
+	Body base.PaginatedWithWarnings[volume.Backup]
 }
 
 type CreateBackupInput struct {
@@ -140,7 +133,7 @@ func (h *Handler) ListBackups(ctx context.Context, input *ListBackupsInput) (*Li
 	warning := h.service.backupMountWarning(ctx)
 
 	return &ListBackupsOutput{
-		Body: VolumeBackupPaginatedResponse{
+		Body: base.PaginatedWithWarnings[volume.Backup]{
 			Success:    true,
 			Data:       backups,
 			Pagination: handlerutil.PaginationResponse(paginationResp),

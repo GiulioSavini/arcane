@@ -4,290 +4,277 @@ import (
 	"cmp"
 	"errors"
 	"fmt"
+	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/getarcaneapp/arcane/types/v2/env"
 	"github.com/spf13/cobra"
+	"go.getarcane.app/kit/pkg"
 
-	"github.com/getarcaneapp/arcane/cli/v2/internal/client"
 	"github.com/getarcaneapp/arcane/cli/v2/internal/cmdutil"
 	"github.com/getarcaneapp/arcane/cli/v2/internal/output"
 	"github.com/getarcaneapp/arcane/cli/v2/internal/types"
 )
 
-var (
-	jsonOutput     bool
-	forceFlag      bool
-	createKey      string
-	createValue    string
-	createSecret   bool
-	createAllEnvs  bool
-	createEnvIDs   []string
-	updateKey      string
-	updateValue    string
-	updateSecret   bool
-	updateAllEnvs  bool
-	updateEnvIDs   []string
-	syncStatusFlag bool
-)
-
-// VariablesCmd is the parent command for global variable operations.
-var VariablesCmd = &cobra.Command{
-	Use:     "variables",
-	Aliases: []string{"variable", "vars"},
-	Short:   "Manage global variables",
+// Command is the parent command for global variable operations.
+func Command() *cobra.Command {
+	command := &cobra.Command{
+		Use:     "variables",
+		Aliases: []string{"variable", "vars"},
+		Short:   "Manage global variables",
+	}
+	command.AddCommand(newListCmd())
+	command.AddCommand(newCreateCmd())
+	command.AddCommand(newUpdateCmd())
+	command.AddCommand(newDeleteCmd())
+	command.AddCommand(newSyncCmd())
+	return command
 }
 
 const secretMask = "********"
 
-func variableScope(allEnvironments bool, environmentIDs []string) string {
-	if allEnvironments {
-		return "all environments"
-	}
-	if len(environmentIDs) == 0 {
-		return "-"
-	}
-	return strings.Join(environmentIDs, ",")
-}
-
-func printSyncStatuses(statuses []env.EnvironmentSyncStatus) error {
-	headers := []string{"ENVIRONMENT ID", "NAME", "STATUS", "LAST SYNCED", "ERROR"}
-	rows := make([][]string, len(statuses))
-	for i, status := range statuses {
-		lastSynced := "-"
-		if status.LastSyncedAt != nil {
-			lastSynced = status.LastSyncedAt.Format(time.RFC3339)
-		}
-		syncError := cmp.Or(status.Error, "-")
-		rows[i] = []string{
-			status.EnvironmentID,
-			status.EnvironmentName,
-			status.Status,
-			lastSynced,
-			syncError,
-		}
-	}
-	return output.Table(headers, rows)
-}
-
 func printMutationResult(result env.GlobalVariableMutationResponse, message string) error {
-	if jsonOutput {
-		return cmdutil.PrintJSON(result)
-	}
-
 	output.Success("%s", message)
 	if result.Variable != nil {
 		output.KeyValue("ID", result.Variable.ID)
 		output.KeyValue("Key", result.Variable.Key)
 		output.KeyValue("Secret", strconv.FormatBool(result.Variable.IsSecret))
-		output.KeyValue("Scope", variableScope(result.Variable.AllEnvironments, result.Variable.EnvironmentIDs))
+		scope := "-"
+		switch {
+		case result.Variable.AllEnvironments:
+			scope = "all environments"
+		case len(result.Variable.EnvironmentIDs) > 0:
+			scope = strings.Join(result.Variable.EnvironmentIDs, ",")
+		}
+		output.KeyValue("Scope", scope)
 	}
 	return nil
 }
 
-var listCmd = &cobra.Command{
-	Use:          "list",
-	Aliases:      []string{"ls"},
-	Short:        "List global variables",
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := cmdutil.ClientFromCommand(cmd)
-		if err != nil {
-			return err
-		}
-
-		result, err := c.GetJSON[[]env.GlobalVariable](cmd.Context(), types.Variables())
-		if err != nil {
-			return fmt.Errorf("failed to list variables: %w", err)
-		}
-
-		if jsonOutput {
-			return cmdutil.PrintJSON(result.Data)
-		}
-
-		headers := []string{"ID", "KEY", "SCOPE", "SECRET", "VALUE"}
-		rows := make([][]string, len(result.Data))
-		for i, variable := range result.Data {
-			value := variable.Value
-			if variable.IsSecret {
-				value = secretMask
-			}
-			rows[i] = []string{
-				variable.ID,
-				variable.Key,
-				variableScope(variable.AllEnvironments, variable.EnvironmentIDs),
-				strconv.FormatBool(variable.IsSecret),
-				value,
-			}
-		}
-
-		if tableErr := output.Table(headers, rows); tableErr != nil {
-			return tableErr
-		}
-		_, _ = fmt.Fprintf(output.Stdout(), "\nTotal: %d variables\n", len(result.Data))
-		return nil
-	},
-}
-
-var createCmd = &cobra.Command{
-	Use:          "create",
-	Short:        "Create a global variable",
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := cmdutil.ClientFromCommand(cmd)
-		if err != nil {
-			return err
-		}
-
-		req := env.CreateGlobalVariableRequest{
-			Key:             createKey,
-			Value:           createValue,
-			IsSecret:        createSecret,
-			AllEnvironments: createAllEnvs,
-			EnvironmentIDs:  createEnvIDs,
-		}
-
-		result, err := c.PostJSON[env.GlobalVariableMutationResponse](cmd.Context(), types.Variables(), req)
-		if err != nil {
-			return fmt.Errorf("failed to create variable: %w", err)
-		}
-
-		return printMutationResult(result.Data, fmt.Sprintf("Variable %s created successfully", createKey))
-	},
-}
-
-var updateCmd = &cobra.Command{
-	Use:          "update <id>",
-	Short:        "Update a global variable",
-	Args:         cobra.ExactArgs(1),
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := cmdutil.ClientFromCommand(cmd)
-		if err != nil {
-			return err
-		}
-
-		var req env.UpdateGlobalVariableRequest
-		if cmd.Flags().Changed("key") {
-			req.Key = &updateKey
-		}
-		if cmd.Flags().Changed("value") {
-			req.Value = &updateValue
-		}
-		if cmd.Flags().Changed("secret") {
-			req.IsSecret = &updateSecret
-		}
-		if cmd.Flags().Changed("all-environments") {
-			req.AllEnvironments = &updateAllEnvs
-		}
-		if cmd.Flags().Changed("environment") {
-			req.EnvironmentIDs = &updateEnvIDs
-		}
-
-		if req.Key == nil && req.Value == nil && req.IsSecret == nil && req.AllEnvironments == nil && req.EnvironmentIDs == nil {
-			return errors.New("no updates provided (set at least one flag)")
-		}
-
-		result, err := c.PutJSON[env.GlobalVariableMutationResponse](cmd.Context(), types.Variable(args[0]), req)
-		if err != nil {
-			return fmt.Errorf("failed to update variable: %w", err)
-		}
-
-		return printMutationResult(result.Data, "Variable updated successfully")
-	},
-}
-
-var deleteCmd = &cobra.Command{
-	Use:          "delete <id>",
-	Aliases:      []string{"rm", "remove"},
-	Short:        "Delete a global variable",
-	Args:         cobra.ExactArgs(1),
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		if !forceFlag {
-			confirmed, err := cmdutil.Confirm(cmd, fmt.Sprintf("Are you sure you want to delete variable %s?", args[0]))
+func newListCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:          "list",
+		Aliases:      []string{"ls"},
+		Short:        "List global variables",
+		Args:         cobra.NoArgs,
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := cmdutil.ClientFromCommand(cmd)
 			if err != nil {
 				return err
 			}
-			if !confirmed {
-				_, _ = fmt.Fprintln(output.Stdout(), "Cancelled")
-				return nil
+
+			return cmdutil.Run(cmd, c, cmdutil.Spec[[]env.GlobalVariable]{
+				Method:         http.MethodGet,
+				Path:           types.Variables(),
+				FailureMessage: "failed to list variables",
+				Render: func(data []env.GlobalVariable) error {
+					headers := []string{"ID", "KEY", "SCOPE", "SECRET", "VALUE"}
+					rows := make([][]string, len(data))
+					for i, variable := range data {
+						value := variable.Value
+						if variable.IsSecret {
+							value = secretMask
+						}
+						scope := "-"
+						switch {
+						case variable.AllEnvironments:
+							scope = "all environments"
+						case len(variable.EnvironmentIDs) > 0:
+							scope = strings.Join(variable.EnvironmentIDs, ",")
+						}
+						rows[i] = []string{
+							variable.ID,
+							variable.Key,
+							scope,
+							strconv.FormatBool(variable.IsSecret),
+							value,
+						}
+					}
+
+					if tableErr := output.Table(headers, rows); tableErr != nil {
+						return tableErr
+					}
+					_, _ = fmt.Fprintf(output.Stdout(), "\nTotal: %d variables\n", len(data))
+					return nil
+				},
+			})
+		},
+	}
+}
+
+func newCreateCmd() *cobra.Command {
+	var opts struct {
+		key     string
+		value   string
+		secret  bool
+		allEnvs bool
+		envIDs  []string
+	}
+	command := &cobra.Command{
+		Use:          "create",
+		Short:        "Create a global variable",
+		Args:         cobra.NoArgs,
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := cmdutil.ClientFromCommand(cmd)
+			if err != nil {
+				return err
 			}
-		}
 
-		c, err := cmdutil.ClientFromCommand(cmd)
-		if err != nil {
-			return err
-		}
+			req := env.CreateGlobalVariableRequest{
+				Key:             opts.key,
+				Value:           opts.value,
+				IsSecret:        opts.secret,
+				AllEnvironments: opts.allEnvs,
+				EnvironmentIDs:  opts.envIDs,
+			}
 
-		result, err := c.DeleteJSON[env.GlobalVariableMutationResponse](cmd.Context(), types.Variable(args[0]))
-		if err != nil {
-			return fmt.Errorf("failed to delete variable: %w", err)
-		}
-
-		return printMutationResult(result.Data, "Variable deleted successfully")
-	},
+			return cmdutil.Run(cmd, c, cmdutil.Spec[env.GlobalVariableMutationResponse]{
+				Method:         http.MethodPost,
+				Path:           types.Variables(),
+				FailureMessage: "failed to create variable",
+				Body:           req,
+				Render: func(data env.GlobalVariableMutationResponse) error {
+					return printMutationResult(data, fmt.Sprintf("Variable %s created successfully", opts.key))
+				},
+			})
+		},
+	}
+	command.Flags().StringVar(&opts.key, "key", "", "Variable key")
+	command.Flags().StringVar(&opts.value, "value", "", "Variable value")
+	command.Flags().BoolVar(&opts.secret, "secret", false, "Store the value as a secret")
+	command.Flags().BoolVar(&opts.allEnvs, "all-environments", false, "Scope the variable to all environments")
+	command.Flags().StringArrayVar(&opts.envIDs, "environment", nil, "Environment ID to scope the variable to (repeatable)")
+	_ = command.MarkFlagRequired("key")
+	return command
 }
 
-var syncCmd = &cobra.Command{
-	Use:          "sync",
-	Short:        "Sync global variables to every environment (--status shows the last sync result per environment)",
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := cmdutil.ClientFromCommand(cmd)
-		if err != nil {
-			return err
-		}
+func newUpdateCmd() *cobra.Command {
+	var opts struct {
+		key     string
+		value   string
+		secret  bool
+		allEnvs bool
+		envIDs  []string
+	}
+	command := &cobra.Command{
+		Use:          "update <id>",
+		Short:        "Update a global variable",
+		Args:         cobra.ExactArgs(1),
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if !slices.ContainsFunc([]string{"key", "value", "secret", "all-environments", "environment"}, cmd.Flags().Changed) {
+				return errors.New("no updates provided (set at least one flag)")
+			}
+			c, err := cmdutil.ClientFromCommand(cmd)
+			if err != nil {
+				return err
+			}
 
-		var result *client.APIResponse[[]env.EnvironmentSyncStatus]
-		failureMessage := "failed to sync variables"
-		if syncStatusFlag {
-			failureMessage = "failed to get variable sync status"
-			result, err = c.GetJSON[[]env.EnvironmentSyncStatus](cmd.Context(), types.VariablesSyncStatus())
-		} else {
-			result, err = c.PostJSON[[]env.EnvironmentSyncStatus](cmd.Context(), types.VariablesSync(), nil)
-		}
-		if err != nil {
-			return fmt.Errorf("%s: %w", failureMessage, err)
-		}
+			req := env.UpdateGlobalVariableRequest{
+				Key:             kit.Ternary(cmd.Flags().Changed("key"), &opts.key, nil),
+				Value:           kit.Ternary(cmd.Flags().Changed("value"), &opts.value, nil),
+				IsSecret:        kit.Ternary(cmd.Flags().Changed("secret"), &opts.secret, nil),
+				AllEnvironments: kit.Ternary(cmd.Flags().Changed("all-environments"), &opts.allEnvs, nil),
+				EnvironmentIDs:  kit.Ternary(cmd.Flags().Changed("environment"), &opts.envIDs, nil),
+			}
 
-		if jsonOutput {
-			return cmdutil.PrintJSON(result.Data)
-		}
-
-		return printSyncStatuses(result.Data)
-	},
+			return cmdutil.Run(cmd, c, cmdutil.Spec[env.GlobalVariableMutationResponse]{
+				Method:         http.MethodPut,
+				Path:           types.Variable(args[0]),
+				FailureMessage: "failed to update variable",
+				Body:           req,
+				Render: func(data env.GlobalVariableMutationResponse) error {
+					return printMutationResult(data, "Variable updated successfully")
+				},
+			})
+		},
+	}
+	command.Flags().StringVar(&opts.key, "key", "", "Variable key")
+	command.Flags().StringVar(&opts.value, "value", "", "Variable value")
+	command.Flags().BoolVar(&opts.secret, "secret", false, "Store the value as a secret")
+	command.Flags().BoolVar(&opts.allEnvs, "all-environments", false, "Scope the variable to all environments")
+	command.Flags().StringArrayVar(&opts.envIDs, "environment", nil, "Environment ID to scope the variable to (repeatable)")
+	return command
 }
 
-func init() {
-	VariablesCmd.AddCommand(listCmd)
-	VariablesCmd.AddCommand(createCmd)
-	VariablesCmd.AddCommand(updateCmd)
-	VariablesCmd.AddCommand(deleteCmd)
-	VariablesCmd.AddCommand(syncCmd)
+func newDeleteCmd() *cobra.Command {
+	var opts struct {
+		force bool
+	}
+	command := &cobra.Command{
+		Use:          "delete <id>",
+		Aliases:      []string{"rm", "remove"},
+		Short:        "Delete a global variable",
+		Args:         cobra.ExactArgs(1),
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := cmdutil.ClientFromCommand(cmd)
+			if err != nil {
+				return err
+			}
+			return cmdutil.RunDelete(cmd, c, cmdutil.DeleteSpec{
+				Force:          opts.force,
+				Prompt:         fmt.Sprintf("Are you sure you want to delete variable %s?", args[0]),
+				Path:           types.Variable(args[0]),
+				FailureMessage: "failed to delete variable",
+				SuccessMessage: "Variable deleted successfully",
+			})
+		},
+	}
+	command.Flags().BoolVarP(&opts.force, "force", "f", false, "Skip the confirmation prompt")
+	return command
+}
 
-	listCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
+func newSyncCmd() *cobra.Command {
+	var opts struct {
+		syncStatus bool
+	}
+	command := &cobra.Command{
+		Use:          "sync",
+		Short:        "Sync global variables to every environment (--status shows the last sync result per environment)",
+		Args:         cobra.NoArgs,
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := cmdutil.ClientFromCommand(cmd)
+			if err != nil {
+				return err
+			}
 
-	createCmd.Flags().StringVar(&createKey, "key", "", "Variable key")
-	createCmd.Flags().StringVar(&createValue, "value", "", "Variable value")
-	createCmd.Flags().BoolVar(&createSecret, "secret", false, "Store the value as a secret")
-	createCmd.Flags().BoolVar(&createAllEnvs, "all-environments", false, "Scope the variable to all environments")
-	createCmd.Flags().StringArrayVar(&createEnvIDs, "environment", nil, "Environment ID to scope the variable to (repeatable)")
-	createCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
-	_ = createCmd.MarkFlagRequired("key")
-
-	updateCmd.Flags().StringVar(&updateKey, "key", "", "Variable key")
-	updateCmd.Flags().StringVar(&updateValue, "value", "", "Variable value")
-	updateCmd.Flags().BoolVar(&updateSecret, "secret", false, "Store the value as a secret")
-	updateCmd.Flags().BoolVar(&updateAllEnvs, "all-environments", false, "Scope the variable to all environments")
-	updateCmd.Flags().StringArrayVar(&updateEnvIDs, "environment", nil, "Environment ID to scope the variable to (repeatable)")
-	updateCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
-
-	deleteCmd.Flags().BoolVarP(&forceFlag, "force", "f", false, "Skip the confirmation prompt")
-	deleteCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
-
-	syncCmd.Flags().BoolVar(&syncStatusFlag, "status", false, "Show the last sync result per environment instead of triggering a sync")
-	syncCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
+			method, path, failureMessage := http.MethodPost, types.VariablesSync(), "failed to sync variables"
+			if opts.syncStatus {
+				method, path, failureMessage = http.MethodGet, types.VariablesSyncStatus(), "failed to get variable sync status"
+			}
+			return cmdutil.Run(cmd, c, cmdutil.Spec[[]env.EnvironmentSyncStatus]{
+				Method:         method,
+				Path:           path,
+				FailureMessage: failureMessage,
+				Render: func(data []env.EnvironmentSyncStatus) error {
+					headers := []string{"ENVIRONMENT ID", "NAME", "STATUS", "LAST SYNCED", "ERROR"}
+					rows := make([][]string, len(data))
+					for i, status := range data {
+						lastSynced := "-"
+						if status.LastSyncedAt != nil {
+							lastSynced = status.LastSyncedAt.Format(time.RFC3339)
+						}
+						syncError := cmp.Or(status.Error, "-")
+						rows[i] = []string{
+							status.EnvironmentID,
+							status.EnvironmentName,
+							status.Status,
+							lastSynced,
+							syncError,
+						}
+					}
+					return output.Table(headers, rows)
+				},
+			})
+		},
+	}
+	command.Flags().BoolVar(&opts.syncStatus, "status", false, "Show the last sync result per environment instead of triggering a sync")
+	return command
 }

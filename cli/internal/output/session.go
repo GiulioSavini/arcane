@@ -12,7 +12,13 @@ import (
 	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/colorprofile"
 	"github.com/charmbracelet/x/term"
+	kit "go.getarcane.app/kit/pkg"
 )
+
+// fileDescriptor supplies a writer's descriptor for terminal detection and sizing.
+type fileDescriptor interface {
+	Fd() uintptr
+}
 
 var (
 	sessionMu        sync.RWMutex
@@ -30,7 +36,7 @@ func Configure(stdout, stderr io.Writer, jsonMode, noColor bool, label string) {
 	plainMode = jsonMode
 	colorEnabled = !noColor
 	commandLabel = label
-	setThemeInternal(detectDarkBackgroundInternal(stdout, noColor))
+	setTheme(detectDarkBackground(stdout, noColor))
 }
 
 // Stdout returns the current command's result writer.
@@ -53,24 +59,32 @@ func Stderr() io.Writer {
 	return os.Stderr
 }
 
+// humanWriter routes human-oriented output to stderr when stdout is reserved for JSON.
+func humanWriter() io.Writer {
+	sessionMu.RLock()
+	jsonMode := plainMode
+	sessionMu.RUnlock()
+	return kit.Ternary(jsonMode, Stderr(), Stdout())
+}
+
 // IsTerminal checks the actual writer, including terminal capability.
 func IsTerminal(value any) bool {
 	if writer, ok := value.(*colorprofile.Writer); ok {
 		value = writer.Forward
 	}
-	fd, ok := value.(interface{ Fd() uintptr })
+	fd, ok := value.(fileDescriptor)
 	return ok && os.Getenv("TERM") != "dumb" && term.IsTerminal(fd.Fd())
 }
 
-func colorEnabledInternal() bool {
+func colorsEnabled() bool {
 	sessionMu.RLock()
 	defer sessionMu.RUnlock()
 	_, noColor := os.LookupEnv("NO_COLOR")
 	return colorEnabled && !noColor
 }
 
-func renderForInternal(w io.Writer, style lipgloss.Style, value string) string {
-	if !colorEnabledInternal() || !IsTerminal(w) {
+func renderFor(w io.Writer, style lipgloss.Style, value string) string {
+	if !colorsEnabled() || !IsTerminal(w) {
 		return value
 	}
 	return style.Render(value)
@@ -102,10 +116,10 @@ func (w coordinatedWriter) Write(p []byte) (int, error) {
 // WriteError renders the command error once through Fang's error handler.
 func WriteError(w io.Writer, err error) {
 	defer SuspendProgress()()
-	_, _ = fmt.Fprintf(w, "\n  %s\n  %s\n", renderForInternal(w, headerStyle.Foreground(statusOffline), "Error"), err.Error())
+	_, _ = fmt.Fprintf(w, "\n  %s\n  %s\n", renderFor(w, headerStyle.Foreground(statusOffline), "Error"), err.Error())
 }
 
-func detectDarkBackgroundInternal(out io.Writer, noColor bool) bool {
+func detectDarkBackground(out io.Writer, noColor bool) bool {
 	if noColor || !IsTerminal(out) {
 		return true
 	}

@@ -62,7 +62,7 @@ func StartTracker(ctx context.Context, out io.Writer, enabled bool, labels ...st
 	if !t.live {
 		return t
 	}
-	fd, hasFD := t.out.(interface{ Fd() uintptr })
+	fd, hasFD := t.out.(fileDescriptor)
 	t.stop, t.done = make(chan struct{}), make(chan struct{})
 	t.resumeOuter = SuspendProgress()
 	trackersMu.Lock()
@@ -110,7 +110,7 @@ func StartTracker(ctx context.Context, out io.Writer, enabled bool, labels ...st
 			icons := [...]string{stepPending: "○", stepRunning: spinnerFrames[t.frame%len(spinnerFrames)], stepSucceeded: "✓", stepFailed: "✗"}
 			styles := [...]lipgloss.Style{stepPending: statusMutedStyle, stepRunning: infoStyle, stepSucceeded: successStyle, stepFailed: statusOfflineStyle}
 			for _, step := range t.steps[start:] {
-				line := "  " + renderForInternal(t.out, styles[step.status], icons[step.status]) + " " + renderForInternal(t.out, valueStyle, step.label)
+				line := "  " + renderFor(t.out, styles[step.status], icons[step.status]) + " " + renderFor(t.out, valueStyle, step.label)
 				if step.status == stepRunning && step.total > 0 {
 					current := min(step.current, step.total)
 					var count string
@@ -119,13 +119,13 @@ func StartTracker(ctx context.Context, out io.Writer, enabled bool, labels ...st
 					} else {
 						count = fmt.Sprintf("%d/%d", current, step.total)
 					}
-					barWidth := min(24, max(width-visibleWidthInternal(step.label)-len(count)-7, 1))
+					barWidth := min(24, max(width-visibleWidth(step.label)-len(count)-7, 1))
 					bar := progress.New(progress.WithWidth(barWidth), progress.WithColors(arcanePurple))
-					showColor := colorEnabledInternal()
+					showColor := colorsEnabled()
 					bar.FullColor = kit.Ternary(showColor, bar.FullColor, nil)
 					bar.EmptyColor = kit.Ternary(showColor, bar.EmptyColor, nil)
 					bar.PercentageStyle = kit.Ternary(showColor, bar.PercentageStyle, tablePlainCell.UnsetPadding())
-					line = fmt.Sprintf("  %s %s %s", renderForInternal(t.out, infoStyle, step.label), bar.ViewAs(float64(current)/float64(step.total)), count)
+					line = fmt.Sprintf("  %s %s %s", renderFor(t.out, infoStyle, step.label), bar.ViewAs(float64(current)/float64(step.total)), count)
 					if !showColor {
 						line = ansi.Strip(line)
 					}
@@ -188,10 +188,7 @@ func (t *tracker) Finish(key string, err error) {
 	defer t.mu.Unlock()
 	for i := range t.steps {
 		if (key == "" && i == t.current) || (key != "" && t.steps[i].key == key) {
-			t.steps[i].status = stepSucceeded
-			if err != nil {
-				t.steps[i].status = stepFailed
-			}
+			t.steps[i].status = kit.Ternary(err != nil, stepFailed, stepSucceeded)
 		}
 	}
 }

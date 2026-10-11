@@ -104,9 +104,7 @@ type DeleteContainerInput struct {
 type SetAutoUpdateInput struct {
 	EnvironmentID string `path:"id" doc:"Environment ID"`
 	ContainerID   string `path:"containerId" doc:"Container ID"`
-	Body          struct {
-		Enabled bool `json:"enabled" doc:"Whether auto-update is enabled for this container"`
-	}
+	Body          container.SetAutoUpdateRequest
 }
 
 // KillContainerInput carries the optional signal for a container kill.
@@ -511,7 +509,7 @@ func (h *ContainerHandler) GenerateCompose(ctx context.Context, input *GenerateC
 }
 
 func (h *ContainerHandler) StartContainer(ctx context.Context, input *ContainerActionInput) (*handlerutil.Out[base.MessageResponse], error) {
-	return h.runContainerActionInternal(ctx, input, containerActionConfigInternal{
+	return h.runContainerAction(ctx, input, containerActionConfig{
 		ActivityType:    activitytypes.TypeContainerStart,
 		Step:            "Starting container",
 		StartMessage:    "Container start requested",
@@ -527,7 +525,7 @@ func (h *ContainerHandler) StartContainer(ctx context.Context, input *ContainerA
 }
 
 func (h *ContainerHandler) StopContainer(ctx context.Context, input *ContainerActionInput) (*handlerutil.Out[base.MessageResponse], error) {
-	return h.runContainerActionInternal(ctx, input, containerActionConfigInternal{
+	return h.runContainerAction(ctx, input, containerActionConfig{
 		ActivityType:    activitytypes.TypeContainerStop,
 		Step:            "Stopping container",
 		StartMessage:    "Container stop requested",
@@ -543,7 +541,7 @@ func (h *ContainerHandler) StopContainer(ctx context.Context, input *ContainerAc
 }
 
 func (h *ContainerHandler) RestartContainer(ctx context.Context, input *ContainerActionInput) (*handlerutil.Out[base.MessageResponse], error) {
-	return h.runContainerActionInternal(ctx, input, containerActionConfigInternal{
+	return h.runContainerAction(ctx, input, containerActionConfig{
 		ActivityType:    activitytypes.TypeContainerRestart,
 		Step:            "Restarting container",
 		StartMessage:    "Container restart requested",
@@ -560,7 +558,7 @@ func (h *ContainerHandler) RestartContainer(ctx context.Context, input *Containe
 
 func (h *ContainerHandler) KillContainer(ctx context.Context, input *KillContainerInput) (*handlerutil.Out[base.MessageResponse], error) {
 	signal := strings.TrimSpace(input.Signal)
-	return h.runContainerActionInternal(ctx, &ContainerActionInput{EnvironmentID: input.EnvironmentID, ContainerID: input.ContainerID}, containerActionConfigInternal{
+	return h.runContainerAction(ctx, &ContainerActionInput{EnvironmentID: input.EnvironmentID, ContainerID: input.ContainerID}, containerActionConfig{
 		ActivityType:    activitytypes.TypeContainerKill,
 		Step:            "Killing container",
 		StartMessage:    "Container kill requested",
@@ -576,7 +574,7 @@ func (h *ContainerHandler) KillContainer(ctx context.Context, input *KillContain
 }
 
 func (h *ContainerHandler) PauseContainer(ctx context.Context, input *ContainerActionInput) (*handlerutil.Out[base.MessageResponse], error) {
-	return h.runContainerActionInternal(ctx, input, containerActionConfigInternal{
+	return h.runContainerAction(ctx, input, containerActionConfig{
 		ActivityType:    activitytypes.TypeContainerPause,
 		Step:            "Pausing container",
 		StartMessage:    "Container pause requested",
@@ -592,7 +590,7 @@ func (h *ContainerHandler) PauseContainer(ctx context.Context, input *ContainerA
 }
 
 func (h *ContainerHandler) UnpauseContainer(ctx context.Context, input *ContainerActionInput) (*handlerutil.Out[base.MessageResponse], error) {
-	return h.runContainerActionInternal(ctx, input, containerActionConfigInternal{
+	return h.runContainerAction(ctx, input, containerActionConfig{
 		ActivityType:    activitytypes.TypeContainerUnpause,
 		Step:            "Unpausing container",
 		StartMessage:    "Container unpause requested",
@@ -607,7 +605,7 @@ func (h *ContainerHandler) UnpauseContainer(ctx context.Context, input *Containe
 	})
 }
 
-type containerActionConfigInternal struct {
+type containerActionConfig struct {
 	ActivityType    activitytypes.Type
 	Step            string
 	StartMessage    string
@@ -617,8 +615,8 @@ type containerActionConfigInternal struct {
 	Error           func(error) error
 }
 
-// containerActivityNameInternal returns the container's name for activity records, falling back to its ID.
-func (h *ContainerHandler) containerActivityNameInternal(ctx context.Context, containerID string) string {
+// containerActivityName returns the container's name for activity records, falling back to its ID.
+func (h *ContainerHandler) containerActivityName(ctx context.Context, containerID string) string {
 	name, err := h.containerService.GetContainerNameByID(ctx, containerID)
 	if err != nil || name == "" {
 		return containerID
@@ -626,7 +624,7 @@ func (h *ContainerHandler) containerActivityNameInternal(ctx context.Context, co
 	return name
 }
 
-func (h *ContainerHandler) runContainerActionInternal(ctx context.Context, input *ContainerActionInput, cfg containerActionConfigInternal) (*handlerutil.Out[base.MessageResponse], error) {
+func (h *ContainerHandler) runContainerAction(ctx context.Context, input *ContainerActionInput, cfg containerActionConfig) (*handlerutil.Out[base.MessageResponse], error) {
 	user, err := handlerutil.RequireUser(ctx)
 	if err != nil {
 		return nil, err
@@ -640,7 +638,7 @@ func (h *ContainerHandler) runContainerActionInternal(ctx context.Context, input
 		cfg.ActivityType,
 		"container",
 		input.ContainerID,
-		h.containerActivityNameInternal(
+		h.containerActivityName(
 			runtimeCtx,
 			input.ContainerID,
 		),
@@ -698,7 +696,7 @@ func (h *ContainerHandler) RedeployContainer(ctx context.Context, input *Contain
 		activitytypes.TypeContainerRedeploy,
 		"container",
 		input.ContainerID,
-		h.containerActivityNameInternal(
+		h.containerActivityName(
 			runtimeCtx,
 			input.ContainerID,
 		),
@@ -762,7 +760,7 @@ func (h *ContainerHandler) GetContainerEditConfig(ctx context.Context, input *Ge
 	}, nil
 }
 
-func editContainerHTTPErrorInternal(err error) error {
+func editContainerHTTPError(err error) error {
 	switch {
 	case errors.Is(err, common.ErrConflict):
 		return huma.Error409Conflict(err.Error())
@@ -787,7 +785,7 @@ func (h *ContainerHandler) EditContainer(ctx context.Context, input *EditContain
 		activitytypes.TypeContainerEdit,
 		"container",
 		input.ContainerID,
-		h.containerActivityNameInternal(
+		h.containerActivityName(
 			runtimeCtx,
 			input.ContainerID,
 		),
@@ -806,7 +804,7 @@ func (h *ContainerHandler) EditContainer(ctx context.Context, input *EditContain
 	if err != nil {
 		activitylib.FlushWriter(activityWriter)
 		activitylib.CompleteHandlerActivity(runtimeCtx, h.activityService, activityID, "Container edit failed", err)
-		return nil, editContainerHTTPErrorInternal(err)
+		return nil, editContainerHTTPError(err)
 	}
 	activitylib.FlushWriter(activityWriter)
 	activitylib.CompleteHandlerActivity(runtimeCtx, h.activityService, activityID, "Container edited", nil)
@@ -851,7 +849,7 @@ func (h *ContainerHandler) DeleteContainer(ctx context.Context, input *DeleteCon
 		activitytypes.TypeContainerDelete,
 		"container",
 		input.ContainerID,
-		h.containerActivityNameInternal(
+		h.containerActivityName(
 			runtimeCtx,
 			input.ContainerID,
 		),

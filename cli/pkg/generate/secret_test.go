@@ -11,7 +11,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	gen "github.com/getarcaneapp/arcane/cli/v2/pkg/generate"
+	"github.com/getarcaneapp/arcane/cli/v2/pkg/generate"
 )
 
 // captureOutput captures stdout produced by fn and returns it as a string.
@@ -39,7 +39,7 @@ func captureOutput(fn func() error) (string, error) {
 }
 
 func TestSecretDefaultBase64(t *testing.T) {
-	cmd := gen.GenerateCmd
+	cmd := generate.Command()
 	cmd.SetArgs([]string{"secret"})
 
 	out, err := captureOutput(func() error {
@@ -80,7 +80,7 @@ func TestSecretDefaultBase64(t *testing.T) {
 }
 
 func TestSecretAllFormatContainsSections(t *testing.T) {
-	cmd := gen.GenerateCmd
+	cmd := generate.Command()
 	cmd.SetArgs([]string{"secret", "-f", "all"})
 
 	out, err := captureOutput(func() error {

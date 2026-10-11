@@ -11,25 +11,17 @@ import (
 	kit "go.getarcane.app/kit/pkg"
 
 	"github.com/getarcaneapp/arcane/cli/v2/internal/config"
-	runtimectx "github.com/getarcaneapp/arcane/cli/v2/internal/runtime"
-	clitypes "github.com/getarcaneapp/arcane/cli/v2/internal/types"
+	"github.com/getarcaneapp/arcane/cli/v2/internal/runtime"
 )
 
 const (
-	// ShowAllLimit is the sentinel the Arcane API uses for "return everything".
-	// The backend honours it on every list path: DB-backed lists short-circuit to
-	// paginateDBAll (bypassing the 100-item clamp), in-memory Docker lists return
-	// the full slice, and the handlers that coerce a zero limit to 20 test for
-	// exactly 0 so they leave it alone.
+	// ShowAllLimit requests every item without the server pagination clamp.
 	ShowAllLimit = -1
 
 	// AllFlagUsage is the shared help text for the --all flag on list commands.
 	AllFlagUsage = "Return every item, ignoring pagination"
 
-	// StartFlagUsage is the shared help text for the --start flag on list commands.
-	// Database-backed resources (projects, repos, gitops-syncs, environments,
-	// registries, users, events, api-keys, roles) derive a page number from
-	// start/limit, so an offset that is not a multiple of --limit is rounded down.
+	// StartFlagUsage documents offset rounding for database-backed resources.
 	StartFlagUsage = "Offset for pagination (rounded down to a multiple of --limit on database-backed resources)"
 )
 
@@ -53,7 +45,7 @@ func AppendQuery(path string, extra url.Values) string {
 // ListParams describes how a list command wants its results paginated.
 type ListParams struct {
 	// Resource is the canonical resource name used to look up a configured
-	// per-resource limit. See clitypes.KnownPaginatedResources.
+	// per-resource limit.
 	Resource string
 	// Limit is the value of the command's --limit flag.
 	Limit int
@@ -97,10 +89,8 @@ func ApplyPaginationParams(cmd *cobra.Command, path string, p ListParams) (strin
 	return parsed.String(), nil
 }
 
-// EffectiveLimit resolves the final list limit with precedence:
-// explicit flag > per-resource config > global config > fallback default.
-// A limit of ShowAllLimit is passed straight through so that `--limit -1`
-// reaches the server as the documented "return everything" sentinel.
+// EffectiveLimit resolves explicit flag, resource config, global config, then fallback.
+// ShowAllLimit passes through unchanged.
 func EffectiveLimit(cmd *cobra.Command, resource, flagName string, flagValue, fallbackDefault int) int {
 	if cmd != nil {
 		if flag := cmd.Flags().Lookup(flagName); flag != nil && flag.Changed {
@@ -108,13 +98,11 @@ func EffectiveLimit(cmd *cobra.Command, resource, flagName string, flagValue, fa
 		}
 	}
 
-	resource = clitypes.NormalizePaginatedResource(resource)
-
 	var ctx context.Context
 	if cmd != nil {
 		ctx = cmd.Context()
 	}
-	if app, ok := runtimectx.From(ctx); ok {
+	if app, ok := runtime.From(ctx); ok {
 		if cfg := app.Config(); cfg != nil {
 			if v := cfg.LimitFor(resource); v != 0 {
 				return v

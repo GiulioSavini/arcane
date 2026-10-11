@@ -9,6 +9,7 @@ import (
 	"github.com/getarcaneapp/arcane/types/v2/base"
 	"github.com/getarcaneapp/arcane/types/v2/project"
 	"github.com/getarcaneapp/arcane/types/v2/updater"
+	"go.getarcane.app/kit/pkg/mapping"
 
 	"github.com/getarcaneapp/arcane/backend/v2/internal/common"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/utils"
@@ -83,7 +84,7 @@ func (h *UpdaterHandler) GetUpdaterStatus(ctx context.Context, input *GetUpdater
 }
 
 // GetUpdaterHistory returns the history of update operations.
-func (h *UpdaterHandler) GetUpdaterHistory(ctx context.Context, input *GetUpdaterHistoryInput) (*handlerutil.Out[[]AutoUpdateRecord], error) {
+func (h *UpdaterHandler) GetUpdaterHistory(ctx context.Context, input *GetUpdaterHistoryInput) (*handlerutil.Out[[]updater.AutoUpdateRecord], error) {
 	limit := input.Limit
 	if limit <= 0 {
 		limit = 50
@@ -94,10 +95,15 @@ func (h *UpdaterHandler) GetUpdaterHistory(ctx context.Context, input *GetUpdate
 		return nil, huma.Error500InternalServerError("Failed to get updater history: " + err.Error())
 	}
 
-	return &handlerutil.Out[[]AutoUpdateRecord]{
-		Body: base.ApiResponse[[]AutoUpdateRecord]{
+	records, err := mapping.MapSlice[AutoUpdateRecord, updater.AutoUpdateRecord](history)
+	if err != nil {
+		return nil, huma.Error500InternalServerError("Failed to get updater history: " + err.Error())
+	}
+
+	return &handlerutil.Out[[]updater.AutoUpdateRecord]{
+		Body: base.ApiResponse[[]updater.AutoUpdateRecord]{
 			Success: true,
-			Data:    history,
+			Data:    records,
 		},
 	}, nil
 }

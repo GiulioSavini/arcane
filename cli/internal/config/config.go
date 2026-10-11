@@ -36,22 +36,6 @@ var configCache = hot.NewHotCache[string, *types.Config](hot.LRU, 4).
 	WithCopyOnWrite((*types.Config).Clone).
 	Build()
 
-func normalizeConfig(cfg *types.Config) *types.Config {
-	if cfg == nil {
-		return DefaultConfig()
-	}
-	normalized := cfg.Clone()
-	if normalized == nil {
-		return DefaultConfig()
-	}
-
-	if normalized.Pagination.Resources == nil {
-		normalized.Pagination.Resources = make(map[string]types.PaginationResourceConfig)
-	}
-
-	return normalized
-}
-
 func invalidateCache() {
 	configCache.Purge()
 }
@@ -132,7 +116,10 @@ func Load() (*types.Config, error) {
 	if parseErr := yaml.Unmarshal(data, cfg); parseErr != nil {
 		return nil, fmt.Errorf("failed to parse config file: %w", parseErr)
 	}
-	normalized := normalizeConfig(cfg)
+	normalized := cfg.Clone()
+	if normalized.Pagination.Resources == nil {
+		normalized.Pagination.Resources = make(map[string]types.PaginationResourceConfig)
+	}
 
 	configCache.Set(path, normalized)
 
@@ -146,7 +133,10 @@ func Save(c *types.Config) error {
 		return err
 	}
 
-	cfg := normalizeConfig(c)
+	cfg := DefaultConfig()
+	if c != nil {
+		cfg = c.Clone()
+	}
 	cfg.Pagination.Default.Limit = max(0, cfg.Pagination.Default.Limit)
 	resources := cfg.Pagination.Resources
 	cfg.Pagination.Resources = make(map[string]types.PaginationResourceConfig, len(resources))

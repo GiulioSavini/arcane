@@ -86,9 +86,6 @@ func (a *AppContext) Config() *types.Config {
 		return nil
 	}
 	copyCfg := a.cfg.Clone()
-	if copyCfg == nil {
-		return nil
-	}
 	if id := cmp.Or(a.selectedEnv, a.EnvOverride); id != "" {
 		copyCfg.DefaultEnvironment = id
 	}
@@ -117,8 +114,7 @@ func (a *AppContext) Client() (*client.Client, error) {
 		return client.NewFromConfig()
 	}
 	a.clientOnce.Do(func() {
-		cfg := a.Config()
-		a.client, a.clientErr = client.New(cfg)
+		a.client, a.clientErr = client.New(a.Config())
 		if a.clientErr != nil {
 			return
 		}
@@ -134,8 +130,7 @@ func (a *AppContext) UnauthClient() (*client.Client, error) {
 		return client.NewFromConfigUnauthenticated()
 	}
 	a.unauthClientOnce.Do(func() {
-		cfg := a.Config()
-		a.unauthClient, a.unauthClientErr = client.NewUnauthenticated(cfg)
+		a.unauthClient, a.unauthClientErr = client.NewUnauthenticated(a.Config())
 		if a.unauthClientErr != nil {
 			return
 		}

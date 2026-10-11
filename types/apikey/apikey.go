@@ -56,5 +56,5 @@ type UpdateApiKey struct {
 	Name        *string           `json:"name,omitzero" maxLength:"255" doc:"New name for the API key" unorm:"nfc" trim:"true"`
 	Description *string           `json:"description,omitzero" maxLength:"1000" doc:"New description for the API key" unorm:"nfc" trim:"true"`
 	ExpiresAt   *time.Time        `json:"expiresAt,omitzero" doc:"New expiration date for the API key"`
-	Permissions []PermissionGrant `json:"permissions,omitempty" doc:"Replace the key's permission grants. Omit to leave unchanged. Cannot exceed the updater's own permissions."`
+	Permissions []PermissionGrant `json:"permissions,omitzero" doc:"Replace the key's permission grants. Omit to leave unchanged. Cannot exceed the updater's own permissions."`
 }

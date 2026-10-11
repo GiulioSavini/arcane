@@ -10,7 +10,7 @@ import (
 func TestFindChecksumMatchesNextDistPath(t *testing.T) {
 	checksums := "abc123  dist/arcane-cli_darwin_arm64_v8.0/arcane-cli\n"
 
-	got, err := findChecksumInternal(checksums, "arcane-cli_darwin_arm64_v8.0/arcane-cli", "arcane-cli_darwin_arm64")
+	got, err := findChecksum(checksums, "arcane-cli_darwin_arm64_v8.0/arcane-cli", "arcane-cli_darwin_arm64")
 
 	require.NoError(t, err,
 		"findChecksum returned error: %v", err)
@@ -22,7 +22,7 @@ func TestFindChecksumMatchesNextDistPath(t *testing.T) {
 func TestFindChecksumMatchesArchiveBasename(t *testing.T) {
 	checksums := "def456  dist/arcane-cli_linux_amd64.tar.gz\n"
 
-	got, err := findChecksumInternal(checksums, "arcane-cli_linux_amd64.tar.gz")
+	got, err := findChecksum(checksums, "arcane-cli_linux_amd64.tar.gz")
 
 	require.NoError(t, err,
 		"findChecksum returned error: %v", err)
@@ -34,7 +34,7 @@ func TestFindChecksumMatchesArchiveBasename(t *testing.T) {
 func TestChecksumEntryNames(t *testing.T) {
 	checksums := "abc123  ./arcane-cli_darwin_arm64\n\nbad-line\ndef456  dist/arcane-cli_linux_amd64.tar.gz\n"
 
-	got := checksumEntryNamesInternal(checksums)
+	got := checksumEntryNames(checksums)
 	want := []string{"arcane-cli_darwin_arm64", "dist/arcane-cli_linux_amd64.tar.gz"}
 	if len(got) != len(want) {
 		require.Len(t, got, len(want),
@@ -47,19 +47,11 @@ func TestChecksumEntryNames(t *testing.T) {
 }
 
 func TestCLIArtifactNamesUseFlatR2BinaryNames(t *testing.T) {
-	platformName, err := cliPlatformNameInternal()
+	platformName, err := cliPlatformName()
 
 	require.NoError(t, err,
 		"cliPlatformName returned error: %v", err)
 
 	require.False(t, strings.HasPrefix(platformName, "arcane-cli_") || strings.Contains(platformName, "/") || strings.HasSuffix(platformName, ".tar.gz"),
 		"platformName = %q, want bare platform name", platformName)
-
-	artifactName, err := cliRawArtifactNameInternal()
-
-	require.NoError(t, err,
-		"cliRawArtifactName returned error: %v", err)
-
-	require.Equal(t, "arcane-cli_"+platformName, artifactName,
-		"artifactName = %q, want %q", artifactName, "arcane-cli_"+platformName)
 }

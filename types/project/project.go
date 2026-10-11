@@ -144,6 +144,19 @@ type UpdateProject struct {
 	OverrideContent *string `json:"overrideContent,omitzero"`
 }
 
+// BuildRequest configures a project's image build.
+type BuildRequest struct {
+	Services []string `json:"services,omitempty" doc:"Service names to build"`
+	Provider string   `json:"provider,omitempty" doc:"Build provider override"`
+	Push     *bool    `json:"push,omitempty" doc:"Push images"`
+	Load     *bool    `json:"load,omitempty" doc:"Load images into Docker"`
+}
+
+// UpdateServicesRequest selects project services to update.
+type UpdateServicesRequest struct {
+	Services []string `json:"services,omitempty" doc:"Service names to update; empty updates all services"`
+}
+
 // DeployOptions configures project deploy behavior.
 type DeployOptions struct {
 	// PullPolicy overrides the image pull policy used during deploy.

@@ -13,32 +13,37 @@ import (
 	"github.com/muesli/cancelreader"
 )
 
-// Confirm uses a terminal selector, falling back to line input for scripts.
+// Confirm requires terminal input, using a selector or line input depending on the output terminal.
 func Confirm(ctx context.Context, input io.Reader, out io.Writer, label string) (bool, error) {
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
+	if !IsTerminal(input) {
+		return false, fmt.Errorf("confirmation required: re-run with --yes (%s)", label)
+	}
 	defer SuspendProgress()()
-	if !IsTerminal(input) || !IsTerminal(out) {
+	if !IsTerminal(out) {
 		if _, err := fmt.Fprintf(out, "%s (y/N): ", strings.TrimSpace(label)); err != nil {
 			return false, err
 		}
-		answer, err := ReadWithContext(ctx, input, func(r io.Reader) (string, error) {
-			var answer string
-			_, err := fmt.Fscanln(r, &answer)
-			return answer, err
-		})
+		answer, err := ReadWithContext(ctx, input, readLine)
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return false, ctxErr
 		}
 		if err != nil && !errors.Is(err, io.EOF) {
 			return false, fmt.Errorf("failed to read confirmation input: %w", err)
 		}
-		return strings.EqualFold(answer, "y") || strings.EqualFold(answer, "yes"), nil
+		return strings.EqualFold(strings.TrimSpace(answer), "y") || strings.EqualFold(strings.TrimSpace(answer), "yes"), nil
 	}
 	model, err := tea.NewProgram(confirmModel{label: label, out: out}, tea.WithContext(ctx), tea.WithInput(input), tea.WithOutput(out)).Run()
-	if promptErr := programErrInternal(ctx, err, "confirmation prompt"); promptErr != nil {
-		return false, promptErr
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return false, ctxErr
+	}
+	if errors.Is(err, tea.ErrInterrupted) {
+		return false, context.Canceled
+	}
+	if err != nil {
+		return false, fmt.Errorf("confirmation prompt: %w", err)
 	}
 	result, ok := model.(confirmModel)
 	if !ok {
@@ -54,7 +59,7 @@ func Secret(ctx context.Context, input io.Reader, out io.Writer, label, flagName
 		return "", err
 	}
 	if !IsTerminal(input) {
-		value, err := ReadWithContext(ctx, input, readLineInternal)
+		value, err := ReadWithContext(ctx, input, readLine)
 		if err != nil {
 			return "", err
 		}
@@ -69,8 +74,14 @@ func Secret(ctx context.Context, input io.Reader, out io.Writer, label, flagName
 	field.EchoMode = textinput.EchoPassword
 	field.Focus()
 	model, err := tea.NewProgram(secretModel{input: field}, tea.WithContext(ctx), tea.WithInput(input), tea.WithOutput(out)).Run()
-	if promptErr := programErrInternal(ctx, err, "secret prompt"); promptErr != nil {
-		return "", promptErr
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return "", ctxErr
+	}
+	if errors.Is(err, tea.ErrInterrupted) {
+		return "", context.Canceled
+	}
+	if err != nil {
+		return "", fmt.Errorf("secret prompt: %w", err)
 	}
 	result, ok := model.(secretModel)
 	if !ok {
@@ -83,24 +94,34 @@ func Secret(ctx context.Context, input io.Reader, out io.Writer, label, flagName
 }
 
 // ReadWithContext reads input until read returns or ctx is canceled.
-// Pipes, sockets and terminals are interrupted in place; regular files never
-// block; other readers fall back to readAsyncInternal.
+// Pollable files cancel in place; other blocking readers use an asynchronous read.
 func ReadWithContext[T any](ctx context.Context, input io.Reader, read func(io.Reader) (T, error)) (T, error) {
 	var value T
 	var err, closeErr error
-	mode, isFile := fileModeInternal(input)
-	if isFile && mode.IsRegular() {
+	var mode os.FileMode
+	isFile := false
+	if file, ok := input.(interface{ Stat() (os.FileInfo, error) }); ok {
+		if info, statErr := file.Stat(); statErr == nil {
+			mode, isFile = info.Mode(), true
+		}
+	}
+	var reader cancelreader.CancelReader
+	if isFile && !mode.IsRegular() {
+		reader, _ = cancelreader.NewReader(input)
+	}
+	switch {
+	case isFile && mode.IsRegular():
 		// kqueue never reports a regular file readable at EOF, so poll nothing.
 		value, err = read(input)
-	} else if reader := pollableReaderInternal(input, isFile); reader != nil {
+	case reader != nil:
 		stop := context.AfterFunc(ctx, func() { reader.Cancel() })
 		value, err = read(reader)
 		stop()
 		if releaseErr := reader.Close(); releaseErr != nil {
 			closeErr = fmt.Errorf("release input reader: %w", releaseErr)
 		}
-	} else {
-		value, err = readAsyncInternal(ctx, input, read)
+	default:
+		value, err = readAsync(ctx, input, read)
 	}
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		var zero T
@@ -109,35 +130,8 @@ func ReadWithContext[T any](ctx context.Context, input io.Reader, read func(io.R
 	return value, errors.Join(err, closeErr)
 }
 
-func fileModeInternal(input io.Reader) (os.FileMode, bool) {
-	file, ok := input.(interface{ Stat() (os.FileInfo, error) })
-	if !ok {
-		return 0, false
-	}
-	info, err := file.Stat()
-	if err != nil {
-		return 0, false
-	}
-	return info.Mode(), true
-}
-
-// pollableReaderInternal wraps a non-regular file in a reader whose blocked
-// Read can be canceled, or returns nil when the platform cannot poll it.
-func pollableReaderInternal(input io.Reader, isFile bool) cancelreader.CancelReader {
-	if !isFile {
-		return nil
-	}
-	reader, err := cancelreader.NewReader(input)
-	if err != nil {
-		return nil
-	}
-	return reader
-}
-
-// readAsyncInternal serves readers that cannot be interrupted, such as an
-// embedder's io.Pipe. Cancellation stops waiting; the goroutine exits when the
-// caller-owned reader returns, which closing it forces.
-func readAsyncInternal[T any](ctx context.Context, input io.Reader, read func(io.Reader) (T, error)) (T, error) {
+// readAsync stops waiting on cancellation; its goroutine exits when input returns.
+func readAsync[T any](ctx context.Context, input io.Reader, read func(io.Reader) (T, error)) (T, error) {
 	type result struct {
 		value T
 		err   error
@@ -156,9 +150,9 @@ func readAsyncInternal[T any](ctx context.Context, input io.Reader, read func(io
 	}
 }
 
-// readLineInternal reads byte by byte so input after the newline stays
+// readLine reads byte by byte so input after the newline stays
 // available to the next prompt.
-func readLineInternal(r io.Reader) (string, error) {
+func readLine(r io.Reader) (string, error) {
 	var line []byte
 	buf := make([]byte, 1)
 	for {
@@ -177,21 +171,6 @@ func readLineInternal(r io.Reader) (string, error) {
 		}
 	}
 	return strings.TrimSuffix(string(line), "\r"), nil
-}
-
-// programErrInternal maps prompt cancellation, including Ctrl+C in raw mode,
-// to a context error.
-func programErrInternal(ctx context.Context, err error, name string) error {
-	if ctx.Err() != nil {
-		return ctx.Err()
-	}
-	if errors.Is(err, tea.ErrInterrupted) {
-		return context.Canceled
-	}
-	if err != nil {
-		return fmt.Errorf("%s: %w", name, err)
-	}
-	return nil
 }
 
 type secretModel struct {
@@ -274,6 +253,6 @@ func (m confirmModel) View() tea.View {
 	} else {
 		no = "[ No ]"
 	}
-	hint := renderForInternal(m.out, statusMutedStyle, "←/→ or tab: choose · enter: submit · esc: cancel")
-	return tea.NewView("\n  " + renderForInternal(m.out, headerStyle, m.label) + "\n\n  " + no + "  " + yes + "\n\n  " + hint + "\n")
+	hint := renderFor(m.out, statusMutedStyle, "←/→ or tab: choose · enter: submit · esc: cancel")
+	return tea.NewView("\n  " + renderFor(m.out, headerStyle, m.label) + "\n\n  " + no + "  " + yes + "\n\n  " + hint + "\n")
 }

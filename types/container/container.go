@@ -13,6 +13,11 @@ import (
 	imagetypes "github.com/getarcaneapp/arcane/types/v2/image"
 )
 
+// SetAutoUpdateRequest configures container auto-update.
+type SetAutoUpdateRequest struct {
+	Enabled bool `json:"enabled" doc:"Whether auto-update is enabled for this container"`
+}
+
 // RestartPolicyCreate represents restart policy options for container creation.
 type RestartPolicyCreate struct {
 	// Name of the restart policy.

@@ -11,7 +11,6 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
-	"io"
 	"math/big"
 	"net"
 	"net/url"
@@ -22,67 +21,74 @@ import (
 
 	"github.com/spf13/cobra"
 	"go.getarcane.app/acfs/atomic"
+	kit "go.getarcane.app/kit/pkg"
 )
 
 const (
 	certValidity = 5 * 365 * 24 * time.Hour
 )
 
-var (
-	mtlsOutDir    string
-	mtlsEnvID     string
-	mtlsAppURL    string
-	tlsOutDir     string
-	tlsCommonName string
-	tlsHosts      []string
-	tlsCertName   string
-	tlsKeyName    string
-)
-
-var mtlsCmd = &cobra.Command{
-	Use:   "mtls",
-	Short: "Generate Arcane edge mTLS assets",
-	Long:  `Generate an Arcane-managed edge mTLS CA and agent client certificate bundle using ML-DSA-87.`,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		return generateMTLSOutputInternal(cmd.OutOrStdout())
-	},
+func newMTLSCmd() *cobra.Command {
+	var opts struct {
+		outDir string
+		envID  string
+		appURL string
+	}
+	cmd := &cobra.Command{
+		Use:   "mtls",
+		Short: "Generate Arcane edge mTLS assets",
+		Long:  `Generate an Arcane-managed edge mTLS CA and agent client certificate bundle using ML-DSA-87.`,
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return generateMTLSOutput(cmd, opts.outDir, opts.envID, opts.appURL)
+		},
+	}
+	cmd.Flags().StringVar(&opts.outDir, "out-dir", "./edge-mtls", "directory to write generated edge mTLS assets")
+	cmd.Flags().StringVar(&opts.envID, "env-id", "local-edge", "environment identifier to embed in the generated edge agent certificate")
+	cmd.Flags().StringVar(&opts.appURL, "app-url", "http://localhost:3552", "Arcane manager app URL to embed as the edge mTLS SPIFFE trust domain")
+	return cmd
 }
 
-var tlsCmd = &cobra.Command{
-	Use:   "tls",
-	Short: "Generate Arcane HTTPS TLS assets",
-	Long:  `Generate a self-signed Arcane HTTPS server certificate bundle using ECDSA P-384.`,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		return generateTLSOutputInternal(cmd.OutOrStdout())
-	},
+func newTLSCmd() *cobra.Command {
+	var opts struct {
+		outDir     string
+		commonName string
+		hosts      []string
+		certName   string
+		keyName    string
+	}
+	cmd := &cobra.Command{
+		Use:   "tls",
+		Short: "Generate Arcane HTTPS TLS assets",
+		Long:  `Generate a self-signed Arcane HTTPS server certificate bundle using ECDSA P-384.`,
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return generateTLSOutput(cmd, opts.outDir, opts.commonName, opts.hosts, opts.certName, opts.keyName)
+		},
+	}
+	cmd.Flags().StringVar(&opts.outDir, "out-dir", "./arcane-tls", "directory to write generated Arcane TLS assets")
+	cmd.Flags().StringVar(&opts.commonName, "common-name", "localhost", "certificate common name")
+	cmd.Flags().StringSliceVar(&opts.hosts, "host", []string{"localhost", "127.0.0.1"}, "DNS name or IP SAN to include; repeat flag to add more")
+	cmd.Flags().StringVar(&opts.certName, "cert-name", "server.crt", "certificate file name to write under out-dir")
+	cmd.Flags().StringVar(&opts.keyName, "key-name", "server.key", "private key file name to write under out-dir")
+	return cmd
 }
 
-func init() {
-	GenerateCmd.AddCommand(mtlsCmd)
-	GenerateCmd.AddCommand(tlsCmd)
-
-	mtlsCmd.Flags().StringVar(&mtlsOutDir, "out-dir", "./edge-mtls", "directory to write generated edge mTLS assets")
-	mtlsCmd.Flags().StringVar(&mtlsEnvID, "env-id", "local-edge", "environment identifier to embed in the generated edge agent certificate")
-	mtlsCmd.Flags().StringVar(&mtlsAppURL, "app-url", "http://localhost:3552", "Arcane manager app URL to embed as the edge mTLS SPIFFE trust domain")
-
-	tlsCmd.Flags().StringVar(&tlsOutDir, "out-dir", "./arcane-tls", "directory to write generated Arcane TLS assets")
-	tlsCmd.Flags().StringVar(&tlsCommonName, "common-name", "localhost", "certificate common name")
-	tlsCmd.Flags().StringSliceVar(&tlsHosts, "host", []string{"localhost", "127.0.0.1"}, "DNS name or IP SAN to include; repeat flag to add more")
-	tlsCmd.Flags().StringVar(&tlsCertName, "cert-name", "server.crt", "certificate file name to write under out-dir")
-	tlsCmd.Flags().StringVar(&tlsKeyName, "key-name", "server.key", "private key file name to write under out-dir")
-}
-
-func generateMTLSOutputInternal(w io.Writer) error {
+func generateMTLSOutput(cmd *cobra.Command, mtlsOutDir, mtlsEnvID, mtlsAppURL string) error {
+	w := cmd.OutOrStdout()
 	outDir, err := filepath.Abs(strings.TrimSpace(mtlsOutDir))
 	if err != nil {
 		return fmt.Errorf("failed to resolve output directory: %w", err)
 	}
 
-	paths, err := generateEdgeMTLSBundleInternal(outDir, strings.TrimSpace(mtlsEnvID), strings.TrimSpace(mtlsAppURL))
+	paths, err := generateEdgeMTLSBundle(outDir, strings.TrimSpace(mtlsEnvID), strings.TrimSpace(mtlsAppURL))
 	if err != nil {
 		return err
 	}
 
+	if jsonOutput(cmd) {
+		return printJSON(cmd, paths)
+	}
 	_, _ = fmt.Fprintln(w, "Generated Arcane edge mTLS assets (ML-DSA-87)")
 	_, _ = fmt.Fprintf(w, "CA cert: %s\n", paths.CACertPath)
 	_, _ = fmt.Fprintf(w, "CA key: %s\n", paths.CAKeyPath)
@@ -97,17 +103,21 @@ func generateMTLSOutputInternal(w io.Writer) error {
 	return nil
 }
 
-func generateTLSOutputInternal(w io.Writer) error {
+func generateTLSOutput(cmd *cobra.Command, tlsOutDir, tlsCommonName string, tlsHosts []string, tlsCertName, tlsKeyName string) error {
+	w := cmd.OutOrStdout()
 	outDir, err := filepath.Abs(strings.TrimSpace(tlsOutDir))
 	if err != nil {
 		return fmt.Errorf("failed to resolve output directory: %w", err)
 	}
 
-	paths, err := generateServerTLSBundleInternal(outDir, strings.TrimSpace(tlsCommonName), tlsHosts, strings.TrimSpace(tlsCertName), strings.TrimSpace(tlsKeyName))
+	paths, err := generateServerTLSBundle(outDir, strings.TrimSpace(tlsCommonName), tlsHosts, strings.TrimSpace(tlsCertName), strings.TrimSpace(tlsKeyName))
 	if err != nil {
 		return err
 	}
 
+	if jsonOutput(cmd) {
+		return printJSON(cmd, paths)
+	}
 	_, _ = fmt.Fprintln(w, "Generated Arcane TLS assets (ECDSA P-384)")
 	_, _ = fmt.Fprintf(w, "Server cert: %s\n", paths.CertPath)
 	_, _ = fmt.Fprintf(w, "Server key: %s\n", paths.KeyPath)
@@ -118,18 +128,18 @@ func generateTLSOutputInternal(w io.Writer) error {
 }
 
 type edgeMTLSPaths struct {
-	CACertPath     string
-	CAKeyPath      string
-	ClientCertPath string
-	ClientKeyPath  string
+	CACertPath     string `json:"cACertPath"`
+	CAKeyPath      string `json:"cAKeyPath"`
+	ClientCertPath string `json:"clientCertPath"`
+	ClientKeyPath  string `json:"clientKeyPath"`
 }
 
 type serverTLSPaths struct {
-	CertPath string
-	KeyPath  string
+	CertPath string `json:"certPath"`
+	KeyPath  string `json:"keyPath"`
 }
 
-func generateEdgeMTLSBundleInternal(outDir, envID, appURL string) (*edgeMTLSPaths, error) {
+func generateEdgeMTLSBundle(outDir, envID, appURL string) (*edgeMTLSPaths, error) {
 	if envID == "" {
 		return nil, errors.New("env ID is required")
 	}
@@ -180,17 +190,17 @@ func generateEdgeMTLSBundleInternal(outDir, envID, appURL string) (*edgeMTLSPath
 		ClientCertPath: filepath.Join(outDir, "agent.crt"),
 		ClientKeyPath:  filepath.Join(outDir, "agent.key"),
 	}
-	if writeCertificateBundleErr := writeCertificateBundleInternal(paths.CACertPath, paths.CAKeyPath, caDER, caKey); writeCertificateBundleErr != nil {
+	if writeCertificateBundleErr := writeCertificateBundle(paths.CACertPath, paths.CAKeyPath, caDER, caKey); writeCertificateBundleErr != nil {
 		return nil, writeCertificateBundleErr
 	}
-	if writeClientBundleErr := writeCertificateBundleInternal(paths.ClientCertPath, paths.ClientKeyPath, clientDER, clientKey); writeClientBundleErr != nil {
+	if writeClientBundleErr := writeCertificateBundle(paths.ClientCertPath, paths.ClientKeyPath, clientDER, clientKey); writeClientBundleErr != nil {
 		return nil, writeClientBundleErr
 	}
 
 	return paths, nil
 }
 
-func generateServerTLSBundleInternal(outDir, commonName string, hosts []string, certName, keyName string) (*serverTLSPaths, error) {
+func generateServerTLSBundle(outDir, commonName string, hosts []string, certName, keyName string) (*serverTLSPaths, error) {
 	if commonName == "" {
 		return nil, errors.New("common name is required")
 	}
@@ -225,7 +235,7 @@ func generateServerTLSBundleInternal(outDir, commonName string, hosts []string, 
 		CertPath: filepath.Join(outDir, certName),
 		KeyPath:  filepath.Join(outDir, keyName),
 	}
-	if writeCertificateBundleErr := writeCertificateBundleInternal(paths.CertPath, paths.KeyPath, certDER, privateKey); writeCertificateBundleErr != nil {
+	if writeCertificateBundleErr := writeCertificateBundle(paths.CertPath, paths.KeyPath, certDER, privateKey); writeCertificateBundleErr != nil {
 		return nil, writeCertificateBundleErr
 	}
 	return paths, nil
@@ -243,7 +253,7 @@ func GenerateMLDSA87PrivateKey() (*mldsa.PrivateKey, error) {
 
 // NewEdgeMTLSCATemplate builds Arcane's edge mTLS CA certificate template.
 func NewEdgeMTLSCATemplate() (*x509.Certificate, error) {
-	template, err := newCertificateTemplateInternal("Arcane Edge mTLS CA")
+	template, err := newCertificateTemplate("Arcane Edge mTLS CA")
 	if err != nil {
 		return nil, err
 	}
@@ -261,7 +271,7 @@ func NewEdgeMTLSClientTemplate(commonName string, uriSAN *url.URL, dnsSANs []str
 	if commonName == "" {
 		return nil, errors.New("common name is required")
 	}
-	template, err := newCertificateTemplateInternal(commonName)
+	template, err := newCertificateTemplate(commonName)
 	if err != nil {
 		return nil, err
 	}
@@ -275,12 +285,7 @@ func NewEdgeMTLSClientTemplate(commonName string, uriSAN *url.URL, dnsSANs []str
 	if uriSAN != nil {
 		template.URIs = []*url.URL{uriSAN}
 	}
-	for _, dnsSAN := range dnsSANs {
-		dnsSAN = strings.TrimSpace(dnsSAN)
-		if dnsSAN != "" {
-			template.DNSNames = append(template.DNSNames, dnsSAN)
-		}
-	}
+	template.DNSNames = kit.TrimNonEmpty(dnsSANs)
 	return template, nil
 }
 
@@ -290,7 +295,7 @@ func NewServerTLSTemplate(commonName string, hosts []string) (*x509.Certificate,
 	if commonName == "" {
 		return nil, errors.New("common name is required")
 	}
-	template, err := newCertificateTemplateInternal(commonName)
+	template, err := newCertificateTemplate(commonName)
 	if err != nil {
 		return nil, err
 	}
@@ -298,11 +303,7 @@ func NewServerTLSTemplate(commonName string, hosts []string) (*x509.Certificate,
 	template.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}
 	template.KeyUsage = x509.KeyUsageDigitalSignature
 
-	for _, host := range hosts {
-		host = strings.TrimSpace(host)
-		if host == "" {
-			continue
-		}
+	for _, host := range kit.TrimNonEmpty(hosts) {
 		if ip := net.ParseIP(host); ip != nil {
 			template.IPAddresses = append(template.IPAddresses, ip)
 			continue
@@ -344,10 +345,11 @@ func BuildEdgeMTLSURISAN(appURL, envID string) *url.URL {
 	return &url.URL{Scheme: "spiffe", Host: trustDomain, Path: "/edge/" + envID}
 }
 
-func newCertificateTemplateInternal(commonName string) (*x509.Certificate, error) {
-	serial, err := randomSerialInternal()
+func newCertificateTemplate(commonName string) (*x509.Certificate, error) {
+	limit := new(big.Int).Lsh(big.NewInt(1), 128)
+	serial, err := rand.Int(rand.Reader, limit)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to generate certificate serial: %w", err)
 	}
 
 	now := time.Now().UTC()
@@ -359,33 +361,21 @@ func newCertificateTemplateInternal(commonName string) (*x509.Certificate, error
 	}, nil
 }
 
-func randomSerialInternal() (*big.Int, error) {
-	limit := new(big.Int).Lsh(big.NewInt(1), 128)
-	serial, err := rand.Int(rand.Reader, limit)
-	if err != nil {
-		return nil, fmt.Errorf("failed to generate certificate serial: %w", err)
-	}
-	return serial, nil
-}
-
-func writeCertificateBundleInternal(certPath, keyPath string, certDER []byte, privateKey crypto.PrivateKey) error {
+func writeCertificateBundle(certPath, keyPath string, certDER []byte, privateKey crypto.PrivateKey) error {
 	keyDER, err := x509.MarshalPKCS8PrivateKey(privateKey)
 	if err != nil {
 		return fmt.Errorf("failed to marshal private key: %w", err)
 	}
-	if writePEMFileErr := writePEMFileInternal(certPath, "CERTIFICATE", certDER, 0o644); writePEMFileErr != nil {
-		return writePEMFileErr
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
+	if certPEM == nil {
+		return fmt.Errorf("failed to encode PEM file %s", certPath)
 	}
-	if writePrivateKeyErr := writePEMFileInternal(keyPath, "PRIVATE KEY", keyDER, 0o600); writePrivateKeyErr != nil {
-		return writePrivateKeyErr
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
+	if keyPEM == nil {
+		return fmt.Errorf("failed to encode PEM file %s", keyPath)
 	}
-	return nil
-}
-
-func writePEMFileInternal(path, blockType string, bytes []byte, perm os.FileMode) error {
-	pemBytes := pem.EncodeToMemory(&pem.Block{Type: blockType, Bytes: bytes})
-	if pemBytes == nil {
-		return fmt.Errorf("failed to encode PEM file %s", path)
+	if writeErr := atomic.WriteFile(certPath, certPEM, 0o644); writeErr != nil {
+		return writeErr
 	}
-	return atomic.WriteFile(path, pemBytes, perm)
+	return atomic.WriteFile(keyPath, keyPEM, 0o600)
 }

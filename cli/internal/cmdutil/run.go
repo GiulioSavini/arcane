@@ -1,8 +1,11 @@
 package cmdutil
 
 import (
+	"encoding/json/jsontext"
 	"encoding/json/v2"
+	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
 	"time"
 
@@ -24,8 +27,6 @@ type ListSpec[T any] struct {
 	Params ListParams
 	// Query holds extra query parameters, applied after pagination.
 	Query url.Values
-	// JSON selects raw JSON passthrough output.
-	JSON bool
 
 	Headers []string
 	Row     func(T) []string
@@ -33,7 +34,7 @@ type ListSpec[T any] struct {
 
 // RunList executes one standard list command as described by spec.
 func RunList[T any](cmd *cobra.Command, c *client.Client, spec ListSpec[T]) error {
-	loading := output.StartTracker(cmd.Context(), cmd.ErrOrStderr(), !spec.JSON, "Loading "+spec.Resource)
+	loading := output.StartTracker(cmd.Context(), cmd.ErrOrStderr(), !JSONOutputEnabled(cmd), "Loading "+spec.Resource)
 	loading.NextStep()
 	defer loading.Stop()
 	path, err := ApplyPaginationParams(cmd, spec.Endpoint, spec.Params)
@@ -55,7 +56,7 @@ func RunList[T any](cmd *cobra.Command, c *client.Client, spec ListSpec[T]) erro
 		return fmt.Errorf("failed to list %s: %w", spec.Resource, err)
 	}
 
-	if spec.JSON {
+	if JSONOutputEnabled(cmd) {
 		return PrintRawJSON(body)
 	}
 
@@ -71,49 +72,72 @@ func RunList[T any](cmd *cobra.Command, c *client.Client, spec ListSpec[T]) erro
 		rows[i] = spec.Row(item)
 	}
 
-	if tableErr := PrintTable(cmd, spec.Headers, rows, TableSummary{Resource: spec.Resource, Total: result.Pagination.TotalItems, Paginated: true}); tableErr != nil {
-		return tableErr
+	return PrintTable(cmd, spec.Headers, rows, TableSummary{Resource: spec.Resource, Total: result.Pagination.TotalItems, Paginated: true})
+}
+
+// Spec describes a request with raw JSON data output or typed text rendering.
+// Render is required in text mode; a nil Render returns a programmer error before requesting.
+type Spec[T any] struct {
+	Method, Path, FailureMessage string
+	Body                         any
+	Timeout                      time.Duration
+	Render                       func(T) error
+}
+
+// Run enforces a success envelope and prints raw data in JSON mode or invokes Render in text mode.
+func Run[T any](cmd *cobra.Command, c *client.Client, spec Spec[T]) error {
+	jsonMode := JSONOutputEnabled(cmd)
+	if !jsonMode && spec.Render == nil {
+		return errors.New("request runner requires Render in text mode")
 	}
-	return nil
-}
-
-// PostActionSpec describes one resolve→POST→decode→report action command. T
-// is the API envelope's data payload.
-type PostActionSpec struct {
-	// Path is the fully built action path.
-	Path string
-	// Body is the optional JSON request body.
-	Body any
-	// FailureMessage wraps transport and status errors.
-	FailureMessage string
-	// SuccessMessage is the preformatted human-readable success line.
-	SuccessMessage string
-	// Timeout optionally extends the client timeout for slow actions.
-	Timeout time.Duration
-	// JSON prints the decoded response data instead of the success line.
-	JSON bool
-}
-
-// RunPostAction executes one POST action command as described by spec.
-func RunPostAction[T any](cmd *cobra.Command, c *client.Client, spec PostActionSpec) error {
 	if spec.Timeout > 0 {
 		c.SetTimeout(spec.Timeout)
 	}
-
-	loading := output.StartTracker(cmd.Context(), cmd.ErrOrStderr(), !spec.JSON, cmd.Short)
+	loading := output.StartTracker(cmd.Context(), cmd.ErrOrStderr(), !jsonMode, cmd.Short)
 	loading.NextStep()
 	defer loading.Stop()
-	result, err := c.PostJSON[T](cmd.Context(), spec.Path, spec.Body)
+	result, err := c.DoEnvelope[jsontext.Value](cmd.Context(), spec.Method, spec.Path, spec.Body)
 	if err != nil {
 		return fmt.Errorf("%s: %w", spec.FailureMessage, err)
 	}
-
 	loading.Finish("", nil)
 	loading.Stop()
-	if spec.JSON {
-		return PrintJSON(result.Data)
+	if jsonMode {
+		if len(result.Data) == 0 {
+			return PrintJSON(nil)
+		}
+		return PrintRawJSON(result.Data)
 	}
+	var data T
+	if len(result.Data) > 0 {
+		if decodeErr := json.Unmarshal(result.Data, &data); decodeErr != nil {
+			return fmt.Errorf("%s: failed to decode response: %w", spec.FailureMessage, decodeErr)
+		}
+	}
+	return spec.Render(data)
+}
 
-	output.Success("%s", spec.SuccessMessage)
-	return nil
+// DeleteSpec describes a confirmed DELETE with optional body and human-readable success output.
+type DeleteSpec struct {
+	Force                                        bool
+	Prompt, Path, FailureMessage, SuccessMessage string
+	Body                                         any
+}
+
+// RunDelete returns nil on cancellation, otherwise printing raw data in JSON mode or SuccessMessage in text mode.
+func RunDelete(cmd *cobra.Command, c *client.Client, spec DeleteSpec) error {
+	confirmed, err := ConfirmOrCancel(cmd, spec.Force, spec.Prompt)
+	if err != nil || !confirmed {
+		return err
+	}
+	return Run(cmd, c, Spec[jsontext.Value]{
+		Method:         http.MethodDelete,
+		Path:           spec.Path,
+		Body:           spec.Body,
+		FailureMessage: spec.FailureMessage,
+		Render: func(jsontext.Value) error {
+			output.Success("%s", spec.SuccessMessage)
+			return nil
+		},
+	})
 }

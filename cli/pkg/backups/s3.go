@@ -4,117 +4,128 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"strconv"
 
 	"github.com/getarcaneapp/arcane/types/v2/backup"
 	"github.com/getarcaneapp/arcane/types/v2/base"
 	"github.com/spf13/cobra"
+	"go.getarcane.app/kit/pkg"
 
 	"github.com/getarcaneapp/arcane/cli/v2/internal/cmdutil"
 	"github.com/getarcaneapp/arcane/cli/v2/internal/output"
-	"github.com/getarcaneapp/arcane/cli/v2/internal/prompt"
 	"github.com/getarcaneapp/arcane/cli/v2/internal/types"
 )
 
-var (
-	s3Name            string
-	s3Endpoint        string
-	s3Bucket          string
-	s3Region          string
-	s3AccessKeyID     string
-	s3SecretAccessKey string
-	s3Prefix          string
-	s3UseSSL          bool
-	s3ForcePathStyle  bool
-
-	s3GetInUse bool
-)
-
-var s3Cmd = &cobra.Command{
-	Use:   "s3",
-	Short: "Manage S3 backup destinations",
+func newS3Cmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "s3",
+		Short: "Manage S3 backup destinations",
+	}
+	cmd.AddCommand(newS3ListCmd())
+	cmd.AddCommand(newS3GetCmd())
+	cmd.AddCommand(newS3CreateCmd())
+	cmd.AddCommand(newS3UpdateCmd())
+	cmd.AddCommand(newS3DeleteCmd())
+	cmd.AddCommand(newS3TestCmd())
+	return cmd
 }
 
-var s3ListCmd = &cobra.Command{
-	Use:          "list",
-	Aliases:      []string{"ls"},
-	Short:        "List S3 backup destinations",
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := cmdutil.ClientFromCommand(cmd)
-		if err != nil {
-			return err
-		}
-
-		return cmdutil.RunList(cmd, c, cmdutil.ListSpec[backup.S3Destination]{
-			Resource: "S3 destinations",
-			Endpoint: types.BackupsS3(),
-			Params:   cmdutil.ListParams{Resource: "s3 destinations", Limit: limitFlag, FallbackDefault: 20, Start: startFlag, All: allFlag},
-			JSON:     cmdutil.JSONOutputEnabled(cmd),
-			Headers:  []string{"ID", "NAME", "BUCKET", "REGION", "ENDPOINT", "SSL", "SECRET"},
-			Row: func(dest backup.S3Destination) []string {
-				secret := "Not set"
-				if dest.SecretConfigured {
-					secret = "Set"
-				}
-				return []string{
-					dest.ID,
-					dest.Name,
-					dest.Bucket,
-					dest.Region,
-					dest.Endpoint,
-					strconv.FormatBool(dest.UseSSL),
-					secret,
-				}
-			},
-		})
-	},
-}
-
-var s3GetCmd = &cobra.Command{
-	Use:          "get <destination>",
-	Short:        "Get S3 destination details by name or ID",
-	Args:         cobra.ExactArgs(1),
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := cmdutil.ClientFromCommand(cmd)
-		if err != nil {
-			return err
-		}
-
-		resolved, _, err := s3DestinationRef.Resolve(cmd.Context(), c, args[0], !cmdutil.JSONOutputEnabled(cmd) && prompt.IsInteractive())
-		if err != nil {
-			return err
-		}
-		dest := *resolved
-
-		if !s3GetInUse {
-			if cmdutil.JSONOutputEnabled(cmd) {
-				return cmdutil.PrintJSON(dest)
+func newS3ListCmd() *cobra.Command {
+	var opts struct {
+		limit int
+		start int
+		all   bool
+	}
+	cmd := &cobra.Command{
+		Use:          "list",
+		Aliases:      []string{"ls"},
+		Short:        "List S3 backup destinations",
+		Args:         cobra.NoArgs,
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := cmdutil.ClientFromCommand(cmd)
+			if err != nil {
+				return err
 			}
+
+			return cmdutil.RunList(cmd, c, cmdutil.ListSpec[backup.S3Destination]{
+				Resource: "S3 destinations",
+				Endpoint: types.BackupsS3(),
+				Params:   cmdutil.ListParams{Resource: "s3 destinations", Limit: opts.limit, FallbackDefault: 20, Start: opts.start, All: opts.all},
+				Headers:  []string{"ID", "NAME", "BUCKET", "REGION", "ENDPOINT", "SSL", "SECRET"},
+				Row: func(dest backup.S3Destination) []string {
+					return []string{
+						dest.ID,
+						dest.Name,
+						dest.Bucket,
+						dest.Region,
+						dest.Endpoint,
+						strconv.FormatBool(dest.UseSSL),
+						kit.Ternary(dest.SecretConfigured, "Set", "Not set"),
+					}
+				},
+			})
+		},
+	}
+	cmd.Flags().IntVarP(&opts.limit, "limit", "n", 20, "Number of destinations to show")
+	cmd.Flags().IntVar(&opts.start, "start", 0, cmdutil.StartFlagUsage)
+	cmd.Flags().BoolVarP(&opts.all, "all", "a", false, cmdutil.AllFlagUsage)
+	return cmd
+}
+
+func newS3GetCmd() *cobra.Command {
+	var opts struct {
+		inUse bool
+	}
+	cmd := &cobra.Command{
+		Use:          "get <destination>",
+		Short:        "Get S3 destination details by name or ID",
+		Args:         cobra.ExactArgs(1),
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := cmdutil.ClientFromCommand(cmd)
+			if err != nil {
+				return err
+			}
+
+			resolved, _, err := s3DestinationRef.Resolve(cmd.Context(), c, args[0], cmdutil.AllowPrompt(cmd))
+			if err != nil {
+				return err
+			}
+			dest := *resolved
+
+			if !opts.inUse {
+				if cmdutil.JSONOutputEnabled(cmd) {
+					return cmdutil.PrintJSON(dest)
+				}
+				printS3Destination(dest)
+				return nil
+			}
+
+			usage, err := c.DoJSON[backup.S3DestinationUsage](cmd.Context(), http.MethodGet, types.BackupsS3DestinationInUse(resolved.ID), nil)
+			if err != nil {
+				return fmt.Errorf("failed to check S3 destination usage: %w", err)
+			}
+
+			if cmdutil.JSONOutputEnabled(cmd) {
+				return cmdutil.PrintJSON(struct {
+					Destination backup.S3Destination `json:"destination"`
+					InUse       bool                 `json:"inUse"`
+				}{Destination: dest, InUse: usage.InUse})
+			}
+
 			printS3Destination(dest)
+			if usage.InUse {
+				output.KeyValue("In Use", "Yes (referenced by backups, policies, or settings)")
+			} else {
+				output.KeyValue("In Use", "No")
+			}
 			return nil
-		}
-
-		usage, err := c.DoJSON[struct {
-			InUse bool `json:"inUse"`
-		}](cmd.Context(), http.MethodGet, types.BackupsS3DestinationInUse(resolved.ID), nil)
-		if err != nil {
-			return fmt.Errorf("failed to check S3 destination usage: %w", err)
-		}
-
-		if cmdutil.JSONOutputEnabled(cmd) {
-			return cmdutil.PrintJSON(map[string]any{"destination": dest, "inUse": usage.InUse})
-		}
-
-		printS3Destination(dest)
-		if usage.InUse {
-			output.KeyValue("In Use", "Yes (referenced by backups, policies, or settings)")
-		} else {
-			output.KeyValue("In Use", "No")
-		}
-		return nil
-	},
+		},
+	}
+	cmd.Flags().BoolVar(&opts.inUse, "in-use", false, "Also report whether the destination is still referenced")
+	return cmd
 }
 
 func printS3Destination(dest backup.S3Destination) {
@@ -136,217 +147,171 @@ func printS3Destination(dest backup.S3Destination) {
 	output.KeyValue("Created", dest.CreatedAt.Format("2006-01-02 15:04"))
 }
 
-func s3DestinationFromFlags() backup.CreateS3Destination {
-	return backup.CreateS3Destination{
-		Name:            s3Name,
-		Endpoint:        s3Endpoint,
-		Bucket:          s3Bucket,
-		Region:          s3Region,
-		AccessKeyID:     s3AccessKeyID,
-		SecretAccessKey: s3SecretAccessKey,
-		Prefix:          s3Prefix,
-		UseSSL:          s3UseSSL,
-		ForcePathStyle:  s3ForcePathStyle,
+func newS3CreateCmd() *cobra.Command {
+	var opts backup.CreateS3Destination
+	cmd := &cobra.Command{
+		Use:          "create",
+		Short:        "Create an S3 backup destination",
+		Args:         cobra.NoArgs,
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := cmdutil.ClientFromCommand(cmd)
+			if err != nil {
+				return err
+			}
+
+			dest, err := c.DoJSON[backup.S3Destination](cmd.Context(), http.MethodPost, types.BackupsS3(), opts)
+			if err != nil {
+				return fmt.Errorf("failed to create S3 destination: %w", err)
+			}
+
+			if cmdutil.JSONOutputEnabled(cmd) {
+				return cmdutil.PrintJSON(dest)
+			}
+
+			output.Success("S3 destination %s created successfully", dest.Name)
+			printS3Destination(dest)
+			return nil
+		},
 	}
+	addS3ConnectionFlags(cmd, &opts)
+	_ = cmd.MarkFlagRequired("name")
+	_ = cmd.MarkFlagRequired("bucket")
+	_ = cmd.MarkFlagRequired("region")
+	_ = cmd.MarkFlagRequired("access-key-id")
+	_ = cmd.MarkFlagRequired("secret-access-key")
+	return cmd
 }
 
-var s3CreateCmd = &cobra.Command{
-	Use:          "create",
-	Short:        "Create an S3 backup destination",
-	Args:         cobra.NoArgs,
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := cmdutil.ClientFromCommand(cmd)
-		if err != nil {
-			return err
-		}
-
-		dest, err := c.DoJSON[backup.S3Destination](cmd.Context(), http.MethodPost, types.BackupsS3(), s3DestinationFromFlags())
-		if err != nil {
-			return fmt.Errorf("failed to create S3 destination: %w", err)
-		}
-
-		if cmdutil.JSONOutputEnabled(cmd) {
-			return cmdutil.PrintJSON(dest)
-		}
-
-		output.Success("S3 destination %s created successfully", dest.Name)
-		printS3Destination(dest)
-		return nil
-	},
-}
-
-var s3UpdateCmd = &cobra.Command{
-	Use:          "update <destination>",
-	Short:        "Update an S3 backup destination by name or ID",
-	Args:         cobra.ExactArgs(1),
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := cmdutil.ClientFromCommand(cmd)
-		if err != nil {
-			return err
-		}
-
-		resolved, _, err := s3DestinationRef.Resolve(cmd.Context(), c, args[0], !cmdutil.JSONOutputEnabled(cmd) && prompt.IsInteractive())
-		if err != nil {
-			return err
-		}
-
-		dest, err := c.DoJSON[backup.S3Destination](cmd.Context(), http.MethodPut, types.BackupsS3Destination(resolved.ID), s3DestinationFromFlags())
-		if err != nil {
-			return fmt.Errorf("failed to update S3 destination: %w", err)
-		}
-
-		if cmdutil.JSONOutputEnabled(cmd) {
-			return cmdutil.PrintJSON(dest)
-		}
-
-		output.Success("S3 destination %s updated successfully", dest.Name)
-		printS3Destination(dest)
-		return nil
-	},
-}
-
-var s3DeleteCmd = &cobra.Command{
-	Use:          "delete <destination>",
-	Aliases:      []string{"rm", "remove"},
-	Short:        "Delete an S3 backup destination by name or ID",
-	Args:         cobra.ExactArgs(1),
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := cmdutil.ClientFromCommand(cmd)
-		if err != nil {
-			return err
-		}
-
-		resolved, _, err := s3DestinationRef.Resolve(cmd.Context(), c, args[0], !forceFlag && !cmdutil.JSONOutputEnabled(cmd) && prompt.IsInteractive())
-		if err != nil {
-			return err
-		}
-
-		if !forceFlag {
-			confirmed, confirmErr := cmdutil.Confirm(cmd, fmt.Sprintf("Are you sure you want to delete S3 destination %s?", resolved.Name))
-			if confirmErr != nil {
-				return confirmErr
+func newS3UpdateCmd() *cobra.Command {
+	var opts backup.CreateS3Destination
+	cmd := &cobra.Command{
+		Use:          "update <destination>",
+		Short:        "Update an S3 backup destination by name or ID",
+		Args:         cobra.ExactArgs(1),
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := cmdutil.ClientFromCommand(cmd)
+			if err != nil {
+				return err
 			}
-			if !confirmed {
-				_, _ = fmt.Fprintln(output.Stdout(), "Cancelled")
-				return nil
+
+			resolved, _, err := s3DestinationRef.Resolve(cmd.Context(), c, args[0], cmdutil.AllowPrompt(cmd))
+			if err != nil {
+				return err
 			}
-		}
 
-		result, err := c.DeleteJSON[base.MessageResponse](cmd.Context(), types.BackupsS3Destination(resolved.ID))
-		if err != nil {
-			return fmt.Errorf("failed to delete S3 destination: %w", err)
-		}
+			dest, err := c.DoJSON[backup.S3Destination](cmd.Context(), http.MethodPut, types.BackupsS3Destination(resolved.ID), opts)
+			if err != nil {
+				return fmt.Errorf("failed to update S3 destination: %w", err)
+			}
 
-		if cmdutil.JSONOutputEnabled(cmd) {
-			return cmdutil.PrintJSON(result.Data)
-		}
+			if cmdutil.JSONOutputEnabled(cmd) {
+				return cmdutil.PrintJSON(dest)
+			}
 
-		output.Success("S3 destination %s deleted successfully", resolved.Name)
-		return nil
-	},
+			output.Success("S3 destination %s updated successfully", dest.Name)
+			printS3Destination(dest)
+			return nil
+		},
+	}
+	addS3ConnectionFlags(cmd, &opts)
+	_ = cmd.MarkFlagRequired("name")
+	_ = cmd.MarkFlagRequired("bucket")
+	_ = cmd.MarkFlagRequired("region")
+	_ = cmd.MarkFlagRequired("access-key-id")
+	return cmd
 }
 
-var s3TestCmd = &cobra.Command{
-	Use:   "test [destination]",
-	Short: "Test an S3 destination connection",
-	Long: `Test a saved S3 destination by name or ID, or an unsaved configuration by
+func newS3DeleteCmd() *cobra.Command {
+	var opts struct {
+		force bool
+	}
+	cmd := &cobra.Command{
+		Use:          "delete <destination>",
+		Aliases:      []string{"rm", "remove"},
+		Short:        "Delete an S3 backup destination by name or ID",
+		Args:         cobra.ExactArgs(1),
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := cmdutil.ClientFromCommand(cmd)
+			if err != nil {
+				return err
+			}
+
+			resolved, _, err := s3DestinationRef.Resolve(cmd.Context(), c, args[0], !opts.force && cmdutil.AllowPrompt(cmd))
+			if err != nil {
+				return err
+			}
+
+			return cmdutil.RunDelete(cmd, c, cmdutil.DeleteSpec{
+				Force:          opts.force,
+				Prompt:         fmt.Sprintf("Are you sure you want to delete S3 destination %s?", resolved.Name),
+				Path:           types.BackupsS3Destination(resolved.ID),
+				Body:           nil,
+				FailureMessage: "failed to delete S3 destination",
+				SuccessMessage: fmt.Sprintf("S3 destination %s deleted successfully", resolved.Name),
+			})
+		},
+	}
+	cmd.Flags().BoolVarP(&opts.force, "force", "f", false, "Delete without confirmation")
+	return cmd
+}
+
+func newS3TestCmd() *cobra.Command {
+	var opts backup.CreateS3Destination
+	cmd := &cobra.Command{
+		Use:   "test [destination]",
+		Short: "Test an S3 destination connection",
+		Long: `Test a saved S3 destination by name or ID, or an unsaved configuration by
 passing the connection flags (--name, --bucket, --region, ...) with no argument.`,
-	Args:         cobra.MaximumNArgs(1),
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		connectionFlagsSet := false
-		for _, name := range []string{"name", "endpoint", "bucket", "region", "access-key-id", "secret-access-key", "prefix", "use-ssl", "force-path-style"} {
-			if cmd.Flags().Changed(name) {
-				connectionFlagsSet = true
-				break
+		Args:         cobra.MaximumNArgs(1),
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			flagNames := []string{"name", "endpoint", "bucket", "region", "access-key-id", "secret-access-key", "prefix", "use-ssl", "force-path-style"}
+			connectionFlagsSet := slices.ContainsFunc(flagNames, cmd.Flags().Changed)
+
+			c, err := cmdutil.ClientFromCommand(cmd)
+			if err != nil {
+				return err
 			}
-		}
 
-		c, err := cmdutil.ClientFromCommand(cmd)
-		if err != nil {
-			return err
-		}
-
-		testPath := types.BackupsS3Test()
-		var testBody any = s3DestinationFromFlags()
-		if len(args) == 1 {
-			if connectionFlagsSet {
-				return errors.New("pass either a saved destination name or ID, or the connection flags, not both")
+			testPath := types.BackupsS3Test()
+			var testBody any = opts
+			if len(args) == 1 {
+				if connectionFlagsSet {
+					return errors.New("pass either a saved destination name or ID, or the connection flags, not both")
+				}
+				resolved, _, resolveErr := s3DestinationRef.Resolve(cmd.Context(), c, args[0], cmdutil.AllowPrompt(cmd))
+				if resolveErr != nil {
+					return resolveErr
+				}
+				testPath, testBody = types.BackupsS3DestinationTest(resolved.ID), nil
+			} else if opts.Bucket == "" {
+				return errors.New("either a destination name or ID, or connection flags (--name, --bucket, --region, ...) are required")
 			}
-			resolved, _, resolveErr := s3DestinationRef.Resolve(cmd.Context(), c, args[0], !cmdutil.JSONOutputEnabled(cmd) && prompt.IsInteractive())
-			if resolveErr != nil {
-				return resolveErr
-			}
-			testPath, testBody = types.BackupsS3DestinationTest(resolved.ID), nil
-		} else if s3Bucket == "" {
-			return errors.New("either a destination name or ID, or connection flags (--name, --bucket, --region, ...) are required")
-		}
 
-		result, err := c.PostJSON[base.MessageResponse](cmd.Context(), testPath, testBody)
-		if err != nil {
-			return fmt.Errorf("failed to test S3 destination: %w", err)
-		}
-
-		if cmdutil.JSONOutputEnabled(cmd) {
-			return cmdutil.PrintJSON(result.Data)
-		}
-
-		output.Success("S3 connection test succeeded")
-		return nil
-	},
+			return cmdutil.Run(cmd, c, cmdutil.Spec[base.MessageResponse]{
+				Method:         http.MethodPost,
+				Path:           testPath,
+				Body:           testBody,
+				FailureMessage: "failed to test S3 destination",
+				Render:         func(base.MessageResponse) error { output.Success("%s", "S3 connection test succeeded"); return nil },
+			})
+		},
+	}
+	addS3ConnectionFlags(cmd, &opts)
+	return cmd
 }
 
-func addS3ConnectionFlags(cmd *cobra.Command) {
-	cmd.Flags().StringVar(&s3Name, "name", "", "Destination name")
-	cmd.Flags().StringVar(&s3Endpoint, "endpoint", "", "S3 endpoint (empty for AWS S3)")
-	cmd.Flags().StringVar(&s3Bucket, "bucket", "", "Bucket name")
-	cmd.Flags().StringVar(&s3Region, "region", "", "Region")
-	cmd.Flags().StringVar(&s3AccessKeyID, "access-key-id", "", "Access key ID")
-	cmd.Flags().StringVar(&s3SecretAccessKey, "secret-access-key", "", "Secret access key")
-	cmd.Flags().StringVar(&s3Prefix, "prefix", "", "Object key prefix")
-	cmd.Flags().BoolVar(&s3UseSSL, "use-ssl", true, "Use SSL for the connection")
-	cmd.Flags().BoolVar(&s3ForcePathStyle, "force-path-style", false, "Use path-style bucket addressing")
-}
-
-func init() {
-	BackupsCmd.AddCommand(s3Cmd)
-
-	s3Cmd.AddCommand(s3ListCmd)
-	s3Cmd.AddCommand(s3GetCmd)
-	s3Cmd.AddCommand(s3CreateCmd)
-	s3Cmd.AddCommand(s3UpdateCmd)
-	s3Cmd.AddCommand(s3DeleteCmd)
-	s3Cmd.AddCommand(s3TestCmd)
-
-	s3ListCmd.Flags().IntVarP(&limitFlag, "limit", "n", 20, "Number of destinations to show")
-	s3ListCmd.Flags().IntVar(&startFlag, "start", 0, cmdutil.StartFlagUsage)
-	s3ListCmd.Flags().BoolVarP(&allFlag, "all", "a", false, cmdutil.AllFlagUsage)
-	s3ListCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
-
-	s3GetCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
-	s3GetCmd.Flags().BoolVar(&s3GetInUse, "in-use", false, "Also report whether the destination is still referenced")
-
-	addS3ConnectionFlags(s3CreateCmd)
-	s3CreateCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
-	_ = s3CreateCmd.MarkFlagRequired("name")
-	_ = s3CreateCmd.MarkFlagRequired("bucket")
-	_ = s3CreateCmd.MarkFlagRequired("region")
-	_ = s3CreateCmd.MarkFlagRequired("access-key-id")
-	_ = s3CreateCmd.MarkFlagRequired("secret-access-key")
-
-	addS3ConnectionFlags(s3UpdateCmd)
-	s3UpdateCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
-	_ = s3UpdateCmd.MarkFlagRequired("name")
-	_ = s3UpdateCmd.MarkFlagRequired("bucket")
-	_ = s3UpdateCmd.MarkFlagRequired("region")
-	_ = s3UpdateCmd.MarkFlagRequired("access-key-id")
-
-	addS3ConnectionFlags(s3TestCmd)
-	s3TestCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
-
-	s3DeleteCmd.Flags().BoolVarP(&forceFlag, "force", "f", false, "Delete without confirmation")
-	s3DeleteCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
+func addS3ConnectionFlags(cmd *cobra.Command, opts *backup.CreateS3Destination) {
+	cmd.Flags().StringVar(&opts.Name, "name", "", "Destination name")
+	cmd.Flags().StringVar(&opts.Endpoint, "endpoint", "", "S3 endpoint (empty for AWS S3)")
+	cmd.Flags().StringVar(&opts.Bucket, "bucket", "", "Bucket name")
+	cmd.Flags().StringVar(&opts.Region, "region", "", "Region")
+	cmd.Flags().StringVar(&opts.AccessKeyID, "access-key-id", "", "Access key ID")
+	cmd.Flags().StringVar(&opts.SecretAccessKey, "secret-access-key", "", "Secret access key")
+	cmd.Flags().StringVar(&opts.Prefix, "prefix", "", "Object key prefix")
+	cmd.Flags().BoolVar(&opts.UseSSL, "use-ssl", true, "Use SSL for the connection")
+	cmd.Flags().BoolVar(&opts.ForcePathStyle, "force-path-style", false, "Use path-style bucket addressing")
 }

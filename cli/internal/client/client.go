@@ -68,29 +68,14 @@ func New(cfg *types.Config) (*Client, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
-	parsedURL, err := url.Parse(cfg.ServerURL)
+	c, err := NewUnauthenticated(cfg)
 	if err != nil {
-		return nil, fmt.Errorf("invalid server_url: %w", err)
+		return nil, err
 	}
-
-	envID := cmp.Or(cfg.DefaultEnvironment, defaultEnvID)
-	httpClient := &http.Client{Timeout: defaultTimeout}
-	if transport, ok := http.DefaultTransport.(*http.Transport); ok {
-		httpClient.Transport = transport.Clone()
-	}
-
-	return &Client{
-		baseURL:       cfg.ServerURL,
-		baseURLParsed: parsedURL,
-		apiKey:        cfg.APIKey,
-		jwtToken:      cfg.JWTToken,
-		refreshToken:  cfg.RefreshToken,
-		envID:         envID,
-		httpClient:    httpClient,
-		maxAttempts:   3,
-		baseBackoff:   150 * time.Millisecond,
-		maxBackoff:    2 * time.Second,
-	}, nil
+	c.apiKey = cfg.APIKey
+	c.jwtToken = cfg.JWTToken
+	c.refreshToken = cfg.RefreshToken
+	return c, nil
 }
 
 // NewUnauthenticated creates a client that can call unauthenticated endpoints
@@ -108,7 +93,6 @@ func NewUnauthenticated(cfg *types.Config) (*Client, error) {
 		return nil, fmt.Errorf("invalid server_url: %w", err)
 	}
 
-	envID := cmp.Or(cfg.DefaultEnvironment, defaultEnvID)
 	httpClient := &http.Client{Timeout: defaultTimeout}
 	if transport, ok := http.DefaultTransport.(*http.Transport); ok {
 		httpClient.Transport = transport.Clone()
@@ -117,7 +101,7 @@ func NewUnauthenticated(cfg *types.Config) (*Client, error) {
 	return &Client{
 		baseURL:       cfg.ServerURL,
 		baseURLParsed: parsedURL,
-		envID:         envID,
+		envID:         cmp.Or(cfg.DefaultEnvironment, defaultEnvID),
 		refreshToken:  cfg.RefreshToken,
 		httpClient:    httpClient,
 		maxAttempts:   3,
@@ -178,10 +162,7 @@ func (c *Client) SetTimeout(timeout time.Duration) {
 
 // SetRetryPolicy configures retry behavior for idempotent requests.
 func (c *Client) SetRetryPolicy(maxAttempts int, baseBackoff, maxBackoff time.Duration) {
-	if maxAttempts < 1 {
-		maxAttempts = 1
-	}
-	c.maxAttempts = maxAttempts
+	c.maxAttempts = max(maxAttempts, 1)
 	c.baseBackoff = baseBackoff
 	c.maxBackoff = maxBackoff
 }
@@ -190,13 +171,6 @@ func (c *Client) SetRetryPolicy(maxAttempts int, baseBackoff, maxBackoff time.Du
 // The environment ID is used to scope API requests to a specific environment.
 func (c *Client) EnvID() string {
 	return c.envID
-}
-
-// APIResponse wraps the Arcane success, data, and error response fields.
-type APIResponse[T any] struct {
-	Success bool   `json:"success"`
-	Data    T      `json:"data"`
-	Error   string `json:"error,omitempty"`
 }
 
 // Request sends JSON or raw reader bodies with authentication; streaming bodies skip retries and token refresh.
@@ -350,7 +324,8 @@ func (c *Client) doRequest(ctx context.Context, method, fullURL string, bodyByte
 		}
 
 		if attempt < attempts && c.shouldRetry(method, resp.StatusCode, nil) {
-			logger.GetLogger().Debug("Retrying request after retryable status", "method", method, "url", fullURL, "env_id", c.envID, "attempt", attempt, "max_attempts", attempts, "status", resp.Status)
+			logger.GetLogger().Debug("Retrying request after retryable status",
+				"method", method, "url", fullURL, "env_id", c.envID, "attempt", attempt, "max_attempts", attempts, "status", resp.Status)
 			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxErrorBody))
 			_ = resp.Body.Close()
 			if backoffErr := c.waitRetry(ctx, attempt); backoffErr != nil {
@@ -395,8 +370,8 @@ func (c *Client) waitRetry(ctx context.Context, attempt int) error {
 	for i := 1; i < attempt; i++ {
 		delay *= 2
 	}
-	if c.maxBackoff > 0 && delay > c.maxBackoff {
-		delay = c.maxBackoff
+	if c.maxBackoff > 0 {
+		delay = min(delay, c.maxBackoff)
 	}
 	timer := time.NewTimer(delay)
 	defer timer.Stop()
@@ -468,10 +443,7 @@ func (c *Client) refreshAccessToken(ctx context.Context) error {
 		return errors.New("token refresh failed: unexpected response from server")
 	}
 
-	newRefresh := result.Data.RefreshToken
-	if newRefresh == "" {
-		newRefresh = c.refreshToken
-	}
+	newRefresh := cmp.Or(result.Data.RefreshToken, c.refreshToken)
 
 	c.jwtToken = result.Data.Token
 	c.refreshToken = newRefresh
@@ -542,12 +514,11 @@ func (c *Client) DoJSON[T any](ctx context.Context, method, path string, body an
 	return out, nil
 }
 
-// GetJSON performs a GET and decodes the standard API envelope, enforcing
-// HTTP and API success.
-func (c *Client) GetJSON[T any](ctx context.Context, path string) (*APIResponse[T], error) {
+// DoEnvelope sends a request and decodes the shared envelope, enforcing HTTP and API success.
+func (c *Client) DoEnvelope[T any](ctx context.Context, method, path string, body any) (*base.ApiResponse[T], error) {
 	loading := output.StartLoading(ctx)
 	defer loading.Stop()
-	resp, err := c.Get(ctx, path)
+	resp, err := c.Request(ctx, method, path, body)
 	if err != nil {
 		return nil, err
 	}
@@ -555,17 +526,16 @@ func (c *Client) GetJSON[T any](ctx context.Context, path string) (*APIResponse[
 	return decodeResponseStrict[T](resp)
 }
 
+// GetJSON performs a GET and decodes the standard API envelope, enforcing
+// HTTP and API success.
+func (c *Client) GetJSON[T any](ctx context.Context, path string) (*base.ApiResponse[T], error) {
+	return c.DoEnvelope[T](ctx, http.MethodGet, path, nil)
+}
+
 // PostJSON performs a POST with a JSON body and decodes the standard API
 // envelope, enforcing HTTP and API success.
-func (c *Client) PostJSON[T any](ctx context.Context, path string, body any) (*APIResponse[T], error) {
-	loading := output.StartLoading(ctx)
-	defer loading.Stop()
-	resp, err := c.Post(ctx, path, body)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-	return decodeResponseStrict[T](resp)
+func (c *Client) PostJSON[T any](ctx context.Context, path string, body any) (*base.ApiResponse[T], error) {
+	return c.DoEnvelope[T](ctx, http.MethodPost, path, body)
 }
 
 // DoRaw performs a request and returns the response payload when status is 2xx.
@@ -592,32 +562,18 @@ func (c *Client) DoRaw(ctx context.Context, method, path string, body any) ([]by
 
 // PutJSON performs a PUT with a JSON body and decodes the standard API
 // envelope, enforcing HTTP and API success.
-func (c *Client) PutJSON[T any](ctx context.Context, path string, body any) (*APIResponse[T], error) {
-	loading := output.StartLoading(ctx)
-	defer loading.Stop()
-	resp, err := c.Put(ctx, path, body)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-	return decodeResponseStrict[T](resp)
+func (c *Client) PutJSON[T any](ctx context.Context, path string, body any) (*base.ApiResponse[T], error) {
+	return c.DoEnvelope[T](ctx, http.MethodPut, path, body)
 }
 
 // DeleteJSON performs a DELETE and decodes the standard API envelope,
 // enforcing HTTP and API success.
-func (c *Client) DeleteJSON[T any](ctx context.Context, path string) (*APIResponse[T], error) {
-	loading := output.StartLoading(ctx)
-	defer loading.Stop()
-	resp, err := c.Delete(ctx, path)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-	return decodeResponseStrict[T](resp)
+func (c *Client) DeleteJSON[T any](ctx context.Context, path string) (*base.ApiResponse[T], error) {
+	return c.DoEnvelope[T](ctx, http.MethodDelete, path, nil)
 }
 
 // decodeResponseStrict enforces HTTP and API success while decoding the response. The caller owns the response body.
-func decodeResponseStrict[T any](resp *http.Response) (*APIResponse[T], error) {
+func decodeResponseStrict[T any](resp *http.Response) (*base.ApiResponse[T], error) {
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBody))
 		return nil, fmt.Errorf("request failed with status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
@@ -628,19 +584,22 @@ func decodeResponseStrict[T any](resp *http.Response) (*APIResponse[T], error) {
 		return nil, fmt.Errorf("failed to read response body: %w", err)
 	}
 
-	var result APIResponse[T]
+	var result struct {
+		base.ApiResponse[T]
+		base.ErrorResponse
+	}
 	if unmarshalErr := json.Unmarshal(body, &result); unmarshalErr != nil {
 		return nil, fmt.Errorf("failed to decode response (body: %s): %w", string(body), unmarshalErr)
 	}
 
 	if !result.Success {
 		if strings.TrimSpace(result.Error) != "" {
-			return &result, fmt.Errorf("API error: %s", result.Error)
+			return &result.ApiResponse, fmt.Errorf("API error: %s", result.Error)
 		}
-		return &result, errors.New("API error: request was not successful")
+		return &result.ApiResponse, errors.New("API error: request was not successful")
 	}
 
-	return &result, nil
+	return &result.ApiResponse, nil
 }
 
 // TestConnection checks the API version endpoint and returns transport or status failures.

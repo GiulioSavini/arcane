@@ -7,6 +7,7 @@ import (
 	"encoding/json/jsontext"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -31,25 +32,34 @@ type environmentResult struct {
 	Error           string         `json:"error,omitempty"`
 }
 
-var resourceResolvers = make(map[*cobra.Command]func(*cobra.Command, []string) error)
-
-// SetResource binds commands using raw identifiers to the shared resource resolver.
+// SetResource binds raw identifiers through a command-owned closure; call after assigning RunE.
 func SetResource[D, S any](ref ResourceRef[D, S], commands ...*cobra.Command) {
 	SetScope(ScopeResource, commands...)
 	for _, cmd := range commands {
-		resourceResolvers[cmd] = func(command *cobra.Command, args []string) error {
+		if cmd.Annotations["arcane:resource-wrapped"] == "true" {
+			continue
+		}
+		cmd.Annotations["arcane:resource-wrapped"] = "true"
+		run := cmd.RunE
+		cmd.RunE = func(command *cobra.Command, args []string) error {
+			app, _ := runtime.From(command.Context())
+			if !app.PreviewEnabled() {
+				return run(command, args)
+			}
+			defer app.SelectEnvironment("")
 			c, err := ClientFromCommand(command)
 			if err != nil {
 				return err
 			}
-			resolved, _, err := ref.Resolve(command.Context(), c, args[0], false)
-			if err != nil {
-				return err
+			resolved, _, resolveErr := ref.Resolve(command.Context(), c, args[0], false)
+			if resolveErr != nil {
+				return resolveErr
 			}
+			resolvedArgs := slices.Clone(args)
 			if ref.IdentifierOf != nil {
-				args[0] = ref.IdentifierOf(*resolved)
+				resolvedArgs[0] = ref.IdentifierOf(*resolved)
 			}
-			return nil
+			return run(command, resolvedArgs)
 		}
 	}
 }
@@ -86,12 +96,6 @@ func RunScoped(cmd *cobra.Command, args []string, run func(*cobra.Command, []str
 		return run(cmd, args)
 	}
 	if scope == ScopeResource {
-		defer app.SelectEnvironment("")
-		if resolve := resourceResolvers[cmd]; resolve != nil {
-			if resolveErr := resolve(cmd, args); resolveErr != nil {
-				return resolveErr
-			}
-		}
 		return run(cmd, args)
 	}
 	if scope != ScopeDestination {
@@ -137,7 +141,7 @@ func RunEnvironments(cmd *cobra.Command, args []string, run func(*cobra.Command,
 	if mutation && !skip {
 		labels := make([]string, len(environments))
 		for i, env := range environments {
-			labels[i] = fmt.Sprintf("%s (%s)", cmp.Or(env.Name, env.ID), env.ID)
+			labels[i] = cmp.Or(env.Name, env.ID)
 		}
 		confirmed, confirmErr := Confirm(cmd, fmt.Sprintf("%s across %d environments: %s?", cmd.Short, len(labels), strings.Join(labels, ", ")))
 		if confirmErr != nil {

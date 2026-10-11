@@ -6,11 +6,11 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	gen "github.com/getarcaneapp/arcane/cli/v2/pkg/generate"
+	"github.com/getarcaneapp/arcane/cli/v2/pkg/generate"
 )
 
 func TestAPIKeyDefaultOutput(t *testing.T) {
-	cmd := gen.GenerateCmd
+	cmd := generate.Command()
 	cmd.SetArgs([]string{"api-key"})
 
 	out, err := captureOutput(func() error {
@@ -32,7 +32,7 @@ func TestAPIKeyDefaultOutput(t *testing.T) {
 }
 
 func TestGenerateAPIKeyProducesArcanePrefix(t *testing.T) {
-	apiKey, err := gen.GenerateAPIKey()
+	apiKey, err := generate.GenerateAPIKey()
 
 	require.NoError(t, err,
 		"GenerateAPIKey failed: %v", err)

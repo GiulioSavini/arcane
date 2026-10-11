@@ -410,16 +410,7 @@ func applyEventTypeFilter(q *gorm.DB, value string) *gorm.DB {
 	return q.Where(strings.Join(conds, " OR "), args...)
 }
 
-// EventSeverityCounts holds global event counts per severity.
-type EventSeverityCounts struct {
-	Total   int64 `json:"total"`
-	Info    int64 `json:"info"`
-	Success int64 `json:"success"`
-	Warning int64 `json:"warning"`
-	Error   int64 `json:"error"`
-}
-
-func (s *EventService) GetEventSeverityCounts(ctx context.Context) (EventSeverityCounts, error) {
+func (s *EventService) GetEventSeverityCounts(ctx context.Context) (event.SeverityCounts, error) {
 	var rows []struct {
 		Severity string
 		Count    int64
@@ -428,10 +419,10 @@ func (s *EventService) GetEventSeverityCounts(ctx context.Context) (EventSeverit
 		Select("severity, COUNT(*) AS count").
 		Group("severity").
 		Scan(&rows).Error; err != nil {
-		return EventSeverityCounts{}, fmt.Errorf("failed to count events by severity: %w", err)
+		return event.SeverityCounts{}, fmt.Errorf("failed to count events by severity: %w", err)
 	}
 
-	var counts EventSeverityCounts
+	var counts event.SeverityCounts
 	for _, r := range rows {
 		switch EventSeverity(r.Severity) {
 		case EventSeveritySuccess:

@@ -2,6 +2,15 @@ package event
 
 import "time"
 
+// SeverityCounts holds global event counts per severity.
+type SeverityCounts struct {
+	Total   int64 `json:"total"`
+	Info    int64 `json:"info"`
+	Success int64 `json:"success"`
+	Warning int64 `json:"warning"`
+	Error   int64 `json:"error"`
+}
+
 // Event represents an event in API responses.
 type Event struct {
 	// ID of the event.

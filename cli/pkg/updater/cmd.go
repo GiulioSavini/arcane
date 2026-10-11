@@ -1,7 +1,9 @@
 package updater
 
 import (
+	"cmp"
 	"fmt"
+	"net/http"
 	"net/url"
 	"strconv"
 	"time"
@@ -15,153 +17,128 @@ import (
 	"github.com/getarcaneapp/arcane/cli/v2/internal/types"
 )
 
-var (
-	jsonOutput   bool
-	historyLimit int
-)
-
-// UpdaterCmd is the parent command for updater operations
-var UpdaterCmd = &cobra.Command{
-	Use:     "updater",
-	Aliases: []string{"upd"},
-	Short:   "Auto-updater operations",
+// Command is the parent command for updater operations
+func Command() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:     "updater",
+		Aliases: []string{"upd"},
+		Short:   "Auto-updater operations",
+	}
+	cmdutil.SetScope(cmdutil.ScopeRead, cmd)
+	cmd.AddCommand(newStatusCmd(), newRunCmd(), newHistoryCmd())
+	return cmd
 }
 
-var statusCmd = &cobra.Command{
-	Use:          "status",
-	Short:        "Get updater status",
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := cmdutil.ClientFromCommand(cmd)
-		if err != nil {
-			return err
-		}
-
-		result, err := c.GetJSON[updater.Status](cmd.Context(), types.UpdaterStatus(c.EnvID()))
-		if err != nil {
-			return fmt.Errorf("failed to get updater status: %w", err)
-		}
-
-		if jsonOutput {
-			return cmdutil.PrintJSON(result.Data)
-		}
-
-		output.Header("Updater Status")
-		output.KeyValue("Updating Containers", strconv.Itoa(result.Data.UpdatingContainers))
-		output.KeyValue("Updating Projects", strconv.Itoa(result.Data.UpdatingProjects))
-		return nil
-	},
-}
-
-var runCmd = &cobra.Command{
-	Use:          "run",
-	Short:        "Run updater",
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := cmdutil.ClientFromCommand(cmd)
-		if err != nil {
-			return err
-		}
-
-		// Updater run can take a long time as it pulls images and restarts containers
-		c.SetTimeout(30 * time.Minute)
-
-		result, err := c.PostJSON[updater.Result](cmd.Context(), types.UpdaterRun(c.EnvID()), nil)
-		if err != nil {
-			return fmt.Errorf("failed to run updater: %w", err)
-		}
-
-		if app, ok := runtime.From(cmd.Context()); ok && app != nil && app.FleetConfirmed && result.Data.Failed > 0 {
-			return fmt.Errorf("updater failed for %d resources", result.Data.Failed)
-		}
-
-		if jsonOutput {
-			return cmdutil.PrintJSON(result.Data)
-		}
-
-		output.Header("Updater Results")
-		output.KeyValue("Checked", strconv.Itoa(result.Data.Checked))
-		output.KeyValue("Updated", strconv.Itoa(result.Data.Updated))
-		output.KeyValue("Skipped", strconv.Itoa(result.Data.Skipped))
-		output.KeyValue("Failed", strconv.Itoa(result.Data.Failed))
-		output.KeyValue("Duration", result.Data.Duration)
-		return nil
-	},
-}
-
-// autoUpdateRecord mirrors the backend's models.AutoUpdateRecord, which is not
-// exported through the shared types module.
-type autoUpdateRecord struct {
-	ID              string            `json:"id"`
-	ResourceID      string            `json:"resourceId"`
-	ResourceType    string            `json:"resourceType"`
-	ResourceName    string            `json:"resourceName"`
-	Status          string            `json:"status"`
-	StartTime       time.Time         `json:"startTime"`
-	EndTime         *time.Time        `json:"endTime,omitempty"`
-	UpdateAvailable bool              `json:"updateAvailable"`
-	UpdateApplied   bool              `json:"updateApplied"`
-	Error           *string           `json:"error,omitempty"`
-	OldImages       map[string]string `json:"oldImageVersions,omitempty"`
-	NewImages       map[string]string `json:"newImageVersions,omitempty"`
-}
-
-var historyCmd = &cobra.Command{
-	Use:          "history",
-	Short:        "Get updater history",
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := cmdutil.ClientFromCommand(cmd)
-		if err != nil {
-			return err
-		}
-
-		path := types.UpdaterHistory(c.EnvID())
-		if cmd.Flags().Changed("limit") {
-			path = cmdutil.AppendQuery(path, url.Values{"limit": []string{strconv.Itoa(historyLimit)}})
-		}
-
-		result, err := c.GetJSON[[]autoUpdateRecord](cmd.Context(), path)
-		if err != nil {
-			return fmt.Errorf("failed to get updater history: %w", err)
-		}
-
-		if jsonOutput {
-			return cmdutil.PrintJSON(result.Data)
-		}
-
-		headers := []string{"RESOURCE", "TYPE", "STATUS", "APPLIED", "STARTED"}
-		rows := make([][]string, len(result.Data))
-		for i, h := range result.Data {
-			name := h.ResourceName
-			if name == "" {
-				name = h.ResourceID
+func newStatusCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:          "status",
+		Short:        "Get updater status",
+		SilenceUsage: true,
+		Args:         cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := cmdutil.ClientFromCommand(cmd)
+			if err != nil {
+				return err
 			}
-			rows[i] = []string{
-				name,
-				h.ResourceType,
-				h.Status,
-				strconv.FormatBool(h.UpdateApplied),
-				h.StartTime.Format("2006-01-02 15:04"),
-			}
-		}
 
-		if tableErr := cmdutil.PrintTable(cmd, headers, rows, cmdutil.TableSummary{Resource: "history entries"}); tableErr != nil {
-			return tableErr
-		}
-		return nil
-	},
+			return cmdutil.Run(cmd, c, cmdutil.Spec[updater.Status]{
+				Method:         http.MethodGet,
+				Path:           types.UpdaterStatus(c.EnvID()),
+				FailureMessage: "failed to get updater status",
+				Render: func(data updater.Status) error {
+					output.Header("Updater Status")
+					output.KeyValue("Updating Containers", strconv.Itoa(data.UpdatingContainers))
+					output.KeyValue("Updating Projects", strconv.Itoa(data.UpdatingProjects))
+					return nil
+				},
+			})
+		},
+	}
 }
 
-func init() {
-	cmdutil.SetScope(cmdutil.ScopeRead, UpdaterCmd)
-	cmdutil.SetScope(cmdutil.ScopeFleet, runCmd)
-	UpdaterCmd.AddCommand(statusCmd)
-	UpdaterCmd.AddCommand(runCmd)
-	UpdaterCmd.AddCommand(historyCmd)
+func newRunCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:          "run",
+		Short:        "Run updater",
+		SilenceUsage: true,
+		Args:         cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := cmdutil.ClientFromCommand(cmd)
+			if err != nil {
+				return err
+			}
 
-	statusCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
-	runCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
-	historyCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
-	historyCmd.Flags().IntVarP(&historyLimit, "limit", "n", 50, "Number of history entries to show")
+			// Updater run can take a long time as it pulls images and restarts containers
+			c.SetTimeout(30 * time.Minute)
+
+			result, err := c.PostJSON[updater.Result](cmd.Context(), types.UpdaterRun(c.EnvID()), nil)
+			if err != nil {
+				return fmt.Errorf("failed to run updater: %w", err)
+			}
+
+			if app, ok := runtime.From(cmd.Context()); ok && app.FleetConfirmed && result.Data.Failed > 0 {
+				return fmt.Errorf("updater failed for %d resources", result.Data.Failed)
+			}
+
+			if cmdutil.JSONOutputEnabled(cmd) {
+				return cmdutil.PrintJSON(result.Data)
+			}
+
+			output.Header("Updater Results")
+			output.KeyValue("Checked", strconv.Itoa(result.Data.Checked))
+			output.KeyValue("Updated", strconv.Itoa(result.Data.Updated))
+			output.KeyValue("Skipped", strconv.Itoa(result.Data.Skipped))
+			output.KeyValue("Failed", strconv.Itoa(result.Data.Failed))
+			output.KeyValue("Duration", result.Data.Duration)
+			return nil
+		},
+	}
+	cmdutil.SetScope(cmdutil.ScopeFleet, cmd)
+	return cmd
+}
+
+func newHistoryCmd() *cobra.Command {
+	var opts struct {
+		limit int
+	}
+	cmd := &cobra.Command{
+		Use:          "history",
+		Short:        "Get updater history",
+		SilenceUsage: true,
+		Args:         cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := cmdutil.ClientFromCommand(cmd)
+			if err != nil {
+				return err
+			}
+
+			path := types.UpdaterHistory(c.EnvID())
+			if cmd.Flags().Changed("limit") {
+				path = cmdutil.AppendQuery(path, url.Values{"limit": []string{strconv.Itoa(opts.limit)}})
+			}
+
+			return cmdutil.Run(cmd, c, cmdutil.Spec[[]updater.AutoUpdateRecord]{
+				Method:         http.MethodGet,
+				Path:           path,
+				FailureMessage: "failed to get updater history",
+				Render: func(data []updater.AutoUpdateRecord) error {
+					headers := []string{"RESOURCE", "TYPE", "STATUS", "APPLIED", "STARTED"}
+					rows := make([][]string, len(data))
+					for i, h := range data {
+						rows[i] = []string{
+							cmp.Or(h.ResourceName, h.ResourceID),
+							h.ResourceType,
+							h.Status,
+							strconv.FormatBool(h.UpdateApplied),
+							h.StartTime.Format("2006-01-02 15:04"),
+						}
+					}
+
+					return cmdutil.PrintTable(cmd, headers, rows, cmdutil.TableSummary{Resource: "history entries"})
+				},
+			})
+		},
+	}
+	cmd.Flags().IntVarP(&opts.limit, "limit", "n", 50, "Number of history entries to show")
+	return cmd
 }

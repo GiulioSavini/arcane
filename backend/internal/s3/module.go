@@ -36,78 +36,78 @@ func (m *Module) RegisterRoutes(api huma.API) {
 }
 
 func RegisterS3Destinations(api huma.API, service *S3DestinationService, syncRemoteDestinations func(context.Context) error) {
-	handler := &s3DestinationHandlerInternal{service: service, syncRemoteDestinations: syncRemoteDestinations}
+	handler := &s3DestinationHandler{service: service, syncRemoteDestinations: syncRemoteDestinations}
 
 	handlerutil.RegisterSecured(api,
 		handlerutil.Operation(
 			"list-s3-destinations",
 			http.MethodGet,
-			s3DestinationPathInternal,
+			s3DestinationPath,
 			"List S3 destinations",
 			"List saved S3-compatible backup destinations with search, sorting, and pagination",
-			s3DestinationTagInternal,
+			s3DestinationTag,
 		),
-		authz.PermS3DestinationsList, handler.listInternal)
+		authz.PermS3DestinationsList, handler.list)
 	handlerutil.RegisterSecured(api,
 		handlerutil.Operation(
 			"list-all-s3-destinations",
 			http.MethodGet,
-			s3DestinationPathInternal+"/options",
+			s3DestinationPath+"/options",
 			"List all S3 destination options",
 			"List saved S3-compatible destinations for backup configuration selectors",
-			s3DestinationTagInternal,
+			s3DestinationTag,
 		),
-		authz.PermS3DestinationsList, handler.listAllInternal)
+		authz.PermS3DestinationsList, handler.listAll)
 	handlerutil.RegisterSecured(api,
 		handlerutil.Operation(
 			"sync-s3-destinations",
 			http.MethodPost,
-			s3DestinationPathInternal+"/sync",
+			s3DestinationPath+"/sync",
 			"Sync S3 destinations",
 			"Synchronize manager-owned S3 destinations to an agent",
-			s3DestinationTagInternal,
+			s3DestinationTag,
 		),
-		authz.PermS3DestinationsSync, handler.syncInternal)
+		authz.PermS3DestinationsSync, handler.sync)
 	handlerutil.RegisterSecured(api,
-		handlerutil.Operation("get-s3-destination", http.MethodGet, s3DestinationPathInternal+"/{id}", "Get S3 destination", "", s3DestinationTagInternal),
-		authz.PermS3DestinationsRead, handler.getInternal)
+		handlerutil.Operation("get-s3-destination", http.MethodGet, s3DestinationPath+"/{id}", "Get S3 destination", "", s3DestinationTag),
+		authz.PermS3DestinationsRead, handler.get)
 	handlerutil.RegisterSecured(api,
-		handlerutil.Operation("create-s3-destination", http.MethodPost, s3DestinationPathInternal, "Create S3 destination", "", s3DestinationTagInternal),
-		authz.PermS3DestinationsCreate, handler.createInternal)
+		handlerutil.Operation("create-s3-destination", http.MethodPost, s3DestinationPath, "Create S3 destination", "", s3DestinationTag),
+		authz.PermS3DestinationsCreate, handler.create)
 	handlerutil.RegisterSecured(api,
-		handlerutil.Operation("update-s3-destination", http.MethodPut, s3DestinationPathInternal+"/{id}", "Update S3 destination", "", s3DestinationTagInternal),
-		authz.PermS3DestinationsUpdate, handler.updateInternal)
+		handlerutil.Operation("update-s3-destination", http.MethodPut, s3DestinationPath+"/{id}", "Update S3 destination", "", s3DestinationTag),
+		authz.PermS3DestinationsUpdate, handler.update)
 	handlerutil.RegisterSecured(api,
 		handlerutil.Operation(
 			"test-s3-destination-configuration",
 			http.MethodPost,
-			s3DestinationPathInternal+"/test",
+			s3DestinationPath+"/test",
 			"Test unsaved S3 destination configuration",
 			"Verify upload, download, and delete access before saving an S3 destination",
-			s3DestinationTagInternal,
+			s3DestinationTag,
 		),
-		authz.PermS3DestinationsTest, handler.testConfigurationInternal)
+		authz.PermS3DestinationsTest, handler.testConfiguration)
 	handlerutil.RegisterSecured(api,
 		handlerutil.Operation(
 			"test-s3-destination",
 			http.MethodPost,
-			s3DestinationPathInternal+"/{id}/test",
+			s3DestinationPath+"/{id}/test",
 			"Test S3 destination",
 			"Verify upload, download, and delete access using the saved or supplied S3 destination configuration",
-			s3DestinationTagInternal,
+			s3DestinationTag,
 		),
-		authz.PermS3DestinationsTest, handler.testInternal)
+		authz.PermS3DestinationsTest, handler.test)
 	handlerutil.RegisterSecured(api,
 		handlerutil.Operation(
 			"get-s3-destination-usage",
 			http.MethodGet,
-			s3DestinationPathInternal+"/{id}/in-use",
+			s3DestinationPath+"/{id}/in-use",
 			"Check S3 destination references",
 			"Report whether backup records, policies, or settings on this environment still reference the destination",
-			s3DestinationTagInternal,
+			s3DestinationTag,
 		),
-		authz.PermS3DestinationsRead, handler.inUseInternal)
+		authz.PermS3DestinationsRead, handler.inUse)
 	handlerutil.RegisterSecured(api,
-		handlerutil.Operation("delete-s3-destination", http.MethodDelete, s3DestinationPathInternal+"/{id}", "Delete S3 destination", "", s3DestinationTagInternal),
-		authz.PermS3DestinationsDelete, handler.deleteInternal)
+		handlerutil.Operation("delete-s3-destination", http.MethodDelete, s3DestinationPath+"/{id}", "Delete S3 destination", "", s3DestinationTag),
+		authz.PermS3DestinationsDelete, handler.delete)
 }

@@ -37,8 +37,7 @@ func Select(label string, options []string) (int, error) {
 	model.list.SetShowStatusBar(false)
 	model.list.SetFilteringEnabled(true)
 	model.list.SetShowHelp(true)
-	program := tea.NewProgram(model)
-	finalModel, err := program.Run()
+	finalModel, err := tea.NewProgram(model).Run()
 	if err != nil {
 		return -1, err
 	}
@@ -88,12 +87,7 @@ func (m selectModel) Init() tea.Cmd {
 func (m selectModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
-		width := msg.Width
-		height := max(msg.Height-4, 6)
-		if width < 20 {
-			width = 20
-		}
-		m.list.SetSize(width, height)
+		m.list.SetSize(max(msg.Width, 20), max(msg.Height-4, 6))
 		return m, nil
 	case tea.KeyPressMsg:
 		switch msg.String() {

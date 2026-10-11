@@ -1,30 +1,28 @@
 package config
 
 import (
+	"io"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 
-	clitypes "github.com/getarcaneapp/arcane/cli/v2/internal/types"
+	"github.com/getarcaneapp/arcane/cli/v2/internal/types"
 )
 
 func TestApplyConfigSetArgs(t *testing.T) {
-	cfg := &clitypes.Config{}
+	cfg := &types.Config{}
 
-	changed, err := applyConfigSetArgs(cfg, []string{
+	err := applyConfigSetArgs(cfg, []string{
 		"server-url", "http://localhost:3552",
 		"api-key", "arc_test_12345678",
 		"previews.allEnvironments", "true",
 		"default-limit", "25",
 		"pagination.resources.images.limit", "100",
 		"resource-limit.volumes", "40",
-	})
+	}, io.Discard)
 
 	require.NoError(t, err,
 		"applyConfigSetArgs() error = %v", err)
-
-	require.True(t, changed,
-		"applyConfigSetArgs() changed = false, want true")
 
 	require.Equal(t, "http://localhost:3552", cfg.ServerURL,
 		"ServerURL = %q, want %q", cfg.ServerURL, "http://localhost:3552")
@@ -37,7 +35,7 @@ func TestApplyConfigSetArgs(t *testing.T) {
 
 	require.True(t, cfg.Previews.AllEnvironments)
 	for _, value := range []string{"false", "true", "invalid"} {
-		_, setErr := applyConfigSetArg(cfg, "previews.allEnvironments", value)
+		setErr := applyConfigSetArg(cfg, "previews.allEnvironments", value, io.Discard)
 		if value == "invalid" {
 			require.Error(t, setErr)
 			continue
@@ -62,39 +60,31 @@ func TestApplyConfigSetArgs(t *testing.T) {
 }
 
 func TestApplyConfigSetArgs_OddArgs(t *testing.T) {
-	cfg := &clitypes.Config{}
-	changed, err := applyConfigSetArgs(cfg, []string{"server-url", "http://localhost:3552", "api-key"})
+	cfg := &types.Config{}
+	err := applyConfigSetArgs(cfg, []string{"server-url", "http://localhost:3552", "api-key"}, io.Discard)
 
 	require.Error(t, err,
 		"expected error for odd key/value args, got nil")
-
-	require.False(t, changed,
-		"changed = true, want false")
 }
 
 func TestApplyConfigSetArg_UnknownKey(t *testing.T) {
-	cfg := &clitypes.Config{}
-	changed, err := applyConfigSetArg(cfg, "not-a-real-key", "value")
+	cfg := &types.Config{}
+	err := applyConfigSetArg(cfg, "not-a-real-key", "value", io.Discard)
 
 	require.Error(t, err,
 		"expected unknown key error, got nil")
-
-	require.False(t, changed,
-		"changed = true, want false")
 
 	require.Contains(t, err.Error(), "unknown config key",
 		"unexpected error: %v", err)
 }
 
 func TestApplyConfigSetArg_ResourceLimitPair(t *testing.T) {
-	cfg := &clitypes.Config{}
-	changed, err := applyConfigSetArg(cfg, "resource-limit", "containers=55")
+	cfg := &types.Config{}
+	err := applyConfigSetArg(cfg, "resource-limit", "containers=55", io.Discard)
 
 	require.NoError(t, err,
 		"applyConfigSetArg() error = %v", err)
 
-	require.True(t, changed,
-		"changed = false, want true")
 	{
 
 		got := cfg.LimitFor("containers")

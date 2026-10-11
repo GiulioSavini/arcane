@@ -2,11 +2,13 @@ package cmdutil
 
 import (
 	"errors"
+	"fmt"
 
 	"github.com/spf13/cobra"
 
 	"github.com/getarcaneapp/arcane/cli/v2/internal/client"
 	"github.com/getarcaneapp/arcane/cli/v2/internal/output"
+	"github.com/getarcaneapp/arcane/cli/v2/internal/prompt"
 	"github.com/getarcaneapp/arcane/cli/v2/internal/runtime"
 )
 
@@ -32,14 +34,15 @@ func UnauthClientFromCommand(cmd *cobra.Command) (*client.Client, error) {
 	return client.NewFromConfigUnauthenticated()
 }
 
-// JSONOutputEnabled returns true if JSON output is enabled for this command.
+// JSONOutputEnabled reads the parsed local or inherited --json flag, then runtime output mode.
+// Runtime JSON mode includes --output json, even when --json is explicitly false.
 func JSONOutputEnabled(cmd *cobra.Command) bool {
 	if cmd == nil {
 		return false
 	}
-	if flag := cmd.Flags().Lookup("json"); flag != nil && flag.Changed {
-		val, err := cmd.Flags().GetBool("json")
-		return err == nil && val
+	jsonMode, _ := cmd.Flags().GetBool("json")
+	if jsonMode {
+		return true
 	}
 	if app, ok := runtime.From(cmd.Context()); ok {
 		return app.IsJSON()
@@ -47,23 +50,39 @@ func JSONOutputEnabled(cmd *cobra.Command) bool {
 	return false
 }
 
-// AssumeYes returns true when prompts should be skipped.
+// AssumeYes reads the global --yes flag or invocation consent.
 func AssumeYes(cmd *cobra.Command) bool {
 	if cmd == nil {
 		return false
 	}
-	if app, ok := runtime.From(cmd.Context()); ok {
-		return app.AssumeYes
-	}
-	return false
+	yes, _ := cmd.Flags().GetBool("yes")
+	app, ok := runtime.From(cmd.Context())
+	return yes || ok && app.AssumeYes
 }
 
-// Confirm prompts the user unless --yes is enabled.
-func Confirm(cmd *cobra.Command, prompt string) (bool, error) {
+// AllowPrompt reports whether interactive prompts are allowed for this command.
+func AllowPrompt(cmd *cobra.Command) bool {
+	return !JSONOutputEnabled(cmd) && prompt.IsInteractive()
+}
+
+// ConfirmOrCancel accepts force, --yes, or fleet consent; otherwise it requires text mode and terminal input.
+// Declining prints Cancelled to stderr and returns false without an error.
+func ConfirmOrCancel(cmd *cobra.Command, force bool, label string) (bool, error) {
 	app, _ := runtime.From(cmd.Context())
-	if AssumeYes(cmd) || app != nil && app.FleetConfirmed {
+	if force || AssumeYes(cmd) || app != nil && app.FleetConfirmed {
 		return true, nil
 	}
+	if JSONOutputEnabled(cmd) {
+		return false, fmt.Errorf("confirmation required: re-run with --yes (%s)", label)
+	}
+	confirmed, err := output.Confirm(cmd.Context(), cmd.InOrStdin(), cmd.ErrOrStderr(), label)
+	if err == nil && !confirmed {
+		_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "Cancelled")
+	}
+	return confirmed, err
+}
 
-	return output.Confirm(cmd.Context(), cmd.InOrStdin(), cmd.ErrOrStderr(), prompt)
+// Confirm prompts through ConfirmOrCancel unless invocation consent is already present.
+func Confirm(cmd *cobra.Command, label string) (bool, error) {
+	return ConfirmOrCancel(cmd, false, label)
 }

@@ -1,5 +1,26 @@
 package updater
 
+import "time"
+
+// AutoUpdateRecord reports a persisted resource auto-update operation.
+type AutoUpdateRecord struct {
+	ID               string         `json:"id"`
+	CreatedAt        time.Time      `json:"createdAt" sortable:"true"`
+	UpdatedAt        *time.Time     `json:"updatedAt,omitempty"`
+	ResourceID       string         `json:"resourceId"`
+	ResourceType     string         `json:"resourceType"`
+	ResourceName     string         `json:"resourceName"`
+	Status           string         `json:"status"`
+	StartTime        time.Time      `json:"startTime"`
+	EndTime          *time.Time     `json:"endTime,omitempty"`
+	UpdateAvailable  bool           `json:"updateAvailable"`
+	UpdateApplied    bool           `json:"updateApplied"`
+	OldImageVersions map[string]any `json:"oldImageVersions,omitempty"`
+	NewImageVersions map[string]any `json:"newImageVersions,omitempty"`
+	Error            *string        `json:"error,omitempty"`
+	Details          map[string]any `json:"details,omitempty"`
+}
+
 const (
 	// StatusChecked indicates a resource was checked.
 	StatusChecked = "checked"

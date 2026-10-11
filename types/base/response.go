@@ -33,6 +33,14 @@ type Paginated[T any] struct {
 	Pagination PaginationResponse `json:"pagination" doc:"Pagination metadata"`
 }
 
+// PaginatedWithWarnings is a generic wrapper for paginated responses with warnings.
+type PaginatedWithWarnings[T any] struct {
+	Success    bool               `json:"success"`
+	Data       []T                `json:"data"`
+	Pagination PaginationResponse `json:"pagination"`
+	Warnings   []string           `json:"warnings,omitempty"`
+}
+
 // PaginatedWithCounts is a generic wrapper for paginated responses with aggregate counts.
 type PaginatedWithCounts[T, C any] struct {
 	Success    bool               `json:"success" doc:"Whether the request was successful"`

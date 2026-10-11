@@ -1,8 +1,10 @@
 package containers
 
 import (
+	"encoding/json/jsontext"
 	"encoding/json/v2"
 	"fmt"
+	"net/http"
 	"net/url"
 	"os"
 	"strings"
@@ -11,259 +13,258 @@ import (
 	"github.com/getarcaneapp/arcane/types/v2/base"
 	"github.com/getarcaneapp/arcane/types/v2/container"
 	"github.com/spf13/cobra"
+	kit "go.getarcane.app/kit/pkg"
 
 	"github.com/getarcaneapp/arcane/cli/v2/internal/cmdutil"
 	"github.com/getarcaneapp/arcane/cli/v2/internal/output"
 	"github.com/getarcaneapp/arcane/cli/v2/internal/types"
 )
 
-var (
-	killSignal string
-
-	commitRepository string
-	commitTag        string
-	commitComment    string
-	commitAuthor     string
-	commitChanges    []string
-	commitNoPause    bool
-
-	editFile string
-
-	autoUpdateEnabled bool
-)
-
-var containersKillCmd = &cobra.Command{
-	Use:          "kill <container-id|name>",
-	Short:        "Kill a container (send a signal to its main process)",
-	Args:         cobra.ExactArgs(1),
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := cmdutil.ClientFromCommand(cmd)
-		if err != nil {
-			return err
-		}
-		resolved, _, err := ContainerRef.Resolve(cmd.Context(), c, args[0], false)
-		if err != nil {
-			return err
-		}
-
-		path := types.ContainerKill(c.EnvID(), resolved.ID)
-		if signal := strings.TrimSpace(killSignal); signal != "" {
-			path += "?signal=" + url.QueryEscape(signal)
-		}
-		return cmdutil.RunPostAction[base.MessageResponse](cmd, c, cmdutil.PostActionSpec{
-			Path:           path,
-			FailureMessage: "failed to kill container",
-			SuccessMessage: fmt.Sprintf("Container %s killed successfully", containerDisplayName(resolved)),
-			JSON:           jsonOutput,
-		})
-	},
-}
-
-var containersPauseCmd = &cobra.Command{
-	Use:          "pause <container-id|name>",
-	Short:        "Pause a container",
-	Args:         cobra.ExactArgs(1),
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := cmdutil.ClientFromCommand(cmd)
-		if err != nil {
-			return err
-		}
-		resolved, _, err := ContainerRef.Resolve(cmd.Context(), c, args[0], false)
-		if err != nil {
-			return err
-		}
-		return cmdutil.RunPostAction[base.MessageResponse](cmd, c, cmdutil.PostActionSpec{
-			Path:           types.ContainerPause(c.EnvID(), resolved.ID),
-			FailureMessage: "failed to pause container",
-			SuccessMessage: fmt.Sprintf("Container %s paused successfully", containerDisplayName(resolved)),
-			JSON:           jsonOutput,
-		})
-	},
-}
-
-var containersUnpauseCmd = &cobra.Command{
-	Use:          "unpause <container-id|name>",
-	Short:        "Unpause a container",
-	Args:         cobra.ExactArgs(1),
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := cmdutil.ClientFromCommand(cmd)
-		if err != nil {
-			return err
-		}
-		resolved, _, err := ContainerRef.Resolve(cmd.Context(), c, args[0], false)
-		if err != nil {
-			return err
-		}
-		return cmdutil.RunPostAction[base.MessageResponse](cmd, c, cmdutil.PostActionSpec{
-			Path:           types.ContainerUnpause(c.EnvID(), resolved.ID),
-			FailureMessage: "failed to unpause container",
-			SuccessMessage: fmt.Sprintf("Container %s unpaused successfully", containerDisplayName(resolved)),
-			JSON:           jsonOutput,
-		})
-	},
-}
-
-var containersCommitCmd = &cobra.Command{
-	Use:          "commit <container-id|name>",
-	Short:        "Create an image from a container",
-	Args:         cobra.ExactArgs(1),
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := cmdutil.ClientFromCommand(cmd)
-		if err != nil {
-			return err
-		}
-
-		resolved, _, err := ContainerRef.Resolve(cmd.Context(), c, args[0], false)
-		if err != nil {
-			return err
-		}
-
-		body := container.CommitRequest{
-			Repository: commitRepository,
-			Tag:        commitTag,
-			Comment:    commitComment,
-			Author:     commitAuthor,
-			Changes:    commitChanges,
-			NoPause:    commitNoPause,
-		}
-
-		c.SetTimeout(30 * time.Minute)
-
-		result, err := c.PostJSON[container.CommitResult](cmd.Context(), types.ContainerCommit(c.EnvID(), resolved.ID), body)
-		if err != nil {
-			return fmt.Errorf("failed to commit container: %w", err)
-		}
-
-		if jsonOutput {
-			return cmdutil.PrintJSON(result.Data)
-		}
-
-		output.Success("Container %s committed successfully", containerDisplayName(resolved))
-		output.KeyValue("Image ID", result.Data.ID)
-		return nil
-	},
-}
-
-var containersEditCmd = &cobra.Command{
-	Use:          "edit <container-id|name>",
-	Short:        "Edit a container's configuration",
-	Long:         "Without --file, prints the container's editable configuration as JSON (pipe it to a file, edit it, then re-apply). With --file, applies the edit payload and recreates the container.",
-	Args:         cobra.ExactArgs(1),
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := cmdutil.ClientFromCommand(cmd)
-		if err != nil {
-			return err
-		}
-
-		resolved, _, err := ContainerRef.Resolve(cmd.Context(), c, args[0], false)
-		if err != nil {
-			return err
-		}
-
-		if editFile == "" {
-			result, getEditConfigErr := c.GetJSON[container.EditConfig](cmd.Context(), types.ContainerEditConfig(c.EnvID(), resolved.ID))
-			if getEditConfigErr != nil {
-				return fmt.Errorf("failed to get container edit config: %w", getEditConfigErr)
+func newKillCmd() *cobra.Command {
+	var opts struct {
+		signal string
+	}
+	command := &cobra.Command{
+		Use:          "kill <container-id|name>",
+		Short:        "Kill a container (send a signal to its main process)",
+		Args:         cobra.ExactArgs(1),
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := cmdutil.ClientFromCommand(cmd)
+			if err != nil {
+				return err
+			}
+			resolved, _, err := ContainerRef.Resolve(cmd.Context(), c, args[0], false)
+			if err != nil {
+				return err
 			}
 
-			return cmdutil.PrintJSON(result.Data)
-		}
-
-		data, err := os.ReadFile(editFile)
-		if err != nil {
-			return fmt.Errorf("failed to read file %s: %w", editFile, err)
-		}
-		var body container.Edit
-		if unmarshalErr := json.Unmarshal(data, &body); unmarshalErr != nil {
-			return fmt.Errorf("failed to parse edit payload: %w", unmarshalErr)
-		}
-
-		c.SetTimeout(30 * time.Minute)
-
-		result, err := c.PostJSON[container.Details](cmd.Context(), types.ContainerEdit(c.EnvID(), resolved.ID), body)
-		if err != nil {
-			return fmt.Errorf("failed to edit container: %w", err)
-		}
-
-		if jsonOutput {
-			return cmdutil.PrintJSON(result.Data)
-		}
-
-		output.Success("Container %s edited successfully", containerDisplayName(resolved))
-		output.KeyValue("New ID", result.Data.ID)
-		return nil
-	},
+			path := types.ContainerKill(c.EnvID(), resolved.ID)
+			if signal := strings.TrimSpace(opts.signal); signal != "" {
+				path += "?signal=" + url.QueryEscape(signal)
+			}
+			return cmdutil.Run(cmd, c, cmdutil.Spec[base.MessageResponse]{
+				Method:         http.MethodPost,
+				Path:           path,
+				FailureMessage: "failed to kill container",
+				Render: func(base.MessageResponse) error {
+					output.Success("Container %s killed successfully", containerDisplayName(resolved))
+					return nil
+				},
+			})
+		},
+	}
+	command.Flags().StringVar(&opts.signal, "signal", "", "Signal to send (for example SIGTERM, SIGKILL); defaults to SIGKILL")
+	return command
 }
 
-var containersAutoUpdateCmd = &cobra.Command{
-	Use:          "auto-update <container-id|name>",
-	Short:        "Enable or disable auto-update for a container",
-	Args:         cobra.ExactArgs(1),
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := cmdutil.ClientFromCommand(cmd)
-		if err != nil {
-			return err
-		}
-
-		resolved, _, err := ContainerRef.Resolve(cmd.Context(), c, args[0], false)
-		if err != nil {
-			return err
-		}
-
-		body := struct {
-			Enabled bool `json:"enabled"`
-		}{Enabled: autoUpdateEnabled}
-
-		result, err := c.PutJSON[base.MessageResponse](cmd.Context(), types.ContainerAutoUpdate(c.EnvID(), resolved.ID), body)
-		if err != nil {
-			return fmt.Errorf("failed to set container auto-update: %w", err)
-		}
-
-		if jsonOutput {
-			return cmdutil.PrintJSON(result.Data)
-		}
-
-		state := "disabled"
-		if autoUpdateEnabled {
-			state = "enabled"
-		}
-		output.Success("Auto-update %s for container %s", state, containerDisplayName(resolved))
-		return nil
-	},
+func newPauseCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:          "pause <container-id|name>",
+		Short:        "Pause a container",
+		Args:         cobra.ExactArgs(1),
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := cmdutil.ClientFromCommand(cmd)
+			if err != nil {
+				return err
+			}
+			resolved, _, err := ContainerRef.Resolve(cmd.Context(), c, args[0], false)
+			if err != nil {
+				return err
+			}
+			return cmdutil.Run(cmd, c, cmdutil.Spec[base.MessageResponse]{
+				Method:         http.MethodPost,
+				Path:           types.ContainerPause(c.EnvID(), resolved.ID),
+				FailureMessage: "failed to pause container",
+				Render: func(base.MessageResponse) error {
+					output.Success("Container %s paused successfully", containerDisplayName(resolved))
+					return nil
+				},
+			})
+		},
+	}
 }
 
-func init() {
-	ContainersCmd.AddCommand(containersKillCmd)
-	ContainersCmd.AddCommand(containersPauseCmd)
-	ContainersCmd.AddCommand(containersUnpauseCmd)
-	ContainersCmd.AddCommand(containersCommitCmd)
-	ContainersCmd.AddCommand(containersEditCmd)
-	ContainersCmd.AddCommand(containersAutoUpdateCmd)
+func newUnpauseCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:          "unpause <container-id|name>",
+		Short:        "Unpause a container",
+		Args:         cobra.ExactArgs(1),
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := cmdutil.ClientFromCommand(cmd)
+			if err != nil {
+				return err
+			}
+			resolved, _, err := ContainerRef.Resolve(cmd.Context(), c, args[0], false)
+			if err != nil {
+				return err
+			}
+			return cmdutil.Run(cmd, c, cmdutil.Spec[base.MessageResponse]{
+				Method:         http.MethodPost,
+				Path:           types.ContainerUnpause(c.EnvID(), resolved.ID),
+				FailureMessage: "failed to unpause container",
+				Render: func(base.MessageResponse) error {
+					output.Success("Container %s unpaused successfully", containerDisplayName(resolved))
+					return nil
+				},
+			})
+		},
+	}
+}
 
-	containersKillCmd.Flags().StringVar(&killSignal, "signal", "", "Signal to send (for example SIGTERM, SIGKILL); defaults to SIGKILL")
+func newCommitCmd() *cobra.Command {
+	var opts struct {
+		repository string
+		tag        string
+		comment    string
+		author     string
+		changes    []string
+		noPause    bool
+	}
+	command := &cobra.Command{
+		Use:          "commit <container-id|name>",
+		Short:        "Create an image from a container",
+		Args:         cobra.ExactArgs(1),
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := cmdutil.ClientFromCommand(cmd)
+			if err != nil {
+				return err
+			}
 
-	containersCommitCmd.Flags().StringVar(&commitRepository, "repository", "", "Target image repository")
-	containersCommitCmd.Flags().StringVar(&commitTag, "tag", "", "Target image tag")
-	containersCommitCmd.Flags().StringVar(&commitComment, "comment", "", "Commit comment")
-	containersCommitCmd.Flags().StringVar(&commitAuthor, "author", "", "Commit author")
-	containersCommitCmd.Flags().StringArrayVar(&commitChanges, "change", nil, "Dockerfile instruction to apply during commit (repeatable)")
-	containersCommitCmd.Flags().BoolVar(&commitNoPause, "no-pause", false, "Do not pause the container during commit")
+			resolved, _, err := ContainerRef.Resolve(cmd.Context(), c, args[0], false)
+			if err != nil {
+				return err
+			}
 
-	containersEditCmd.Flags().StringVarP(&editFile, "file", "f", "", "JSON edit payload to apply (omit to print the current editable configuration)")
+			body := container.CommitRequest{
+				Repository: opts.repository,
+				Tag:        opts.tag,
+				Comment:    opts.comment,
+				Author:     opts.author,
+				Changes:    opts.changes,
+				NoPause:    opts.noPause,
+			}
 
-	containersAutoUpdateCmd.Flags().BoolVar(&autoUpdateEnabled, "enabled", false, "Whether auto-update is enabled for this container")
-	_ = containersAutoUpdateCmd.MarkFlagRequired("enabled")
+			c.SetTimeout(30 * time.Minute)
 
-	containersKillCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
-	containersPauseCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
-	containersUnpauseCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
-	containersCommitCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
-	containersEditCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
-	containersAutoUpdateCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
+			return cmdutil.Run(cmd, c, cmdutil.Spec[container.CommitResult]{
+				Method:         http.MethodPost,
+				Path:           types.ContainerCommit(c.EnvID(), resolved.ID),
+				Body:           body,
+				FailureMessage: "failed to commit container",
+				Render: func(data container.CommitResult) error {
+					output.Success("Container %s committed successfully", containerDisplayName(resolved))
+					output.KeyValue("Image ID", data.ID)
+					return nil
+				},
+			})
+		},
+	}
+	command.Flags().StringVar(&opts.repository, "repository", "", "Target image repository")
+	command.Flags().StringVar(&opts.tag, "tag", "", "Target image tag")
+	command.Flags().StringVar(&opts.comment, "comment", "", "Commit comment")
+	command.Flags().StringVar(&opts.author, "author", "", "Commit author")
+	command.Flags().StringArrayVar(&opts.changes, "change", nil, "Dockerfile instruction to apply during commit (repeatable)")
+	command.Flags().BoolVar(&opts.noPause, "no-pause", false, "Do not pause the container during commit")
+	return command
+}
+
+func newEditCmd() *cobra.Command {
+	var opts struct {
+		file string
+	}
+	command := &cobra.Command{
+		Use:          "edit <container-id|name>",
+		Short:        "Edit a container's configuration",
+		Long:         "Without --file, prints the container's editable configuration as JSON (pipe it to a file, edit it, then re-apply). With --file, applies the edit payload and recreates the container.",
+		Args:         cobra.ExactArgs(1),
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := cmdutil.ClientFromCommand(cmd)
+			if err != nil {
+				return err
+			}
+
+			resolved, _, err := ContainerRef.Resolve(cmd.Context(), c, args[0], false)
+			if err != nil {
+				return err
+			}
+
+			if opts.file == "" {
+				return cmdutil.Run(cmd, c, cmdutil.Spec[jsontext.Value]{
+					Method:         http.MethodGet,
+					Path:           types.ContainerEditConfig(c.EnvID(), resolved.ID),
+					FailureMessage: "failed to get container edit config",
+					Render:         func(data jsontext.Value) error { return cmdutil.PrintRawJSON(data) },
+				})
+			}
+
+			data, err := os.ReadFile(opts.file)
+			if err != nil {
+				return fmt.Errorf("failed to read file %s: %w", opts.file, err)
+			}
+			var body container.Edit
+			if unmarshalErr := json.Unmarshal(data, &body); unmarshalErr != nil {
+				return fmt.Errorf("failed to parse edit payload: %w", unmarshalErr)
+			}
+
+			c.SetTimeout(30 * time.Minute)
+
+			return cmdutil.Run(cmd, c, cmdutil.Spec[container.Details]{
+				Method:         http.MethodPost,
+				Path:           types.ContainerEdit(c.EnvID(), resolved.ID),
+				Body:           body,
+				FailureMessage: "failed to edit container",
+				Render: func(data container.Details) error {
+					output.Success("Container %s edited successfully", containerDisplayName(resolved))
+					output.KeyValue("New ID", data.ID)
+					return nil
+				},
+			})
+		},
+	}
+	command.Flags().StringVarP(&opts.file, "file", "f", "", "JSON edit payload to apply (omit to print the current editable configuration)")
+	return command
+}
+
+func newAutoUpdateCmd() *cobra.Command {
+	var opts struct {
+		enabled bool
+	}
+	command := &cobra.Command{
+		Use:          "auto-update <container-id|name>",
+		Short:        "Enable or disable auto-update for a container",
+		Args:         cobra.ExactArgs(1),
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := cmdutil.ClientFromCommand(cmd)
+			if err != nil {
+				return err
+			}
+
+			resolved, _, err := ContainerRef.Resolve(cmd.Context(), c, args[0], false)
+			if err != nil {
+				return err
+			}
+
+			body := container.SetAutoUpdateRequest{Enabled: opts.enabled}
+
+			return cmdutil.Run(cmd, c, cmdutil.Spec[base.MessageResponse]{
+				Method:         http.MethodPut,
+				Path:           types.ContainerAutoUpdate(c.EnvID(), resolved.ID),
+				Body:           body,
+				FailureMessage: "failed to set container auto-update",
+				Render: func(data base.MessageResponse) error {
+					output.Success("Auto-update %s for container %s", kit.Ternary(opts.enabled, "enabled", "disabled"), containerDisplayName(resolved))
+					return nil
+				},
+			})
+		},
+	}
+	command.Flags().BoolVar(&opts.enabled, "enabled", false, "Whether auto-update is enabled for this container")
+	_ = command.MarkFlagRequired("enabled")
+	return command
 }

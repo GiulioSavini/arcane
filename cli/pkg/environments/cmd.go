@@ -10,41 +10,16 @@ import (
 	"strings"
 
 	"charm.land/lipgloss/v2"
-	"github.com/getarcaneapp/arcane/types/v2/base"
 	"github.com/getarcaneapp/arcane/types/v2/environment"
 	"github.com/getarcaneapp/arcane/types/v2/version"
 	"github.com/spf13/cobra"
+	"go.getarcane.app/kit/pkg"
 
-	"github.com/getarcaneapp/arcane/cli/v2/internal/client"
 	"github.com/getarcaneapp/arcane/cli/v2/internal/cmdutil"
 	"github.com/getarcaneapp/arcane/cli/v2/internal/config"
 	"github.com/getarcaneapp/arcane/cli/v2/internal/output"
 	"github.com/getarcaneapp/arcane/cli/v2/internal/prompt"
 	"github.com/getarcaneapp/arcane/cli/v2/internal/types"
-)
-
-var (
-	limitFlag  int
-	startFlag  int
-	allFlag    bool
-	forceFlag  bool
-	jsonOutput bool
-)
-
-var (
-	envUpdateName     string
-	envUpdateApiUrl   string
-	envUpdateEnabled  bool
-	envUpdateDisabled bool
-)
-
-var (
-	envCreateName        string
-	envCreateApiUrl      string
-	envCreateAccessToken string
-	envCreateUseApiKey   bool
-	envCreateEdge        bool
-	envCreateDisabled    bool
 )
 
 var (
@@ -54,431 +29,391 @@ var (
 	enabledStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("#6d28d9"))
 )
 
-// EnvironmentsCmd is the parent command for environment operations
-var EnvironmentsCmd = &cobra.Command{
-	Use:     "environments",
-	Aliases: []string{"environment", "env", "e"},
-	Short:   "Manage environments",
+// Command is the parent command for environment operations
+func Command() *cobra.Command {
+	command := &cobra.Command{
+		Use:     "environments",
+		Aliases: []string{"environment", "env", "e"},
+		Short:   "Manage environments",
+	}
+	command.AddCommand(newListCmd())
+	command.AddCommand(newGetCmd())
+	command.AddCommand(newTestCmd())
+	command.AddCommand(newDeleteCmd())
+	command.AddCommand(newSwitchCmd())
+	command.AddCommand(newUpdateCmd())
+	command.AddCommand(newVersionCmd())
+	command.AddCommand(newCreateCmd())
+	return command
 }
 
-var listCmd = &cobra.Command{
-	Use:          "list",
-	Aliases:      []string{"ls"},
-	Short:        "List environments",
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := client.NewFromConfig()
-		if err != nil {
-			return err
-		}
-
-		return cmdutil.RunList(cmd, c, cmdutil.ListSpec[environment.Environment]{
-			Resource: "environments",
-			Endpoint: types.Environments(),
-			Params:   cmdutil.ListParams{Resource: "environments", Limit: limitFlag, FallbackDefault: 20, Start: startFlag, All: allFlag},
-			JSON:     jsonOutput,
-			Headers:  []string{"ID", "NAME", "API URL", "STATUS", "ENABLED"},
-			Row: func(env environment.Environment) []string {
-				enabled := "false"
-				if env.Enabled {
-					enabled = "true"
-				}
-				return []string{
-					env.ID,
-					env.Name,
-					env.ApiUrl,
-					env.Status,
-					enabled,
-				}
-			},
-		})
-	},
-}
-
-var deleteCmd = &cobra.Command{
-	Use:          "delete <id>",
-	Aliases:      []string{"rm", "remove"},
-	Short:        "Delete environment",
-	Args:         cobra.ExactArgs(1),
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		if !forceFlag {
-			confirmed, err := cmdutil.Confirm(cmd, fmt.Sprintf("Are you sure you want to delete environment %s?", args[0]))
+func newListCmd() *cobra.Command {
+	var opts struct {
+		limit int
+		start int
+		all   bool
+	}
+	command := &cobra.Command{
+		Use:          "list",
+		Aliases:      []string{"ls"},
+		Short:        "List environments",
+		Args:         cobra.NoArgs,
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := cmdutil.ClientFromCommand(cmd)
 			if err != nil {
 				return err
 			}
-			if !confirmed {
-				_, _ = fmt.Fprintln(output.Stdout(), "Cancelled")
+
+			return cmdutil.RunList(cmd, c, cmdutil.ListSpec[environment.Environment]{
+				Resource: "environments",
+				Endpoint: types.Environments(),
+				Params:   cmdutil.ListParams{Resource: "environments", Limit: opts.limit, FallbackDefault: 20, Start: opts.start, All: opts.all},
+				Headers:  []string{"ID", "NAME", "API URL", "STATUS", "ENABLED"},
+				Row: func(env environment.Environment) []string {
+					return []string{
+						env.ID,
+						env.Name,
+						env.ApiUrl,
+						env.Status,
+						strconv.FormatBool(env.Enabled),
+					}
+				},
+			})
+		},
+	}
+	command.Flags().IntVarP(&opts.limit, "limit", "n", 20, "Number of environments to show")
+	command.Flags().IntVar(&opts.start, "start", 0, cmdutil.StartFlagUsage)
+	command.Flags().BoolVarP(&opts.all, "all", "a", false, cmdutil.AllFlagUsage)
+	return command
+}
+
+func newDeleteCmd() *cobra.Command {
+	var opts struct {
+		force bool
+	}
+	command := &cobra.Command{
+		Use:          "delete <id>",
+		Aliases:      []string{"rm", "remove"},
+		Short:        "Delete environment",
+		Args:         cobra.ExactArgs(1),
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := cmdutil.ClientFromCommand(cmd)
+			if err != nil {
+				return err
+			}
+			return cmdutil.RunDelete(cmd, c, cmdutil.DeleteSpec{
+				Force:          opts.force,
+				Prompt:         fmt.Sprintf("Are you sure you want to delete environment %s?", args[0]),
+				Path:           types.Environment(args[0]),
+				FailureMessage: "failed to delete environment",
+				SuccessMessage: "Environment deleted successfully",
+			})
+		},
+	}
+	command.Flags().BoolVarP(&opts.force, "force", "f", false, "Force deletion without confirmation")
+	return command
+}
+
+func newGetCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:          "get <id>",
+		Short:        "Get environment details",
+		Args:         cobra.ExactArgs(1),
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := cmdutil.ClientFromCommand(cmd)
+			if err != nil {
+				return err
+			}
+
+			return cmdutil.Run(cmd, c, cmdutil.Spec[environment.Environment]{
+				Method:         http.MethodGet,
+				Path:           types.Environment(args[0]),
+				FailureMessage: "failed to get environment",
+				Body:           nil,
+				Render: func(data environment.Environment) error {
+					output.Header("Environment Details")
+					output.KeyValue("ID", data.ID)
+					output.KeyValue("Name", data.Name)
+					output.KeyValue("API URL", data.ApiUrl)
+					output.KeyValue("Status", data.Status)
+					output.KeyValue("Enabled", data.Enabled)
+					return nil
+				},
+			})
+		},
+	}
+}
+
+func newTestCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:          "test <id>",
+		Short:        "Test environment connection",
+		Args:         cobra.ExactArgs(1),
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := cmdutil.ClientFromCommand(cmd)
+			if err != nil {
+				return err
+			}
+
+			return cmdutil.Run(cmd, c, cmdutil.Spec[environment.Test]{
+				Method:         http.MethodPost,
+				Path:           types.EnvironmentTest(args[0]),
+				FailureMessage: "failed to test environment",
+				Render: func(environment.Test) error {
+					output.Success("%s", "Environment connection test successful")
+					return nil
+				},
+			})
+		},
+	}
+}
+
+func newSwitchCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:          "switch",
+		Short:        "Switch the default environment (interactive)",
+		Args:         cobra.NoArgs,
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if !cmdutil.AllowPrompt(cmd) {
+				return errors.New("interactive terminal required; run `arcane config set environment <id>` instead")
+			}
+
+			cfg, err := config.Load()
+			if err != nil {
+				return fmt.Errorf("failed to load config: %w", err)
+			}
+
+			c, err := cmdutil.ClientFromCommand(cmd)
+			if err != nil {
+				return err
+			}
+
+			path := fmt.Sprintf("%s?limit=%d", types.Environments(), cmdutil.ShowAllLimit)
+			result, err := c.GetJSON[[]environment.Environment](cmd.Context(), path)
+			if err != nil {
+				return fmt.Errorf("failed to list environments: %w", err)
+			}
+
+			if len(result.Data) == 0 {
+				return errors.New("no environments available")
+			}
+
+			currentEnv := cmp.Or(strings.TrimSpace(cfg.DefaultEnvironment), "0")
+
+			envs := result.Data
+			sort.SliceStable(envs, func(i, j int) bool {
+				left := strings.ToLower(cmp.Or(strings.TrimSpace(envs[i].Name), envs[i].ID))
+				right := strings.ToLower(cmp.Or(strings.TrimSpace(envs[j].Name), envs[j].ID))
+				if left == right {
+					return envs[i].ID < envs[j].ID
+				}
+				return left < right
+			})
+
+			choice, err := prompt.Select("environment", environmentOptions(envs, currentEnv))
+			if err != nil {
+				return err
+			}
+
+			selected := envs[choice]
+			if selected.ID == currentEnv {
+				output.Info("Default environment already set to %s", selected.ID)
 				return nil
 			}
-		}
 
-		c, err := client.NewFromConfig()
-		if err != nil {
-			return err
-		}
-
-		if _, deleteEnvironmentErr := c.DeleteJSON[base.MessageResponse](cmd.Context(), types.Environment(args[0])); deleteEnvironmentErr != nil {
-			return fmt.Errorf("failed to delete environment: %w", deleteEnvironmentErr)
-		}
-
-		output.Success("Environment deleted successfully")
-		return nil
-	},
-}
-
-var getCmd = &cobra.Command{
-	Use:          "get <id>",
-	Short:        "Get environment details",
-	Args:         cobra.ExactArgs(1),
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := client.NewFromConfig()
-		if err != nil {
-			return err
-		}
-
-		result, err := c.GetJSON[environment.Environment](cmd.Context(), types.Environment(args[0]))
-		if err != nil {
-			return fmt.Errorf("failed to get environment: %w", err)
-		}
-
-		if jsonOutput {
-			return cmdutil.PrintJSON(buildEnvironmentPayloadInternal(result.Data))
-		}
-
-		output.Header("Environment Details")
-		output.KeyValue("ID", result.Data.ID)
-		output.KeyValue("Name", result.Data.Name)
-		output.KeyValue("API URL", result.Data.ApiUrl)
-		output.KeyValue("Status", result.Data.Status)
-		output.KeyValue("Enabled", result.Data.Enabled)
-		return nil
-	},
-}
-
-var testCmd = &cobra.Command{
-	Use:          "test <id>",
-	Short:        "Test environment connection",
-	Args:         cobra.ExactArgs(1),
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := client.NewFromConfig()
-		if err != nil {
-			return err
-		}
-
-		return cmdutil.RunPostAction[environment.Test](cmd, c, cmdutil.PostActionSpec{
-			Path:           types.EnvironmentTest(args[0]),
-			FailureMessage: "failed to test environment",
-			SuccessMessage: "Environment connection test successful",
-			JSON:           jsonOutput,
-		})
-	},
-}
-
-var switchCmd = &cobra.Command{
-	Use:          "switch",
-	Short:        "Switch the default environment (interactive)",
-	Args:         cobra.NoArgs,
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		if !prompt.IsInteractive() {
-			return errors.New("interactive terminal required; run `arcane config set environment <id>` instead")
-		}
-
-		cfg, err := config.Load()
-		if err != nil {
-			return fmt.Errorf("failed to load config: %w", err)
-		}
-
-		c, err := client.NewFromConfig()
-		if err != nil {
-			return err
-		}
-
-		path := fmt.Sprintf("%s?limit=%d", types.Environments(), cmdutil.ShowAllLimit)
-		result, err := c.DoJSON[base.Paginated[environment.Environment]](cmd.Context(), http.MethodGet, path, nil)
-		if err != nil {
-			return fmt.Errorf("failed to list environments: %w", err)
-		}
-
-		if len(result.Data) == 0 {
-			return errors.New("no environments available")
-		}
-
-		currentEnv := cfg.DefaultEnvironment
-		if strings.TrimSpace(currentEnv) == "" {
-			currentEnv = "0"
-		}
-
-		envs := result.Data
-		sort.SliceStable(envs, func(i, j int) bool {
-			left := strings.ToLower(strings.TrimSpace(envs[i].Name))
-			right := strings.ToLower(strings.TrimSpace(envs[j].Name))
-			if left == "" {
-				left = strings.ToLower(envs[i].ID)
-			}
-			if right == "" {
-				right = strings.ToLower(envs[j].ID)
-			}
-			if left == right {
-				return envs[i].ID < envs[j].ID
-			}
-			return left < right
-		})
-
-		options := make([]string, len(envs))
-		for i, env := range envs {
-			displayName := cmp.Or(strings.TrimSpace(env.Name), env.ID)
-			status := strings.TrimSpace(env.Status)
-			if status == "" {
-				status = "unknown"
-			}
-			var statusLabel string
-			switch strings.ToLower(status) {
-			case "online":
-				statusLabel = statusOnlineStyle.Render(status)
-			case "offline":
-				statusLabel = statusOfflineStyle.Render(status)
-			default:
-				statusLabel = statusMutedStyle.Render(status)
+			cfg.DefaultEnvironment = selected.ID
+			if saveErr := config.Save(cfg); saveErr != nil {
+				return fmt.Errorf("failed to save config: %w", saveErr)
 			}
 
-			enabledLabel := statusMutedStyle.Render("disabled")
-			if env.Enabled {
-				enabledLabel = enabledStyle.Render("enabled")
+			output.Success("Default environment set to %s", selected.ID)
+			if strings.TrimSpace(selected.Name) != "" {
+				output.KeyValue("Name", selected.Name)
 			}
-			marker := "  "
-			if env.ID == currentEnv {
-				marker = "* "
-			}
-			options[i] = fmt.Sprintf("%s%s (id: %s, %s, %s)", marker, displayName, env.ID, statusLabel, enabledLabel)
-		}
-
-		choice, err := prompt.Select("environment", options)
-		if err != nil {
-			return err
-		}
-
-		selected := envs[choice]
-		if selected.ID == currentEnv {
-			output.Info("Default environment already set to %s", selected.ID)
+			output.KeyValue("API URL", selected.ApiUrl)
 			return nil
-		}
-
-		cfg.DefaultEnvironment = selected.ID
-		if saveErr := config.Save(cfg); saveErr != nil {
-			return fmt.Errorf("failed to save config: %w", saveErr)
-		}
-
-		output.Success("Default environment set to %s", selected.ID)
-		if strings.TrimSpace(selected.Name) != "" {
-			output.KeyValue("Name", selected.Name)
-		}
-		output.KeyValue("API URL", selected.ApiUrl)
-		return nil
-	},
+		},
+	}
 }
 
-var updateCmd = &cobra.Command{
-	Use:          "update <id>",
-	Short:        "Update environment",
-	Args:         cobra.ExactArgs(1),
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := client.NewFromConfig()
-		if err != nil {
-			return err
-		}
+func newUpdateCmd() *cobra.Command {
+	var opts struct {
+		name     string
+		apiUrl   string
+		enabled  bool
+		disabled bool
+	}
+	command := &cobra.Command{
+		Use:          "update <id>",
+		Short:        "Update environment",
+		Args:         cobra.ExactArgs(1),
+		SilenceUsage: true,
+		PreRunE: func(cmd *cobra.Command, _ []string) error {
+			return cmdutil.ExclusiveFlags(cmd, "enabled", "disabled")
+		},
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := cmdutil.ClientFromCommand(cmd)
+			if err != nil {
+				return err
+			}
 
-		var req environment.Update
-		if cmd.Flags().Changed("enabled") && cmd.Flags().Changed("disabled") {
-			return errors.New("--enabled and --disabled are mutually exclusive")
-		}
-		if cmd.Flags().Changed("name") {
-			req.Name = &envUpdateName
-		}
-		if cmd.Flags().Changed("api-url") {
-			req.ApiUrl = &envUpdateApiUrl
-		}
-		if cmd.Flags().Changed("enabled") {
-			req.Enabled = new(true)
-		}
-		if cmd.Flags().Changed("disabled") {
-			req.Enabled = new(false)
-		}
+			enabled := cmd.Flags().Changed("enabled") && opts.enabled || cmd.Flags().Changed("disabled") && !opts.disabled
+			req := environment.Update{
+				Name:    kit.Ternary(cmd.Flags().Changed("name"), &opts.name, nil),
+				ApiUrl:  kit.Ternary(cmd.Flags().Changed("api-url"), &opts.apiUrl, nil),
+				Enabled: kit.Ternary(cmd.Flags().Changed("enabled") || cmd.Flags().Changed("disabled"), &enabled, nil),
+			}
 
-		result, err := c.PutJSON[environment.Environment](cmd.Context(), types.Environment(args[0]), req)
-		if err != nil {
-			return fmt.Errorf("failed to update environment: %w", err)
-		}
-
-		if jsonOutput {
-			return cmdutil.PrintJSON(buildEnvironmentPayloadInternal(result.Data))
-		}
-
-		output.Success("Environment updated successfully")
-		output.KeyValue("ID", result.Data.ID)
-		output.KeyValue("Name", result.Data.Name)
-		output.KeyValue("API URL", result.Data.ApiUrl)
-		output.KeyValue("Enabled", result.Data.Enabled)
-		return nil
-	},
+			return cmdutil.Run(cmd, c, cmdutil.Spec[environment.Environment]{
+				Method:         http.MethodPut,
+				Path:           types.Environment(args[0]),
+				FailureMessage: "failed to update environment",
+				Body:           req,
+				Render: func(data environment.Environment) error {
+					output.Success("Environment updated successfully")
+					output.KeyValue("ID", data.ID)
+					output.KeyValue("Name", data.Name)
+					output.KeyValue("API URL", data.ApiUrl)
+					output.KeyValue("Enabled", data.Enabled)
+					return nil
+				},
+			})
+		},
+	}
+	command.Flags().StringVar(&opts.name, "name", "", "Environment name")
+	command.Flags().StringVar(&opts.apiUrl, "api-url", "", "API URL")
+	command.Flags().BoolVar(&opts.enabled, "enabled", false, "Enable environment")
+	command.Flags().BoolVar(&opts.disabled, "disabled", false, "Disable environment")
+	_ = command.Flags().MarkDeprecated("disabled", "use --enabled=false")
+	return command
 }
 
-var createCmd = &cobra.Command{
-	Use:          "create",
-	Short:        "Create environment",
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := client.NewFromConfig()
-		if err != nil {
-			return err
-		}
+func newCreateCmd() *cobra.Command {
+	var opts struct {
+		name        string
+		apiUrl      string
+		accessToken string
+		useApiKey   bool
+		edge        bool
+		disabled    bool
+		enabled     bool
+	}
+	command := &cobra.Command{
+		Use:          "create",
+		Short:        "Create environment",
+		Args:         cobra.NoArgs,
+		SilenceUsage: true,
+		PreRunE: func(cmd *cobra.Command, _ []string) error {
+			return cmdutil.ExclusiveFlags(cmd, "enabled", "disabled")
+		},
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := cmdutil.ClientFromCommand(cmd)
+			if err != nil {
+				return err
+			}
 
-		req := environment.Create{ApiUrl: envCreateApiUrl}
-		if cmd.Flags().Changed("name") {
-			req.Name = &envCreateName
-		}
-		if cmd.Flags().Changed("access-token") {
-			req.AccessToken = &envCreateAccessToken
-		}
-		if cmd.Flags().Changed("use-api-key") {
-			req.UseApiKey = &envCreateUseApiKey
-		}
-		if cmd.Flags().Changed("edge") {
-			req.IsEdge = &envCreateEdge
-		}
-		if cmd.Flags().Changed("disabled") {
-			req.Enabled = new(!envCreateDisabled)
-		}
+			req := environment.Create{
+				ApiUrl:      opts.apiUrl,
+				Name:        kit.Ternary(cmd.Flags().Changed("name"), &opts.name, nil),
+				AccessToken: kit.Ternary(cmd.Flags().Changed("access-token"), &opts.accessToken, nil),
+				UseApiKey:   kit.Ternary(cmd.Flags().Changed("use-api-key"), &opts.useApiKey, nil),
+				IsEdge:      kit.Ternary(cmd.Flags().Changed("edge"), &opts.edge, nil),
+				Enabled:     kit.Ternary(cmd.Flags().Changed("enabled") || cmd.Flags().Changed("disabled"), new(opts.enabled && !opts.disabled), nil),
+			}
 
-		result, err := c.PostJSON[environment.Environment](cmd.Context(), types.Environments(), req)
-		if err != nil {
-			return fmt.Errorf("failed to create environment: %w", err)
-		}
-
-		if jsonOutput {
-			return cmdutil.PrintJSON(buildEnvironmentPayloadInternal(result.Data))
-		}
-
-		output.Success("Environment created successfully")
-		output.KeyValue("ID", result.Data.ID)
-		output.KeyValue("Name", result.Data.Name)
-		output.KeyValue("API URL", result.Data.ApiUrl)
-		output.KeyValue("Enabled", result.Data.Enabled)
-		if result.Data.ApiKey != nil && *result.Data.ApiKey != "" {
-			output.Warning("Pairing API key (shown only once) — store it now:")
-			output.KeyValue("API Key", *result.Data.ApiKey)
-		}
-		return nil
-	},
+			return cmdutil.Run(cmd, c, cmdutil.Spec[environment.Environment]{
+				Method:         http.MethodPost,
+				Path:           types.Environments(),
+				FailureMessage: "failed to create environment",
+				Body:           req,
+				Render: func(data environment.Environment) error {
+					output.Success("Environment created successfully")
+					output.KeyValue("ID", data.ID)
+					output.KeyValue("Name", data.Name)
+					output.KeyValue("API URL", data.ApiUrl)
+					output.KeyValue("Enabled", data.Enabled)
+					if data.ApiKey != nil && *data.ApiKey != "" {
+						output.Warning("Pairing API key (shown only once) — store it now:")
+						output.KeyValue("API Key", *data.ApiKey)
+					}
+					return nil
+				},
+			})
+		},
+	}
+	command.Flags().StringVar(&opts.apiUrl, "api-url", "", "API URL of the environment (required)")
+	command.Flags().StringVar(&opts.name, "name", "", "Environment name")
+	command.Flags().StringVar(&opts.accessToken, "access-token", "", "Access token for legacy pairing")
+	command.Flags().BoolVar(&opts.useApiKey, "use-api-key", false, "Pair using a generated API key (shown once)")
+	command.Flags().BoolVar(&opts.edge, "edge", false, "Create as an edge environment")
+	command.Flags().BoolVar(&opts.enabled, "enabled", true, "Enable environment")
+	command.Flags().BoolVar(&opts.disabled, "disabled", false, "Create environment in disabled state")
+	_ = command.Flags().MarkDeprecated("disabled", "use --enabled=false")
+	_ = command.MarkFlagRequired("api-url")
+	return command
 }
 
-var versionCmd = &cobra.Command{
-	Use:          "version <id>",
-	Short:        "Get environment version",
-	Args:         cobra.ExactArgs(1),
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := client.NewFromConfig()
-		if err != nil {
-			return err
-		}
+func newVersionCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:          "version <id>",
+		Short:        "Get environment version",
+		Args:         cobra.ExactArgs(1),
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := cmdutil.ClientFromCommand(cmd)
+			if err != nil {
+				return err
+			}
 
-		result, err := c.GetJSON[version.Info](cmd.Context(), types.EnvironmentVersion(args[0]))
-		if err != nil {
-			return fmt.Errorf("failed to get environment version: %w", err)
-		}
-
-		if jsonOutput {
-			return cmdutil.PrintJSON(result.Data)
-		}
-
-		output.Header("Environment Version")
-		output.KeyValue("Version", result.Data.DisplayVersion)
-		output.KeyValue("Full Version", result.Data.CurrentVersion)
-		output.KeyValue("Tag", result.Data.CurrentTag)
-		output.KeyValue("Revision", result.Data.ShortRevision)
-		output.KeyValue("Go Version", result.Data.GoVersion)
-		output.KeyValue("Build Time", result.Data.BuildTime)
-		output.KeyValue("Update Available", strconv.FormatBool(result.Data.UpdateAvailable))
-		return nil
-	},
+			return cmdutil.Run(cmd, c, cmdutil.Spec[version.Info]{
+				Method:         http.MethodGet,
+				Path:           types.EnvironmentVersion(args[0]),
+				FailureMessage: "failed to get environment version",
+				Render: func(data version.Info) error {
+					output.Header("Environment Version")
+					output.KeyValue("Version", data.DisplayVersion)
+					output.KeyValue("Full Version", data.CurrentVersion)
+					output.KeyValue("Tag", data.CurrentTag)
+					output.KeyValue("Revision", data.ShortRevision)
+					output.KeyValue("Go Version", data.GoVersion)
+					output.KeyValue("Build Time", data.BuildTime)
+					output.KeyValue("Update Available", strconv.FormatBool(data.UpdateAvailable))
+					return nil
+				},
+			})
+		},
+	}
 }
 
-func buildEnvironmentPayloadInternal(env environment.Environment) map[string]any {
-	payload := map[string]any{
-		"id":      env.ID,
-		"name":    env.Name,
-		"apiUrl":  env.ApiUrl,
-		"status":  env.Status,
-		"enabled": env.Enabled,
-		"isEdge":  env.IsEdge,
+func environmentOptions(environments []environment.Environment, currentEnv string) []string {
+	options := make([]string, len(environments))
+	for i, env := range environments {
+		displayName := cmp.Or(strings.TrimSpace(env.Name), env.ID)
+		status := cmp.Or(strings.TrimSpace(env.Status), "unknown")
+		var statusLabel string
+		switch strings.ToLower(status) {
+		case "online":
+			statusLabel = statusOnlineStyle.Render(status)
+		case "offline":
+			statusLabel = statusOfflineStyle.Render(status)
+		default:
+			statusLabel = statusMutedStyle.Render(status)
+		}
+
+		enabledLabel := statusMutedStyle.Render("disabled")
+		if env.Enabled {
+			enabledLabel = enabledStyle.Render("enabled")
+		}
+		marker := "  "
+		if env.ID == currentEnv {
+			marker = "* "
+		}
+		options[i] = fmt.Sprintf("%s%s (id: %s, %s, %s)", marker, displayName, env.ID, statusLabel, enabledLabel)
 	}
-	if env.EdgeTransport != nil {
-		payload["edgeTransport"] = *env.EdgeTransport
-	}
-	if env.Connected != nil {
-		payload["connected"] = *env.Connected
-	}
-	if env.ConnectedAt != nil {
-		payload["connectedAt"] = *env.ConnectedAt
-	}
-	if env.LastHeartbeat != nil {
-		payload["lastHeartbeat"] = *env.LastHeartbeat
-	}
-	if env.ApiKey != nil {
-		payload["apiKey"] = *env.ApiKey
-	}
-
-	return payload
-}
-
-func init() {
-	EnvironmentsCmd.AddCommand(listCmd)
-	EnvironmentsCmd.AddCommand(getCmd)
-	EnvironmentsCmd.AddCommand(testCmd)
-	EnvironmentsCmd.AddCommand(deleteCmd)
-	EnvironmentsCmd.AddCommand(switchCmd)
-	EnvironmentsCmd.AddCommand(updateCmd)
-	EnvironmentsCmd.AddCommand(versionCmd)
-	EnvironmentsCmd.AddCommand(createCmd)
-
-	// List command flags
-	listCmd.Flags().IntVarP(&limitFlag, "limit", "n", 20, "Number of environments to show")
-	listCmd.Flags().IntVar(&startFlag, "start", 0, cmdutil.StartFlagUsage)
-	listCmd.Flags().BoolVarP(&allFlag, "all", "a", false, cmdutil.AllFlagUsage)
-	listCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
-
-	// Get command flags
-	getCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
-
-	// Test command flags
-	testCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
-
-	// Delete command flags
-	deleteCmd.Flags().BoolVarP(&forceFlag, "force", "f", false, "Force deletion without confirmation")
-	deleteCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
-
-	// Update command flags
-	updateCmd.Flags().StringVar(&envUpdateName, "name", "", "Environment name")
-	updateCmd.Flags().StringVar(&envUpdateApiUrl, "api-url", "", "API URL")
-	updateCmd.Flags().BoolVar(&envUpdateEnabled, "enabled", false, "Enable environment")
-	updateCmd.Flags().BoolVar(&envUpdateDisabled, "disabled", false, "Disable environment")
-	updateCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
-
-	// Version command flags
-	versionCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
-
-	// Create command flags
-	createCmd.Flags().StringVar(&envCreateApiUrl, "api-url", "", "API URL of the environment (required)")
-	createCmd.Flags().StringVar(&envCreateName, "name", "", "Environment name")
-	createCmd.Flags().StringVar(&envCreateAccessToken, "access-token", "", "Access token for legacy pairing")
-	createCmd.Flags().BoolVar(&envCreateUseApiKey, "use-api-key", false, "Pair using a generated API key (shown once)")
-	createCmd.Flags().BoolVar(&envCreateEdge, "edge", false, "Create as an edge environment")
-	createCmd.Flags().BoolVar(&envCreateDisabled, "disabled", false, "Create environment in disabled state")
-	createCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
-	_ = createCmd.MarkFlagRequired("api-url")
+	return options
 }

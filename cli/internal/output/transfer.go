@@ -10,9 +10,8 @@ func Copy(ctx context.Context, dst io.Writer, src io.Reader, total int64, label 
 	loading := StartTracker(ctx, Stderr(), enabled, label)
 	loading.NextStep()
 	defer loading.Stop()
-	reader := &transferReader{ctx: ctx, source: src, loading: loading, total: total, label: label}
 	loading.SetProgress("", label, 0, total, true)
-	written, err := io.Copy(dst, reader)
+	written, err := io.Copy(dst, &transferReader{ctx: ctx, source: src, loading: loading, total: total, label: label})
 	loading.Finish("", err)
 	return written, err
 }

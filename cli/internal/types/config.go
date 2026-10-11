@@ -143,10 +143,7 @@ func (c *Config) Clone() *Config {
 		return nil
 	}
 	out := *c
-	if c.Pagination.Resources != nil {
-		out.Pagination.Resources = make(map[string]PaginationResourceConfig, len(c.Pagination.Resources))
-		maps.Copy(out.Pagination.Resources, c.Pagination.Resources)
-	}
+	out.Pagination.Resources = maps.Clone(c.Pagination.Resources)
 	return &out
 }
 

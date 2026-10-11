@@ -5,11 +5,11 @@ import (
 	"log/slog"
 	"os"
 
+	"github.com/getarcaneapp/arcane/cli/v2/pkg/generate"
 	"github.com/spf13/cobra"
 	"go.getarcane.app/kit/pkg/signals"
 
 	"github.com/getarcaneapp/arcane/backend/v2/cli/admin"
-	"github.com/getarcaneapp/arcane/backend/v2/cli/generate"
 	"github.com/getarcaneapp/arcane/backend/v2/cli/recovery"
 	"github.com/getarcaneapp/arcane/backend/v2/cli/upgrade"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/bootstrap"
@@ -43,5 +43,5 @@ func init() {
 	rootCmd.AddCommand(admin.AdminCmd)
 	rootCmd.AddCommand(upgrade.UpgradeCmd)
 	rootCmd.AddCommand(recovery.RestoreCmd)
-	rootCmd.AddCommand(generate.GenerateCmd)
+	rootCmd.AddCommand(generate.Command())
 }

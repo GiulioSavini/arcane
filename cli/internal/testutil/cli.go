@@ -10,8 +10,6 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/spf13/cobra"
-	"github.com/spf13/pflag"
 	"github.com/stretchr/testify/require"
 
 	"github.com/getarcaneapp/arcane/cli/v2/pkg"
@@ -42,12 +40,11 @@ func WriteConfig(t *testing.T, serverURL string, preview ...bool) string {
 	return configPath
 }
 
-// Execute runs the root command with isolated flags and captures its output.
+// Execute runs a freshly built root command and captures its output.
 func Execute(t *testing.T, args []string) (string, string, error) {
 	t.Helper()
 
-	root := cli.RootCommand()
-	resetCommandFlags(t, root)
+	root := cli.NewRootCommand()
 	errOut := &strings.Builder{}
 	root.SetErr(errOut)
 	root.SetArgs(args)
@@ -81,26 +78,4 @@ func Execute(t *testing.T, args []string) (string, string, error) {
 	}
 
 	return outBuf, errOut.String(), runErr
-}
-
-func resetCommandFlags(t *testing.T, root *cobra.Command) {
-	t.Helper()
-
-	if root == nil {
-		return
-	}
-
-	for _, flagSet := range []*pflag.FlagSet{root.PersistentFlags(), root.Flags()} {
-		flagSet.VisitAll(func(flag *pflag.Flag) {
-			defValue := flag.DefValue
-			if (flag.Value.Type() == "stringSlice" || flag.Value.Type() == "stringArray") && defValue == "[]" {
-				defValue = ""
-			}
-			require.NoError(t, flag.Value.Set(defValue), "reset flag %s", flag.Name)
-			flag.Changed = false
-		})
-	}
-	for _, cmd := range root.Commands() {
-		resetCommandFlags(t, cmd)
-	}
 }

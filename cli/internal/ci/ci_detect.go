@@ -1,6 +1,7 @@
 package ci
 
 import (
+	"cmp"
 	"context"
 	"encoding/json/v2"
 	"errors"
@@ -10,8 +11,6 @@ import (
 	"net/url"
 	"strings"
 	"time"
-
-	kit "go.getarcane.app/kit/pkg"
 )
 
 const (
@@ -23,7 +22,7 @@ const (
 
 // DetectToken resolves a CI-issued OIDC token from the requested provider.
 func DetectToken(ctx context.Context, provider, audience string, getenv func(string) string, httpClient *http.Client) (string, string, error) {
-	provider = normalizeFederatedProviderInternal(provider)
+	provider = cmp.Or(strings.ToLower(strings.TrimSpace(provider)), ProviderAuto)
 	if getenv == nil {
 		getenv = func(string) string { return "" }
 	}
@@ -33,7 +32,7 @@ func DetectToken(ctx context.Context, provider, audience string, getenv func(str
 
 	switch provider {
 	case ProviderAuto:
-		if token, err := mintGitHubActionsTokenInternal(ctx, audience, getenv, httpClient); err == nil {
+		if token, err := mintGitHubActionsToken(ctx, audience, getenv, httpClient); err == nil {
 			return token, ProviderGitHub, nil
 		}
 		if token := strings.TrimSpace(getenv("CI_JOB_JWT_V2")); token != "" {
@@ -41,7 +40,7 @@ func DetectToken(ctx context.Context, provider, audience string, getenv func(str
 		}
 		return "", "", errors.New("no supported CI OIDC token source detected")
 	case ProviderGitHub:
-		token, err := mintGitHubActionsTokenInternal(ctx, audience, getenv, httpClient)
+		token, err := mintGitHubActionsToken(ctx, audience, getenv, httpClient)
 		if err != nil {
 			return "", "", err
 		}
@@ -59,7 +58,7 @@ func DetectToken(ctx context.Context, provider, audience string, getenv func(str
 	}
 }
 
-func mintGitHubActionsTokenInternal(ctx context.Context, audience string, getenv func(string) string, httpClient *http.Client) (string, error) {
+func mintGitHubActionsToken(ctx context.Context, audience string, getenv func(string) string, httpClient *http.Client) (string, error) {
 	requestURL := strings.TrimSpace(getenv("ACTIONS_ID_TOKEN_REQUEST_URL"))
 	requestToken := strings.TrimSpace(getenv("ACTIONS_ID_TOKEN_REQUEST_TOKEN"))
 	if requestURL == "" || requestToken == "" {
@@ -108,9 +107,4 @@ func mintGitHubActionsTokenInternal(ctx context.Context, audience string, getenv
 		return "", errors.New("GitHub Actions OIDC response did not include a token")
 	}
 	return token, nil
-}
-
-func normalizeFederatedProviderInternal(provider string) string {
-	provider = strings.ToLower(strings.TrimSpace(provider))
-	return kit.Ternary(provider == "", ProviderAuto, provider)
 }

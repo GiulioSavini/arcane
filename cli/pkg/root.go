@@ -15,6 +15,7 @@ import (
 	"charm.land/fang/v2"
 	"charm.land/lipgloss/v2"
 	"github.com/spf13/cobra"
+	kit "go.getarcane.app/kit/pkg"
 
 	"github.com/getarcaneapp/arcane/cli/v2/internal/cmdutil"
 	"github.com/getarcaneapp/arcane/cli/v2/internal/config"
@@ -50,89 +51,89 @@ import (
 	"github.com/getarcaneapp/arcane/cli/v2/pkg/webhooks"
 )
 
-var (
-	logLevel       string
-	logJSONOutput  bool
-	showVersion    bool
-	configPath     string
-	outputMode     string
-	envOverride    string
-	assumeYes      bool
-	noColorOutput  bool
-	requestTimeout time.Duration
-	globalJSON     bool
-)
+type rootOptions struct {
+	logLevel, configPath, outputMode, envOverride  string
+	logJSON, showVersion, assumeYes, noColor, json bool
+	requestTimeout                                 time.Duration
+}
 
-var rootCmd = &cobra.Command{
-	Use:  "arcane-cli",
-	Long: "Arcane CLI - The official command line interface for Arcane",
-	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
-		if configPath != "" {
-			if err := config.SetConfigPath(configPath); err != nil {
+// NewRootCommand builds a fresh Arcane CLI command tree.
+func NewRootCommand() *cobra.Command {
+	opts := &rootOptions{}
+	root := &cobra.Command{
+		Use:  "arcane-cli",
+		Long: "Arcane CLI - The official command line interface for Arcane",
+		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+			if opts.configPath != "" {
+				if err := config.SetConfigPath(opts.configPath); err != nil {
+					return err
+				}
+			}
+
+			jsonMode := opts.json || opts.outputMode == "json"
+			runtimeMode := kit.Ternary(jsonMode, runtimectx.OutputModeJSON, runtimectx.OutputModeText)
+			output.Configure(cmd.OutOrStdout(), cmd.ErrOrStderr(), jsonMode, opts.noColor, cmd.Short)
+
+			app, err := runtimectx.New(runtimectx.Options{
+				EnvOverride:    opts.envOverride,
+				OutputMode:     runtimeMode,
+				AssumeYes:      opts.assumeYes,
+				NoColor:        opts.noColor,
+				RequestTimeout: opts.requestTimeout,
+			})
+			if err != nil {
 				return err
 			}
-		}
-
-		outputMode = cmp.Or(strings.ToLower(strings.TrimSpace(outputMode)), string(runtimectx.OutputModeText))
-		if globalJSON && !cmd.Flags().Changed("output") {
-			outputMode = string(runtimectx.OutputModeJSON)
-		}
-		runtimeMode := runtimectx.OutputMode(outputMode)
-		switch runtimeMode {
-		case runtimectx.OutputModeJSON:
-			if flag := cmd.Flags().Lookup("json"); flag != nil && !flag.Changed {
-				_ = cmd.Flags().Set("json", "true")
+			if cfg := app.Config(); !cmd.Flags().Changed("log-level") && cfg != nil && cfg.LogLevel != "" {
+				opts.logLevel = cfg.LogLevel
 			}
-		case runtimectx.OutputModeText:
-		default:
-			return fmt.Errorf("invalid --output value %q (expected text or json)", outputMode)
-		}
-
-		// Load config to check for log level setting
-		cfg, _ := config.Load()
-
-		// If flag is not explicitly set, try to use config value
-		if !cmd.Flags().Changed("log-level") && cfg != nil && cfg.LogLevel != "" {
-			logLevel = cfg.LogLevel
-		}
-
-		if localJSON, _ := cmd.Flags().GetBool("json"); localJSON {
-			runtimeMode = runtimectx.OutputModeJSON
-		}
-		output.Configure(cmd.OutOrStdout(), cmd.ErrOrStderr(), runtimeMode == runtimectx.OutputModeJSON, noColorOutput, cmd.Short)
-		logger.Setup(cmd.ErrOrStderr(), logLevel, logJSONOutput)
-
-		app, err := runtimectx.New(runtimectx.Options{
-			EnvOverride:    envOverride,
-			OutputMode:     runtimeMode,
-			AssumeYes:      assumeYes,
-			NoColor:        noColorOutput,
-			RequestTimeout: requestTimeout,
-		})
-		if err != nil {
-			return err
-		}
-		cmd.SetContext(context.WithValue(cmd.Context(), runtimectx.AppContextKey, app))
-		runstate.Set(runstate.State{
-			EnvOverride:    envOverride,
-			OutputMode:     outputMode,
-			AssumeYes:      assumeYes,
-			NoColor:        noColorOutput,
-			RequestTimeout: requestTimeout,
-		})
-		return nil
-	},
-	RunE: func(cmd *cobra.Command, args []string) error {
-		if showVersion {
+			logger.Setup(cmd.ErrOrStderr(), opts.logLevel, opts.logJSON)
+			cmd.SetContext(context.WithValue(cmd.Context(), runtimectx.AppContextKey, app))
+			runstate.Set(runstate.State{
+				EnvOverride:    opts.envOverride,
+				OutputMode:     string(runtimeMode),
+				AssumeYes:      opts.assumeYes,
+				NoColor:        opts.noColor,
+				RequestTimeout: opts.requestTimeout,
+			})
+			return nil
+		},
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if !opts.showVersion {
+				return cmd.Help()
+			}
 			_, _ = fmt.Fprintf(output.Stdout(), "Arcane CLI version: %s\n", config.Version)
 			_, _ = fmt.Fprintf(output.Stdout(), "Git revision: %s\n", config.Revision)
 			_, _ = fmt.Fprintf(output.Stdout(), "Go version: %s\n", runtime.Version())
 			_, _ = fmt.Fprintf(output.Stdout(), "OS/Arch: %s/%s\n", runtime.GOOS, runtime.GOARCH)
 			return nil
-		}
-		return cmd.Help()
-	},
-	CompletionOptions: cobra.CompletionOptions{DisableDefaultCmd: true},
+		},
+		CompletionOptions: cobra.CompletionOptions{DisableDefaultCmd: true},
+	}
+
+	flags := root.PersistentFlags()
+	cmdutil.EnumVarP(root, flags, &opts.logLevel, "log-level", "", "info", "Log level", "debug", "info", "warn", "error", "fatal")
+	flags.StringVarP(&opts.configPath, "config", "c", "", "Path to config file (default ~/.config/arcanecli.yml)")
+	cmdutil.EnumVarP(root, flags, &opts.outputMode, "output", "", "text", "Output mode", "text", "json")
+	flags.StringVar(&opts.envOverride, "env", "", "Override default environment ID for this invocation")
+	flags.BoolVarP(&opts.assumeYes, "yes", "y", false, "Automatic yes to prompts")
+	flags.BoolVar(&opts.noColor, "no-color", false, "Disable colored output")
+	flags.DurationVar(&opts.requestTimeout, "request-timeout", 0, "HTTP request timeout override (e.g. 30s, 2m)")
+	flags.BoolVar(&opts.json, "json", false, "Alias for --output json")
+	flags.BoolVar(&opts.logJSON, "log-json", false, "Log in JSON format")
+	root.Flags().BoolVarP(&opts.showVersion, "version", "v", false, "Print version information")
+
+	imagesCmd := images.Command()
+	imagesCmd.AddCommand(vulnerabilities.Command())
+	root.AddCommand(
+		configClient.Command(), completion.NewCommand(root), doctor.Command(), generate.Command(), version.Command(), auth.Command(),
+		containers.Command(), imagesCmd, volumes.Command(), networks.Command(), projects.Command(), environments.Command(),
+		registries.Command(), repos.Command(), templates.Command(), settings.Command(), jobs.Command(), system.Command(),
+		updater.Command(), selfupdate.Command(), admin.Command(), gitops.Command(), variables.Command(), activities.Command(),
+		webhooks.Command(),
+	)
+	instrumentCommandTree(root)
+	return root
 }
 
 func Execute() {
@@ -141,23 +142,29 @@ func Execute() {
 	context.AfterFunc(ctx, cancel)
 	if err := fang.Execute(
 		ctx,
-		rootCmd,
+		NewRootCommand(),
 		fang.WithColorSchemeFunc(func(c lipgloss.LightDarkFunc) fang.ColorScheme {
-			scheme := fang.DefaultColorScheme(c)
-			scheme.Base = c(lipgloss.Color("#1f2937"), lipgloss.Color("#e5e7eb"))
-			scheme.Title = c(lipgloss.Color("#6d28d9"), lipgloss.Color("#a78bfa"))
-			scheme.Description = scheme.Base
-			scheme.Codeblock = c(lipgloss.Color("#f5f3ff"), lipgloss.Color("#241b35"))
-			scheme.Program = scheme.Title
-			scheme.Command = c(lipgloss.Color("#7c3aed"), lipgloss.Color("#c4b5fd"))
-			scheme.DimmedArgument = c(lipgloss.Color("#64748b"), lipgloss.Color("#94a3b8"))
-			scheme.Comment = c(lipgloss.Color("#64748b"), lipgloss.Color("#cbd5e1"))
-			scheme.Flag = scheme.Title
-			scheme.FlagDefault = c(lipgloss.Color("#64748b"), lipgloss.Color("#cbd5e1"))
-			scheme.Argument = scheme.Base
-			scheme.Help = scheme.Base
-			scheme.Dash = scheme.Base
-			return scheme
+			defaults := fang.DefaultColorScheme(c)
+			base := c(lipgloss.Color("#1f2937"), lipgloss.Color("#e5e7eb"))
+			title := c(lipgloss.Color("#6d28d9"), lipgloss.Color("#a78bfa"))
+			return fang.ColorScheme{
+				Base:           base,
+				Title:          title,
+				Description:    base,
+				Codeblock:      c(lipgloss.Color("#f5f3ff"), lipgloss.Color("#241b35")),
+				Program:        title,
+				Command:        c(lipgloss.Color("#7c3aed"), lipgloss.Color("#c4b5fd")),
+				DimmedArgument: c(lipgloss.Color("#64748b"), lipgloss.Color("#94a3b8")),
+				Comment:        c(lipgloss.Color("#64748b"), lipgloss.Color("#cbd5e1")),
+				Flag:           title,
+				FlagDefault:    c(lipgloss.Color("#64748b"), lipgloss.Color("#cbd5e1")),
+				Argument:       base,
+				Help:           base,
+				Dash:           base,
+				QuotedString:   defaults.QuotedString,
+				ErrorHeader:    defaults.ErrorHeader,
+				ErrorDetails:   defaults.ErrorDetails,
+			}
 		}),
 		fang.WithErrorHandler(func(w io.Writer, _ fang.Styles, err error) { output.WriteError(w, err) }),
 		fang.WithVersion(config.Version),
@@ -167,12 +174,6 @@ func Execute() {
 		os.Exit(1)
 	}
 	cancel()
-}
-
-// RootCommand returns the configured root command.
-// Intended for integration tests and embedding.
-func RootCommand() *cobra.Command {
-	return rootCmd
 }
 
 func instrumentCommandTree(cmd *cobra.Command) {
@@ -209,46 +210,4 @@ func instrumentCommandTree(cmd *cobra.Command) {
 			originalRun(command, args)
 		}
 	}
-}
-
-func init() {
-	rootCmd.PersistentFlags().StringVar(&logLevel, "log-level", "info", "Log level (debug, info, warn, error, fatal)")
-	rootCmd.PersistentFlags().StringVarP(&configPath, "config", "c", "", "Path to config file (default ~/.config/arcanecli.yml)")
-	rootCmd.PersistentFlags().StringVar(&outputMode, "output", "text", "Output mode (text, json)")
-	rootCmd.PersistentFlags().StringVar(&envOverride, "env", "", "Override default environment ID for this invocation")
-	rootCmd.PersistentFlags().BoolVarP(&assumeYes, "yes", "y", false, "Automatic yes to prompts")
-	rootCmd.PersistentFlags().BoolVar(&noColorOutput, "no-color", false, "Disable colored output")
-	rootCmd.PersistentFlags().DurationVar(&requestTimeout, "request-timeout", 0, "HTTP request timeout override (e.g. 30s, 2m)")
-	rootCmd.PersistentFlags().BoolVar(&globalJSON, "json", false, "Alias for --output json")
-	rootCmd.PersistentFlags().BoolVar(&logJSONOutput, "log-json", false, "Log in JSON format")
-	rootCmd.Flags().BoolVarP(&showVersion, "version", "v", false, "Print version information")
-
-	rootCmd.AddCommand(configClient.ConfigCmd)
-	rootCmd.AddCommand(completion.NewCommand(rootCmd))
-	rootCmd.AddCommand(doctor.DoctorCmd)
-	rootCmd.AddCommand(generate.GenerateCmd)
-	rootCmd.AddCommand(version.VersionCmd)
-	rootCmd.AddCommand(auth.AuthCmd)
-	rootCmd.AddCommand(containers.ContainersCmd)
-	images.ImagesCmd.AddCommand(vulnerabilities.VulnerabilitiesCmd)
-	rootCmd.AddCommand(images.ImagesCmd)
-	rootCmd.AddCommand(volumes.VolumesCmd)
-	rootCmd.AddCommand(networks.NetworksCmd)
-	rootCmd.AddCommand(projects.ProjectsCmd)
-	rootCmd.AddCommand(environments.EnvironmentsCmd)
-	rootCmd.AddCommand(registries.RegistriesCmd)
-	rootCmd.AddCommand(repos.ReposCmd)
-	rootCmd.AddCommand(templates.TemplatesCmd)
-	rootCmd.AddCommand(settings.SettingsCmd)
-	rootCmd.AddCommand(jobs.JobsCmd)
-	rootCmd.AddCommand(system.SystemCmd)
-	rootCmd.AddCommand(updater.UpdaterCmd)
-	rootCmd.AddCommand(selfupdate.Cmd)
-	rootCmd.AddCommand(admin.AdminCmd)
-	rootCmd.AddCommand(gitops.GitopsCmd)
-	rootCmd.AddCommand(variables.VariablesCmd)
-	rootCmd.AddCommand(activities.ActivitiesCmd)
-	rootCmd.AddCommand(webhooks.WebhooksCmd)
-
-	instrumentCommandTree(rootCmd)
 }

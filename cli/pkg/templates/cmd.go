@@ -1,9 +1,12 @@
 package templates
 
 import (
+	"cmp"
 	"context"
-	"errors"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"fmt"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -16,7 +19,7 @@ import (
 	"github.com/getarcaneapp/arcane/types/v2/base"
 	"github.com/getarcaneapp/arcane/types/v2/template"
 	"github.com/spf13/cobra"
-	kit "go.getarcane.app/kit/pkg"
+	"go.getarcane.app/kit/pkg"
 
 	"github.com/getarcaneapp/arcane/cli/v2/internal/client"
 	"github.com/getarcaneapp/arcane/cli/v2/internal/cmdutil"
@@ -25,297 +28,302 @@ import (
 	"github.com/getarcaneapp/arcane/cli/v2/internal/types"
 )
 
-var (
-	limitFlag       int
-	startFlag       int
-	templateListAll bool
-	forceFlag       bool
-	jsonOutput      bool
-
-	templateUpdateName        string
-	templateUpdateFile        string
-	templateUpdateDescription string
-	templateUpdateEnvFile     string
-	templateCreateName        string
-	templateCreateFile        string
-	templateCreateDescription string
-	templateCreateEnvFile     string
-	templateDownloadOutput    string
-	templateDefaultsSaveFile  string
-	templateDefaultsEnvFile   string
-	templateFetchURL          string
-	templateRegUpdateName     string
-	templateRegUpdateURL      string
-	templateRegUpdateDesc     string
-	templateRegUpdateEnabled  bool
-	templateRegUpdateDisabled bool
-)
-
-// TemplatesCmd is the parent command for template operations
-var TemplatesCmd = &cobra.Command{
-	Use:     "templates",
-	Aliases: []string{"template", "tpl"},
-	Short:   "Manage Docker Compose templates",
+// Command is the parent command for template operations
+func Command() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:     "templates",
+		Aliases: []string{"template", "tpl"},
+		Short:   "Manage Docker Compose templates",
+	}
+	cmd.AddCommand(newListCmd())
+	cmd.AddCommand(newDefaultCmd())
+	cmd.AddCommand(newContentCmd())
+	cmd.AddCommand(newRegistriesCmd())
+	cmd.AddCommand(newDeleteCmd())
+	cmd.AddCommand(newGetCmd())
+	cmd.AddCommand(newCreateCmd())
+	cmd.AddCommand(newUpdateCmd())
+	cmd.AddCommand(newDownloadCmd())
+	cmd.AddCommand(newFetchCmd())
+	return cmd
 }
 
-var listCmd = &cobra.Command{
-	Use:          "list",
-	Aliases:      []string{"ls"},
-	Short:        "List local templates",
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := client.NewFromConfig()
-		if err != nil {
-			return err
+func newListCmd() *cobra.Command {
+	var opts struct {
+		limit           int
+		start           int
+		templateListAll bool
+	}
+	cmd := &cobra.Command{
+		Use:          "list",
+		Aliases:      []string{"ls"},
+		Short:        "List local templates",
+		Args:         cobra.NoArgs,
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := client.NewFromConfig()
+			if err != nil {
+				return err
+			}
+
+			headers := []string{"NAME", "CUSTOM", "REMOTE", "DESCRIPTION"}
+
+			if opts.templateListAll {
+				return cmdutil.Run(cmd, c, cmdutil.Spec[[]template.Template]{
+					Method:         http.MethodGet,
+					Path:           types.TemplatesAll(),
+					FailureMessage: "failed to list templates",
+					Render: func(data []template.Template) error {
+						rows := make([][]string, len(data))
+						for i, tpl := range data {
+							rows[i] = []string{
+								tpl.Name,
+								kit.Ternary(tpl.IsCustom, "yes", "no"),
+								kit.Ternary(tpl.IsRemote, "yes", "no"),
+								tpl.Description,
+							}
+						}
+						if tableErr := output.Table(headers, rows); tableErr != nil {
+							return tableErr
+						}
+						output.Showing(len(data), int64(len(data)), "templates")
+						return nil
+					},
+				})
+			}
+
+			return cmdutil.RunList(cmd, c, cmdutil.ListSpec[template.Template]{
+				Resource: "templates",
+				Endpoint: types.Templates(),
+				Params:   cmdutil.ListParams{Resource: "templates", Limit: opts.limit, FallbackDefault: 20, Start: opts.start},
+				Headers:  headers,
+				Row: func(tpl template.Template) []string {
+					return []string{
+						tpl.Name,
+						kit.Ternary(tpl.IsCustom, "yes", "no"),
+						kit.Ternary(tpl.IsRemote, "yes", "no"),
+						tpl.Description,
+					}
+				},
+			})
+		},
+	}
+	cmd.Flags().IntVarP(&opts.limit, "limit", "n", 20, "Number of templates to show")
+	cmd.Flags().IntVar(&opts.start, "start", 0, "Offset for pagination")
+	cmd.Flags().BoolVarP(&opts.templateListAll, "all", "a", false, "List all templates (including remote)")
+	cmd.PreRunE = func(cmd *cobra.Command, _ []string) error {
+		if conflictErr := cmdutil.ExclusiveFlags(cmd, "all", "limit"); conflictErr != nil {
+			return conflictErr
 		}
+		return cmdutil.ExclusiveFlags(cmd, "all", "start")
+	}
+	return cmd
+}
 
-		headers := []string{"NAME", "CUSTOM", "REMOTE", "DESCRIPTION"}
-		row := func(tpl template.Template) []string {
-			custom := "no"
-			if tpl.IsCustom {
-				custom = "yes"
-			}
-			remote := "no"
-			if tpl.IsRemote {
-				remote = "yes"
-			}
-			return []string{
-				tpl.Name,
-				custom,
-				remote,
-				tpl.Description,
-			}
-		}
-
-		if templateListAll {
-			if cmd.Flags().Changed("limit") || cmd.Flags().Changed("start") {
-				return errors.New("--all cannot be combined with explicit pagination flags")
+func newDefaultCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:          "default",
+		Short:        "Get default templates",
+		Args:         cobra.NoArgs,
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := client.NewFromConfig()
+			if err != nil {
+				return err
 			}
 
-			result, listTemplatesErr := c.GetJSON[[]template.Template](cmd.Context(), types.TemplatesAll())
-			if listTemplatesErr != nil {
-				return fmt.Errorf("failed to list templates: %w", listTemplatesErr)
+			return cmdutil.Run(cmd, c, cmdutil.Spec[template.DefaultTemplatesResponse]{
+				Method:         http.MethodGet,
+				Path:           types.TemplatesDefault(),
+				FailureMessage: "failed to get default templates",
+				Render: func(data template.DefaultTemplatesResponse) error {
+					output.Header("Default Templates")
+					output.KeyValue("Compose Template", fmt.Sprintf("%d bytes", len(data.ComposeTemplate)))
+					output.KeyValue("Env Template", fmt.Sprintf("%d bytes", len(data.EnvTemplate)))
+					return nil
+				},
+			})
+		},
+	}
+	cmd.AddCommand(newDefaultsSaveCmd())
+	return cmd
+}
+
+func newContentCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:          "content <template-id>",
+		Short:        "Get template content",
+		Args:         cobra.ExactArgs(1),
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := client.NewFromConfig()
+			if err != nil {
+				return err
 			}
 
-			if jsonOutput {
-				return cmdutil.PrintJSON(result.Data)
+			return cmdutil.Run(cmd, c, cmdutil.Spec[template.TemplateContent]{
+				Method:         http.MethodGet,
+				Path:           types.TemplateContent(args[0]),
+				FailureMessage: "failed to get template content",
+				Render: func(data template.TemplateContent) error {
+					output.Header("Template Content")
+					output.KeyValue("Name", data.Template.Name)
+					output.KeyValue("Description", data.Template.Description)
+					output.KeyValue("Services", strconv.Itoa(len(data.Services)))
+					output.KeyValue("Env Variables", strconv.Itoa(len(data.EnvVariables)))
+					_, _ = fmt.Fprintln(output.Stdout(), "\n--- Compose Content ---")
+					_, _ = fmt.Fprintln(output.Stdout(), data.Content)
+					if data.EnvContent != "" {
+						_, _ = fmt.Fprintln(output.Stdout(), "\n--- Environment Content ---")
+						_, _ = fmt.Fprintln(output.Stdout(), data.EnvContent)
+					}
+					return nil
+				},
+			})
+		},
+	}
+}
+
+func newRegistriesCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:          "registries",
+		Aliases:      []string{"reg"},
+		Short:        "List template registries",
+		Args:         cobra.NoArgs,
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := client.NewFromConfig()
+			if err != nil {
+				return err
 			}
 
-			rows := make([][]string, len(result.Data))
-			for i, tpl := range result.Data {
-				rows[i] = row(tpl)
+			return cmdutil.Run(cmd, c, cmdutil.Spec[[]template.TemplateRegistry]{
+				Method:         http.MethodGet,
+				Path:           types.TemplatesRegistries(),
+				FailureMessage: "failed to list registries",
+				Render: func(data []template.TemplateRegistry) error {
+					headers := []string{"ID", "NAME", "URL", "ENABLED"}
+					rows := make([][]string, len(data))
+					for i, reg := range data {
+						enabled := kit.Ternary(reg.Enabled, "yes", "no")
+						rows[i] = []string{
+							reg.ID,
+							reg.Name,
+							reg.URL,
+							enabled,
+						}
+					}
+
+					if tableErr := output.Table(headers, rows); tableErr != nil {
+						return tableErr
+					}
+					_, _ = fmt.Fprintf(output.Stdout(), "\nTotal: %d registries\n", len(data))
+					return nil
+				},
+			})
+		},
+	}
+	cmd.AddCommand(newRegistriesUpdateCmd())
+	cmd.AddCommand(newDeleteRegistryCmd())
+	return cmd
+}
+
+func newDeleteCmd() *cobra.Command {
+	var opts struct {
+		force bool
+	}
+	cmd := &cobra.Command{
+		Use:          "delete <template-id>",
+		Aliases:      []string{"rm", "remove"},
+		Short:        "Delete template",
+		Args:         cobra.ExactArgs(1),
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			label := "template " + args[0]
+			c, err := client.NewFromConfig()
+			if err != nil {
+				return err
 			}
-			if tableErr := output.Table(headers, rows); tableErr != nil {
-				return tableErr
+
+			return cmdutil.RunDelete(cmd, c, cmdutil.DeleteSpec{
+				Force:          opts.force,
+				Prompt:         fmt.Sprintf("Are you sure you want to delete %s?", label),
+				Path:           types.Template(args[0]),
+				Body:           nil,
+				FailureMessage: "failed to delete " + label,
+				SuccessMessage: fmt.Sprintf("Deleted %s successfully", label),
+			})
+		},
+	}
+	cmd.Flags().BoolVarP(&opts.force, "force", "f", false, "Force deletion without confirmation")
+	return cmd
+}
+
+func newDeleteRegistryCmd() *cobra.Command {
+	var opts struct {
+		force bool
+	}
+	cmd := &cobra.Command{
+		Use:          "delete <registry-id>",
+		Aliases:      []string{"rm", "remove"},
+		Short:        "Delete template registry",
+		Args:         cobra.ExactArgs(1),
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			label := "template registry " + args[0]
+			c, err := client.NewFromConfig()
+			if err != nil {
+				return err
 			}
-			output.Showing(len(result.Data), int64(len(result.Data)), "templates")
+
+			return cmdutil.RunDelete(cmd, c, cmdutil.DeleteSpec{
+				Force:          opts.force,
+				Prompt:         fmt.Sprintf("Are you sure you want to delete %s?", label),
+				Path:           types.TemplateRegistry(args[0]),
+				Body:           nil,
+				FailureMessage: "failed to delete " + label,
+				SuccessMessage: fmt.Sprintf("Deleted %s successfully", label),
+			})
+		},
+	}
+	cmd.Flags().BoolVarP(&opts.force, "force", "f", false, "Force deletion without confirmation")
+	return cmd
+}
+
+func newGetCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:          "get <template>",
+		Short:        "Get a template by ID or name",
+		Args:         cobra.ExactArgs(1),
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := client.NewFromConfig()
+			if err != nil {
+				return err
+			}
+
+			allowPrompt := cmdutil.AllowPrompt(cmd)
+			resolved, _, err := templateRef.Resolve(cmd.Context(), c, args[0], allowPrompt)
+			if err != nil {
+				return err
+			}
+
+			if cmdutil.JSONOutputEnabled(cmd) {
+				return cmdutil.PrintJSON(resolved)
+			}
+
+			tpl := *resolved
+			output.Header("Template")
+			output.KeyValue("ID", tpl.ID)
+			output.KeyValue("Name", tpl.Name)
+			output.KeyValue("Description", tpl.Description)
+			custom := kit.Ternary(tpl.IsCustom, "yes", "no")
+			remote := kit.Ternary(tpl.IsRemote, "yes", "no")
+			output.KeyValue("Custom", custom)
+			output.KeyValue("Remote", remote)
 			return nil
-		}
-
-		return cmdutil.RunList(cmd, c, cmdutil.ListSpec[template.Template]{
-			Resource: "templates",
-			Endpoint: types.Templates(),
-			Params:   cmdutil.ListParams{Resource: "templates", Limit: limitFlag, FallbackDefault: 20, Start: startFlag},
-			JSON:     jsonOutput,
-			Headers:  headers,
-			Row:      row,
-		})
-	},
-}
-
-var defaultCmd = &cobra.Command{
-	Use:          "default",
-	Short:        "Get default templates",
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := client.NewFromConfig()
-		if err != nil {
-			return err
-		}
-
-		result, err := c.GetJSON[template.DefaultTemplatesResponse](cmd.Context(), types.TemplatesDefault())
-		if err != nil {
-			return fmt.Errorf("failed to get default templates: %w", err)
-		}
-
-		if jsonOutput {
-			return cmdutil.PrintJSON(result.Data)
-		}
-
-		output.Header("Default Templates")
-		output.KeyValue("Compose Template", fmt.Sprintf("%d bytes", len(result.Data.ComposeTemplate)))
-		output.KeyValue("Env Template", fmt.Sprintf("%d bytes", len(result.Data.EnvTemplate)))
-		return nil
-	},
-}
-
-var contentCmd = &cobra.Command{
-	Use:          "content <template-id>",
-	Short:        "Get template content",
-	Args:         cobra.ExactArgs(1),
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := client.NewFromConfig()
-		if err != nil {
-			return err
-		}
-
-		result, err := c.GetJSON[template.TemplateContent](cmd.Context(), types.TemplateContent(args[0]))
-		if err != nil {
-			return fmt.Errorf("failed to get template content: %w", err)
-		}
-
-		if jsonOutput {
-			return cmdutil.PrintJSON(result.Data)
-		}
-
-		output.Header("Template Content")
-		output.KeyValue("Name", result.Data.Template.Name)
-		output.KeyValue("Description", result.Data.Template.Description)
-		output.KeyValue("Services", strconv.Itoa(len(result.Data.Services)))
-		output.KeyValue("Env Variables", strconv.Itoa(len(result.Data.EnvVariables)))
-		_, _ = fmt.Fprintln(output.Stdout(), "\n--- Compose Content ---")
-		_, _ = fmt.Fprintln(output.Stdout(), result.Data.Content)
-		if result.Data.EnvContent != "" {
-			_, _ = fmt.Fprintln(output.Stdout(), "\n--- Environment Content ---")
-			_, _ = fmt.Fprintln(output.Stdout(), result.Data.EnvContent)
-		}
-		return nil
-	},
-}
-
-var registriesCmd = &cobra.Command{
-	Use:          "registries",
-	Aliases:      []string{"reg"},
-	Short:        "List template registries",
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := client.NewFromConfig()
-		if err != nil {
-			return err
-		}
-
-		result, err := c.GetJSON[[]template.TemplateRegistry](cmd.Context(), types.TemplatesRegistries())
-		if err != nil {
-			return fmt.Errorf("failed to list registries: %w", err)
-		}
-
-		if jsonOutput {
-			return cmdutil.PrintJSON(result.Data)
-		}
-
-		headers := []string{"ID", "NAME", "URL", "ENABLED"}
-		rows := make([][]string, len(result.Data))
-		for i, reg := range result.Data {
-			enabled := "no"
-			if reg.Enabled {
-				enabled = "yes"
-			}
-			rows[i] = []string{
-				reg.ID,
-				reg.Name,
-				reg.URL,
-				enabled,
-			}
-		}
-
-		if tableErr := output.Table(headers, rows); tableErr != nil {
-			return tableErr
-		}
-		_, _ = fmt.Fprintf(output.Stdout(), "\nTotal: %d registries\n", len(result.Data))
-		return nil
-	},
-}
-
-func runTemplateDeleteInternal(cmd *cobra.Command, label, path string) error {
-	if !forceFlag {
-		confirmed, err := cmdutil.Confirm(cmd, fmt.Sprintf("Are you sure you want to delete %s?", label))
-		if err != nil {
-			return err
-		}
-		if !confirmed {
-			_, _ = fmt.Fprintln(output.Stdout(), "Cancelled")
-			return nil
-		}
+		},
 	}
-
-	c, err := client.NewFromConfig()
-	if err != nil {
-		return err
-	}
-
-	result, err := c.DeleteJSON[base.MessageResponse](cmd.Context(), path)
-	if err != nil {
-		return fmt.Errorf("failed to delete %s: %w", label, err)
-	}
-	if jsonOutput {
-		return cmdutil.PrintJSON(result.Data)
-	}
-
-	output.Success("Deleted %s successfully", label)
-	return nil
-}
-
-var deleteCmd = &cobra.Command{
-	Use:          "delete <template-id>",
-	Aliases:      []string{"rm", "remove"},
-	Short:        "Delete template",
-	Args:         cobra.ExactArgs(1),
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		return runTemplateDeleteInternal(cmd, "template "+args[0], types.Template(args[0]))
-	},
-}
-
-var deleteRegistryCmd = &cobra.Command{
-	Use:          "delete <registry-id>",
-	Aliases:      []string{"rm", "remove"},
-	Short:        "Delete template registry",
-	Args:         cobra.ExactArgs(1),
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		return runTemplateDeleteInternal(cmd, "template registry "+args[0], types.TemplateRegistry(args[0]))
-	},
-}
-
-var getCmd = &cobra.Command{
-	Use:          "get <template>",
-	Short:        "Get a template by ID or name",
-	Args:         cobra.ExactArgs(1),
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := client.NewFromConfig()
-		if err != nil {
-			return err
-		}
-
-		allowPrompt := !jsonOutput && prompt.IsInteractive()
-		resolved, _, err := templateRef.Resolve(cmd.Context(), c, args[0], allowPrompt)
-		if err != nil {
-			return err
-		}
-
-		if jsonOutput {
-			return cmdutil.PrintJSON(resolved)
-		}
-
-		tpl := *resolved
-		output.Header("Template")
-		output.KeyValue("ID", tpl.ID)
-		output.KeyValue("Name", tpl.Name)
-		output.KeyValue("Description", tpl.Description)
-		custom := "no"
-		if tpl.IsCustom {
-			custom = "yes"
-		}
-		remote := "no"
-		if tpl.IsRemote {
-			remote = "yes"
-		}
-		output.KeyValue("Custom", custom)
-		output.KeyValue("Remote", remote)
-		return nil
-	},
 }
 
 var templateRef = cmdutil.ResourceRef[template.Template, template.Template]{
@@ -324,12 +332,12 @@ var templateRef = cmdutil.ResourceRef[template.Template, template.Template]{
 	IDHint:           "the template ID",
 	ListCmd:          "arcane templates list",
 	GetPath:          func(_, identifier string) string { return types.Template(identifier) },
-	SearchCandidates: searchTemplateCandidatesInternal,
-	SelectCandidate:  selectTemplateCandidateInternal,
+	SearchCandidates: searchTemplateCandidates,
+	SelectCandidate:  selectTemplateCandidate,
 	Promote:          func(match template.Template) *template.Template { return &match },
 }
 
-func searchTemplateCandidatesInternal(ctx context.Context, c *client.Client, identifier string) ([]template.Template, error) {
+func searchTemplateCandidates(ctx context.Context, c *client.Client, identifier string) ([]template.Template, error) {
 	result, err := c.GetJSON[[]template.Template](ctx, types.TemplatesAll())
 	if err != nil {
 		return nil, fmt.Errorf("failed to search templates: %w", err)
@@ -358,22 +366,27 @@ func searchTemplateCandidatesInternal(ctx context.Context, c *client.Client, ide
 	if len(partialMatches) == 1 {
 		return partialMatches, nil
 	}
-	if len(partialMatches) > 1 {
-		ranked := rankFuzzyTemplateMatchesInternal(identifier, partialMatches)
-		if isConfidentBestFuzzyMatchInternal(ranked) {
-			return []template.Template{ranked[0].template}, nil
-		}
-		return topTemplatesFromRankedMatchesInternal(ranked, cmdutil.MaxPromptOptions), nil
+	candidates := result.Data
+	if len(partialMatches) > 0 {
+		candidates = partialMatches
 	}
-
-	ranked := rankFuzzyTemplateMatchesInternal(identifier, result.Data)
-	if isConfidentBestFuzzyMatchInternal(ranked) {
+	ranked := rankFuzzyTemplateMatches(identifier, candidates)
+	if len(ranked) == 0 {
+		return nil, nil
+	}
+	best := ranked[0].score
+	if best <= 110 && (len(ranked) == 1 || ranked[1].score-best >= 8) {
 		return []template.Template{ranked[0].template}, nil
 	}
-	return topTemplatesFromRankedMatchesInternal(ranked, cmdutil.MaxPromptOptions), nil
+	limit := min(cmdutil.MaxPromptOptions, len(ranked))
+	selected := make([]template.Template, 0, limit)
+	for i := range limit {
+		selected = append(selected, ranked[i].template)
+	}
+	return selected, nil
 }
 
-func selectTemplateCandidateInternal(matches []template.Template, identifier string, allowPrompt bool) (*template.Template, error) {
+func selectTemplateCandidate(matches []template.Template, identifier string, allowPrompt bool) (*template.Template, error) {
 	if len(matches) == 0 {
 		return nil, nil
 	}
@@ -381,7 +394,16 @@ func selectTemplateCandidateInternal(matches []template.Template, identifier str
 		return &matches[0], nil
 	}
 	if !allowPrompt || len(matches) > cmdutil.MaxPromptOptions {
-		return nil, fmt.Errorf("ambiguous template %q: %s", identifier, formatTemplateCandidatesInternal(matches))
+		const previewLimit = 5
+		limit := min(len(matches), previewLimit)
+		parts := make([]string, 0, limit+1)
+		for i := range limit {
+			parts = append(parts, fmt.Sprintf("%s (%s)", matches[i].Name, matches[i].ID))
+		}
+		if len(matches) > limit {
+			parts = append(parts, fmt.Sprintf("and %d more", len(matches)-limit))
+		}
+		return nil, fmt.Errorf("ambiguous template %q: %s", identifier, strings.Join(parts, ", "))
 	}
 
 	ordered := slices.Clone(matches)
@@ -396,7 +418,9 @@ func selectTemplateCandidateInternal(matches []template.Template, identifier str
 
 	options := make([]string, len(ordered))
 	for i, candidate := range ordered {
-		options[i] = templateOptionLabelInternal(candidate)
+		source := kit.Ternary(candidate.IsRemote, "remote", "local")
+		custom := kit.Ternary(candidate.IsCustom, "custom", "builtin")
+		options[i] = fmt.Sprintf("%s (id: %s, %s, %s)", candidate.Name, candidate.ID, source, custom)
 	}
 	choice, err := prompt.Select("template", options)
 	if err != nil {
@@ -405,32 +429,26 @@ func selectTemplateCandidateInternal(matches []template.Template, identifier str
 	return &ordered[choice], nil
 }
 
-func templateOptionLabelInternal(candidate template.Template) string {
-	source := kit.Ternary(candidate.IsRemote, "remote", "local")
-	custom := kit.Ternary(candidate.IsCustom, "custom", "builtin")
-	return fmt.Sprintf("%s (id: %s, %s, %s)", candidate.Name, candidate.ID, source, custom)
-}
-
-type rankedTemplateMatchInternal struct {
+type rankedTemplateMatch struct {
 	template template.Template
 	score    int
 }
 
-func rankFuzzyTemplateMatchesInternal(query string, candidates []template.Template) []rankedTemplateMatchInternal {
-	normalizedQuery := normalizeSearchTokenInternal(query)
+func rankFuzzyTemplateMatches(query string, candidates []template.Template) []rankedTemplateMatch {
+	normalizedQuery := normalizeSearchToken(query)
 	if normalizedQuery == "" {
 		return nil
 	}
 
-	ranked := make([]rankedTemplateMatchInternal, 0, len(candidates))
+	ranked := make([]rankedTemplateMatch, 0, len(candidates))
 	for _, candidate := range candidates {
-		nameScore, nameMatches := fuzzyScoreInternal(normalizedQuery, normalizeSearchTokenInternal(candidate.Name))
-		idScore, idMatches := fuzzyScoreInternal(normalizedQuery, normalizeSearchTokenInternal(candidate.ID))
+		nameScore, nameMatches := fuzzyScore(normalizedQuery, normalizeSearchToken(candidate.Name))
+		idScore, idMatches := fuzzyScore(normalizedQuery, normalizeSearchToken(candidate.ID))
 		score := 0
 		matched := false
 		switch {
 		case nameMatches && idMatches:
-			score = kit.Ternary(idScore < nameScore, idScore+10, nameScore)
+			score = min(nameScore, idScore+10)
 			matched = true
 		case nameMatches:
 			score = nameScore
@@ -440,7 +458,7 @@ func rankFuzzyTemplateMatchesInternal(query string, candidates []template.Templa
 			matched = true
 		}
 		if matched {
-			ranked = append(ranked, rankedTemplateMatchInternal{template: candidate, score: score})
+			ranked = append(ranked, rankedTemplateMatch{template: candidate, score: score})
 		}
 	}
 
@@ -456,7 +474,7 @@ func rankFuzzyTemplateMatchesInternal(query string, candidates []template.Templa
 	return ranked
 }
 
-func normalizeSearchTokenInternal(value string) string {
+func normalizeSearchToken(value string) string {
 	var builder strings.Builder
 	builder.Grow(len(value))
 	for _, r := range strings.ToLower(strings.TrimSpace(value)) {
@@ -467,7 +485,7 @@ func normalizeSearchTokenInternal(value string) string {
 	return builder.String()
 }
 
-func fuzzyScoreInternal(query, target string) (int, bool) {
+func fuzzyScore(query, target string) (int, bool) {
 	if query == "" || target == "" {
 		return 0, false
 	}
@@ -475,20 +493,20 @@ func fuzzyScoreInternal(query, target string) (int, bool) {
 		return 0, true
 	}
 	if strings.Contains(target, query) {
-		return 10 + absIntInternal(len(target)-len(query)), true
+		return 10 + absInt(len(target)-len(query)), true
 	}
-	if gap, ok := subsequenceGapPenaltyInternal(query, target); ok {
+	if gap, ok := subsequenceGapPenalty(query, target); ok {
 		return 40 + gap, true
 	}
 
-	distance := levenshteinDistanceInternal(query, target)
+	distance := levenshteinDistance(query, target)
 	if distance <= max(2, len(query)/3) {
-		return 80 + (distance * 8) + absIntInternal(len(target)-len(query)), true
+		return 80 + (distance * 8) + absInt(len(target)-len(query)), true
 	}
 	return 0, false
 }
 
-func subsequenceGapPenaltyInternal(query, target string) (int, bool) {
+func subsequenceGapPenalty(query, target string) (int, bool) {
 	queryRunes := []rune(query)
 	targetRunes := []rune(target)
 	if len(queryRunes) == 0 {
@@ -506,15 +524,13 @@ func subsequenceGapPenaltyInternal(query, target string) (int, bool) {
 		}
 		queryIndex++
 		if queryIndex == len(queryRunes) {
-			span := (index - start) + 1
-			gaps := span - len(queryRunes)
-			return gaps + absIntInternal(len(targetRunes)-len(queryRunes)), true
+			return index - start + 1 - len(queryRunes) + absInt(len(targetRunes)-len(queryRunes)), true
 		}
 	}
 	return 0, false
 }
 
-func levenshteinDistanceInternal(left, right string) int {
+func levenshteinDistance(left, right string) int {
 	leftRunes := []rune(left)
 	rightRunes := []rune(right)
 	if len(leftRunes) == 0 {
@@ -544,410 +560,344 @@ func levenshteinDistanceInternal(left, right string) int {
 	return previous[len(rightRunes)]
 }
 
-func isConfidentBestFuzzyMatchInternal(matches []rankedTemplateMatchInternal) bool {
-	if len(matches) == 0 {
-		return false
-	}
-	best := matches[0].score
-	if len(matches) == 1 {
-		return best <= 110
-	}
-	return best <= 110 && matches[1].score-best >= 8
-}
-
-func topTemplatesFromRankedMatchesInternal(matches []rankedTemplateMatchInternal, limit int) []template.Template {
-	if limit <= 0 || len(matches) == 0 {
-		return nil
-	}
-	limit = min(limit, len(matches))
-	result := make([]template.Template, 0, limit)
-	for i := range limit {
-		result = append(result, matches[i].template)
-	}
-	return result
-}
-
-func absIntInternal(value int) int {
+func absInt(value int) int {
 	return kit.Ternary(value < 0, -value, value)
 }
 
-func formatTemplateCandidatesInternal(matches []template.Template) string {
-	if len(matches) == 0 {
-		return "no matches"
+func newCreateCmd() *cobra.Command {
+	var opts struct {
+		name        string
+		file        string
+		description string
+		envFile     string
 	}
-	const previewLimit = 5
-	limit := min(len(matches), previewLimit)
-	parts := make([]string, 0, limit+1)
-	for i := range limit {
-		parts = append(parts, fmt.Sprintf("%s (%s)", matches[i].Name, matches[i].ID))
+	cmd := &cobra.Command{
+		Use:          "create",
+		Short:        "Create a new template",
+		Args:         cobra.NoArgs,
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			content, err := os.ReadFile(opts.file)
+			if err != nil {
+				return fmt.Errorf("failed to read file %s: %w", opts.file, err)
+			}
+
+			var envContent string
+			if opts.envFile != "" {
+				envData, readFileErr := os.ReadFile(opts.envFile)
+				if readFileErr != nil {
+					return fmt.Errorf("failed to read env file %s: %w", opts.envFile, readFileErr)
+				}
+				envContent = string(envData)
+			}
+
+			req := template.CreateRequest{
+				Name:        opts.name,
+				Description: opts.description,
+				Content:     string(content),
+				EnvContent:  envContent,
+			}
+
+			c, err := client.NewFromConfig()
+			if err != nil {
+				return err
+			}
+
+			return cmdutil.Run(cmd, c, cmdutil.Spec[template.Template]{
+				Method:         http.MethodPost,
+				Path:           types.Templates(),
+				Body:           req,
+				FailureMessage: "failed to create template",
+				Render: func(data template.Template) error {
+					output.Success("Template created successfully")
+					output.KeyValue("ID", data.ID)
+					output.KeyValue("Name", data.Name)
+					return nil
+				},
+			})
+		},
 	}
-	if len(matches) > limit {
-		parts = append(parts, fmt.Sprintf("and %d more", len(matches)-limit))
+	cmd.Flags().StringVar(&opts.name, "name", "", "Template name")
+	cmd.Flags().StringVar(&opts.file, "file", "", "Path to Docker Compose file")
+	cmd.Flags().StringVar(&opts.description, "description", "", "Template description")
+	cmd.Flags().StringVar(&opts.envFile, "env-file", "", "Path to environment file")
+	_ = cmd.MarkFlagRequired("name")
+	_ = cmd.MarkFlagRequired("file")
+	return cmd
+}
+
+func newUpdateCmd() *cobra.Command {
+	var opts struct {
+		name        string
+		file        string
+		description string
+		envFile     string
 	}
-	return strings.Join(parts, ", ")
-}
-
-var createCmd = &cobra.Command{
-	Use:          "create",
-	Short:        "Create a new template",
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		content, err := os.ReadFile(templateCreateFile)
-		if err != nil {
-			return fmt.Errorf("failed to read file %s: %w", templateCreateFile, err)
-		}
-
-		req := template.CreateRequest{
-			Name:        templateCreateName,
-			Description: templateCreateDescription,
-			Content:     string(content),
-		}
-
-		if templateCreateEnvFile != "" {
-			envContent, readFileErr := os.ReadFile(templateCreateEnvFile)
-			if readFileErr != nil {
-				return fmt.Errorf("failed to read env file %s: %w", templateCreateEnvFile, readFileErr)
+	cmd := &cobra.Command{
+		Use:          "update <template-id>",
+		Short:        "Update a template",
+		Args:         cobra.ExactArgs(1),
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := client.NewFromConfig()
+			if err != nil {
+				return err
 			}
-			req.EnvContent = string(envContent)
-		}
 
-		c, err := client.NewFromConfig()
-		if err != nil {
-			return err
-		}
-
-		result, err := c.PostJSON[template.Template](cmd.Context(), types.Templates(), req)
-		if err != nil {
-			return fmt.Errorf("failed to create template: %w", err)
-		}
-
-		if jsonOutput {
-			return cmdutil.PrintJSON(result.Data)
-		}
-
-		output.Success("Template created successfully")
-		output.KeyValue("ID", result.Data.ID)
-		output.KeyValue("Name", result.Data.Name)
-		return nil
-	},
-}
-
-var updateCmd = &cobra.Command{
-	Use:          "update <template-id>",
-	Short:        "Update a template",
-	Args:         cobra.ExactArgs(1),
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := client.NewFromConfig()
-		if err != nil {
-			return err
-		}
-
-		// UpdateRequest has no omitempty fields and the handler replaces the whole
-		// record, so an unset --file would otherwise wipe the compose content.
-		// Start from the stored template and overlay only what was passed.
-		current, err := fetchTemplateInternal(cmd, c, args[0])
-		if err != nil {
-			return err
-		}
-
-		req := template.UpdateRequest{
-			Name:        current.Name,
-			Description: current.Description,
-			Content:     current.Content,
-		}
-		if current.EnvContent != nil {
-			req.EnvContent = *current.EnvContent
-		}
-		if cmd.Flags().Changed("name") {
-			req.Name = templateUpdateName
-		}
-		if cmd.Flags().Changed("description") {
-			req.Description = templateUpdateDescription
-		}
-
-		if templateUpdateFile != "" {
-			content, readFileErr := os.ReadFile(templateUpdateFile)
-			if readFileErr != nil {
-				return fmt.Errorf("failed to read file %s: %w", templateUpdateFile, readFileErr)
+			// Preserve stored content and overlay only the changed flags.
+			currentResult, err := c.GetJSON[template.Template](cmd.Context(), types.Template(args[0]))
+			if err != nil {
+				return fmt.Errorf("failed to load template: %w", err)
 			}
-			req.Content = string(content)
-		}
+			current := currentResult.Data
 
-		if templateUpdateEnvFile != "" {
-			envContent, readEnvFileErr := os.ReadFile(templateUpdateEnvFile)
-			if readEnvFileErr != nil {
-				return fmt.Errorf("failed to read env file %s: %w", templateUpdateEnvFile, readEnvFileErr)
+			content := current.Content
+			envContent := kit.FromPtr(current.EnvContent)
+			if opts.file != "" {
+				contentData, readFileErr := os.ReadFile(opts.file)
+				if readFileErr != nil {
+					return fmt.Errorf("failed to read file %s: %w", opts.file, readFileErr)
+				}
+				content = string(contentData)
 			}
-			req.EnvContent = string(envContent)
-		}
 
-		result, err := c.PutJSON[template.Template](cmd.Context(), types.Template(args[0]), req)
-		if err != nil {
-			return fmt.Errorf("failed to update template: %w", err)
-		}
-
-		if jsonOutput {
-			return cmdutil.PrintJSON(result.Data)
-		}
-
-		output.Success("Template updated successfully")
-		output.KeyValue("ID", result.Data.ID)
-		output.KeyValue("Name", result.Data.Name)
-		return nil
-	},
-}
-
-var downloadCmd = &cobra.Command{
-	Use:          "download <template-id>",
-	Short:        "Download template compose file",
-	Args:         cobra.ExactArgs(1),
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := client.NewFromConfig()
-		if err != nil {
-			return err
-		}
-
-		result, err := c.PostJSON[template.Template](cmd.Context(), types.TemplateDownload(args[0]), nil)
-		if err != nil {
-			return fmt.Errorf("failed to download template: %w", err)
-		}
-
-		if templateDownloadOutput != "" {
-			dir := filepath.Dir(templateDownloadOutput)
-			if mkdirAllErr := os.MkdirAll(dir, 0o755); mkdirAllErr != nil {
-				return fmt.Errorf("failed to create directory %s: %w", dir, mkdirAllErr)
+			if opts.envFile != "" {
+				envData, readEnvFileErr := os.ReadFile(opts.envFile)
+				if readEnvFileErr != nil {
+					return fmt.Errorf("failed to read env file %s: %w", opts.envFile, readEnvFileErr)
+				}
+				envContent = string(envData)
 			}
-			if writeFileErr := os.WriteFile(templateDownloadOutput, []byte(result.Data.Content), 0o600); writeFileErr != nil {
-				return fmt.Errorf("failed to write file %s: %w", templateDownloadOutput, writeFileErr)
+
+			req := template.UpdateRequest{
+				Name:        kit.Ternary(cmd.Flags().Changed("name"), opts.name, current.Name),
+				Description: kit.Ternary(cmd.Flags().Changed("description"), opts.description, current.Description),
+				Content:     content,
+				EnvContent:  envContent,
 			}
-			output.Success("Template downloaded to %s", templateDownloadOutput)
-			return nil
-		}
 
-		_, _ = fmt.Fprint(output.Stdout(), result.Data.Content)
-		return nil
-	},
-}
-
-var defaultsSaveCmd = &cobra.Command{
-	Use:          "save",
-	Short:        "Save default templates",
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		content, err := os.ReadFile(templateDefaultsSaveFile)
-		if err != nil {
-			return fmt.Errorf("failed to read file %s: %w", templateDefaultsSaveFile, err)
-		}
-
-		req := template.SaveDefaultTemplatesRequest{
-			ComposeContent: string(content),
-		}
-
-		if templateDefaultsEnvFile != "" {
-			envContent, readFileErr := os.ReadFile(templateDefaultsEnvFile)
-			if readFileErr != nil {
-				return fmt.Errorf("failed to read env file %s: %w", templateDefaultsEnvFile, readFileErr)
-			}
-			req.EnvContent = string(envContent)
-		}
-
-		c, err := client.NewFromConfig()
-		if err != nil {
-			return err
-		}
-
-		return cmdutil.RunPostAction[base.MessageResponse](cmd, c, cmdutil.PostActionSpec{
-			Path:           types.TemplatesDefault(),
-			Body:           req,
-			FailureMessage: "failed to save default templates",
-			SuccessMessage: "Default templates saved successfully",
-			JSON:           jsonOutput,
-		})
-	},
-}
-
-var registriesUpdateCmd = &cobra.Command{
-	Use:          "update <registry-id>",
-	Short:        "Update a template registry",
-	Args:         cobra.ExactArgs(1),
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		if templateRegUpdateEnabled && templateRegUpdateDisabled {
-			return errors.New("--enabled and --disabled cannot be used together")
-		}
-
-		c, err := client.NewFromConfig()
-		if err != nil {
-			return err
-		}
-
-		// Every field on UpdateRegistryRequest is required and the handler does a
-		// full replace, so start from the current registry and overlay only the
-		// flags that were actually passed.
-		current, err := fetchTemplateRegistryInternal(cmd, c, args[0])
-		if err != nil {
-			return err
-		}
-
-		req := template.UpdateRegistryRequest{
-			Name:        current.Name,
-			URL:         current.URL,
-			Description: current.Description,
-			Enabled:     current.Enabled,
-		}
-		if cmd.Flags().Changed("name") {
-			req.Name = templateRegUpdateName
-		}
-		if cmd.Flags().Changed("url") {
-			req.URL = templateRegUpdateURL
-		}
-		if cmd.Flags().Changed("description") {
-			req.Description = templateRegUpdateDesc
-		}
-		if templateRegUpdateEnabled {
-			req.Enabled = true
-		}
-		if templateRegUpdateDisabled {
-			req.Enabled = false
-		}
-
-		// The handler answers with a plain message, not the updated registry.
-		result, err := c.PutJSON[base.MessageResponse](cmd.Context(), types.TemplateRegistry(args[0]), req)
-		if err != nil {
-			return fmt.Errorf("failed to update registry: %w", err)
-		}
-
-		if jsonOutput {
-			return cmdutil.PrintJSON(result.Data)
-		}
-
-		output.Success("Template registry updated successfully")
-		output.KeyValue("ID", current.ID)
-		output.KeyValue("Name", req.Name)
-		return nil
-	},
-}
-
-// fetchTemplateInternal loads a single template, including its content.
-func fetchTemplateInternal(cmd *cobra.Command, c *client.Client, id string) (template.Template, error) {
-	result, err := c.GetJSON[template.Template](cmd.Context(), types.Template(id))
-	if err != nil {
-		return template.Template{}, fmt.Errorf("failed to load template: %w", err)
+			return cmdutil.Run(cmd, c, cmdutil.Spec[template.Template]{
+				Method:         http.MethodPut,
+				Path:           types.Template(args[0]),
+				Body:           req,
+				FailureMessage: "failed to update template",
+				Render: func(data template.Template) error {
+					output.Success("Template updated successfully")
+					output.KeyValue("ID", data.ID)
+					output.KeyValue("Name", data.Name)
+					return nil
+				},
+			})
+		},
 	}
-	return result.Data, nil
+	cmd.Flags().StringVar(&opts.name, "name", "", "Template name")
+	cmd.Flags().StringVar(&opts.file, "file", "", "Path to Docker Compose file")
+	cmd.Flags().StringVar(&opts.description, "description", "", "Template description")
+	cmd.Flags().StringVar(&opts.envFile, "env-file", "", "Path to environment file")
+	return cmd
 }
 
-// fetchTemplateRegistryInternal looks a registry up by ID. The API exposes no
-// get-by-id route for template registries, so this filters the list.
-func fetchTemplateRegistryInternal(cmd *cobra.Command, c *client.Client, id string) (template.TemplateRegistry, error) {
-	listed, err := c.GetJSON[[]template.TemplateRegistry](cmd.Context(), types.TemplatesRegistries())
-	if err != nil {
-		return template.TemplateRegistry{}, fmt.Errorf("failed to load registry: %w", err)
+func newDownloadCmd() *cobra.Command {
+	var opts struct{ outputFile, legacyOutput string }
+	cmd := &cobra.Command{
+		Use:          "download <template-id>",
+		Short:        "Download template compose file",
+		Example:      "  arcane templates download <template-id> --output-file compose.yaml\n  arcane templates download <template-id> -o compose.yaml",
+		Args:         cobra.ExactArgs(1),
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := client.NewFromConfig()
+			if err != nil {
+				return err
+			}
+			result, err := c.PostJSON[jsontext.Value](cmd.Context(), types.TemplateDownload(args[0]), nil)
+			if err != nil {
+				return fmt.Errorf("failed to download template: %w", err)
+			}
+			jsonMode := cmdutil.JSONOutputEnabled(cmd) || opts.legacyOutput == "json"
+			outputFile := cmp.Or(opts.outputFile, kit.Ternary(slices.Contains([]string{"text", "json"}, opts.legacyOutput), "", opts.legacyOutput))
+			if jsonMode && outputFile == "" {
+				if len(result.Data) == 0 {
+					return cmdutil.PrintJSON(nil)
+				}
+				return cmdutil.PrintRawJSON(result.Data)
+			}
+			var data template.Template
+			if decodeErr := json.Unmarshal(result.Data, &data); decodeErr != nil {
+				return fmt.Errorf("failed to download template: failed to decode response: %w", decodeErr)
+			}
+			if outputFile != "" {
+				dir := filepath.Dir(outputFile)
+				if mkdirErr := os.MkdirAll(dir, 0o755); mkdirErr != nil {
+					return fmt.Errorf("failed to create directory %s: %w", dir, mkdirErr)
+				}
+				if writeErr := os.WriteFile(outputFile, []byte(data.Content), 0o600); writeErr != nil {
+					return fmt.Errorf("failed to write file %s: %w", outputFile, writeErr)
+				}
+				if jsonMode {
+					return cmdutil.PrintJSON(struct {
+						Path  string `json:"path"`
+						Bytes int    `json:"bytes"`
+					}{Path: outputFile, Bytes: len(data.Content)})
+				}
+				output.Success("Template downloaded to %s", outputFile)
+				return nil
+			}
+			_, writeErr := fmt.Fprint(output.Stdout(), data.Content)
+			return writeErr
+		},
 	}
+	cmd.Flags().StringVarP(&opts.outputFile, "output-file", "o", "", "Output file path")
+	cmd.Flags().StringVar(&opts.legacyOutput, "output", "", "Output file path")
+	_ = cmd.Flags().MarkDeprecated("output", "use --output-file or -o")
+	return cmd
+}
 
-	for _, registry := range listed.Data {
-		if registry.ID == id {
-			return registry, nil
-		}
+func newDefaultsSaveCmd() *cobra.Command {
+	var opts struct {
+		saveFile string
+		envFile  string
 	}
-	return template.TemplateRegistry{}, fmt.Errorf("template registry %q not found", id)
+	cmd := &cobra.Command{
+		Use:          "save",
+		Short:        "Save default templates",
+		Args:         cobra.NoArgs,
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			content, err := os.ReadFile(opts.saveFile)
+			if err != nil {
+				return fmt.Errorf("failed to read file %s: %w", opts.saveFile, err)
+			}
+
+			var envContent string
+			if opts.envFile != "" {
+				envData, readFileErr := os.ReadFile(opts.envFile)
+				if readFileErr != nil {
+					return fmt.Errorf("failed to read env file %s: %w", opts.envFile, readFileErr)
+				}
+				envContent = string(envData)
+			}
+
+			req := template.SaveDefaultTemplatesRequest{
+				ComposeContent: string(content),
+				EnvContent:     envContent,
+			}
+
+			c, err := client.NewFromConfig()
+			if err != nil {
+				return err
+			}
+
+			return cmdutil.Run(cmd, c, cmdutil.Spec[base.MessageResponse]{
+				Method:         http.MethodPost,
+				Path:           types.TemplatesDefault(),
+				Body:           req,
+				FailureMessage: "failed to save default templates",
+				Render: func(base.MessageResponse) error {
+					output.Success("%s", "Default templates saved successfully")
+					return nil
+				},
+			})
+		},
+	}
+	cmd.Flags().StringVar(&opts.saveFile, "file", "", "Path to compose content file")
+	cmd.Flags().StringVar(&opts.envFile, "env-file", "", "Path to environment content file")
+	_ = cmd.MarkFlagRequired("file")
+	return cmd
 }
 
-var fetchCmd = &cobra.Command{
-	Use:          "fetch",
-	Short:        "Fetch remote template registries",
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := client.NewFromConfig()
-		if err != nil {
-			return err
-		}
+func newRegistriesUpdateCmd() *cobra.Command {
+	var opts struct {
+		name     string
+		url      string
+		desc     string
+		enabled  bool
+		disabled bool
+	}
+	cmd := &cobra.Command{
+		Use:          "update <registry-id>",
+		Short:        "Update a template registry",
+		Args:         cobra.ExactArgs(1),
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := client.NewFromConfig()
+			if err != nil {
+				return err
+			}
 
-		path := cmdutil.AppendQuery(types.TemplateFetch(), url.Values{"url": []string{templateFetchURL}})
-		result, err := c.GetJSON[template.RemoteRegistry](cmd.Context(), path)
-		if err != nil {
-			return fmt.Errorf("failed to fetch templates: %w", err)
-		}
+			// Preserve required registry fields and overlay only the changed flags.
+			listed, err := c.GetJSON[[]template.TemplateRegistry](cmd.Context(), types.TemplatesRegistries())
+			if err != nil {
+				return fmt.Errorf("failed to load registry: %w", err)
+			}
+			index := slices.IndexFunc(listed.Data, func(registry template.TemplateRegistry) bool { return registry.ID == args[0] })
+			if index < 0 {
+				return fmt.Errorf("template registry %q not found", args[0])
+			}
+			current := listed.Data[index]
 
-		if jsonOutput {
-			return cmdutil.PrintJSON(result.Data)
-		}
+			req := template.UpdateRegistryRequest{
+				Name:        kit.Ternary(cmd.Flags().Changed("name"), opts.name, current.Name),
+				URL:         kit.Ternary(cmd.Flags().Changed("url"), opts.url, current.URL),
+				Description: kit.Ternary(cmd.Flags().Changed("description"), opts.desc, current.Description),
+				Enabled: cmd.Flags().Changed("enabled") && opts.enabled ||
+					cmd.Flags().Changed("disabled") && !opts.disabled ||
+					!cmd.Flags().Changed("enabled") && !cmd.Flags().Changed("disabled") && current.Enabled,
+			}
 
-		output.Success("Remote templates fetched successfully")
-		return nil
-	},
+			// The handler answers with a plain message, not the updated registry.
+			return cmdutil.Run(cmd, c, cmdutil.Spec[base.MessageResponse]{
+				Method:         http.MethodPut,
+				Path:           types.TemplateRegistry(args[0]),
+				Body:           req,
+				FailureMessage: "failed to update registry",
+				Render: func(base.MessageResponse) error {
+					output.Success("Template registry updated successfully")
+					output.KeyValue("ID", current.ID)
+					output.KeyValue("Name", req.Name)
+					return nil
+				},
+			})
+		},
+	}
+	cmd.Flags().StringVar(&opts.name, "name", "", "Registry name")
+	cmd.Flags().StringVar(&opts.url, "url", "", "Registry URL")
+	cmd.Flags().StringVar(&opts.desc, "description", "", "Registry description")
+	cmd.Flags().BoolVar(&opts.enabled, "enabled", false, "Enable registry")
+	cmd.Flags().BoolVar(&opts.disabled, "disabled", false, "Disable registry")
+	_ = cmd.Flags().MarkDeprecated("disabled", "use --enabled=false")
+	cmd.PreRunE = func(cmd *cobra.Command, _ []string) error { return cmdutil.ExclusiveFlags(cmd, "enabled", "disabled") }
+	return cmd
 }
 
-func init() {
-	TemplatesCmd.AddCommand(listCmd)
-	TemplatesCmd.AddCommand(defaultCmd)
-	TemplatesCmd.AddCommand(contentCmd)
-	TemplatesCmd.AddCommand(registriesCmd)
-	TemplatesCmd.AddCommand(deleteCmd)
-	TemplatesCmd.AddCommand(getCmd)
-	TemplatesCmd.AddCommand(createCmd)
-	TemplatesCmd.AddCommand(updateCmd)
-	TemplatesCmd.AddCommand(downloadCmd)
-	TemplatesCmd.AddCommand(fetchCmd)
-	defaultCmd.AddCommand(defaultsSaveCmd)
-	registriesCmd.AddCommand(registriesUpdateCmd)
-	registriesCmd.AddCommand(deleteRegistryCmd)
+func newFetchCmd() *cobra.Command {
+	var opts struct {
+		url string
+	}
+	cmd := &cobra.Command{
+		Use:          "fetch",
+		Short:        "Fetch remote template registries",
+		Args:         cobra.NoArgs,
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := client.NewFromConfig()
+			if err != nil {
+				return err
+			}
 
-	listCmd.Flags().IntVarP(&limitFlag, "limit", "n", 20, "Number of templates to show")
-	listCmd.Flags().IntVar(&startFlag, "start", 0, "Offset for pagination")
-	listCmd.Flags().BoolVarP(&templateListAll, "all", "a", false, "List all templates (including remote)")
-	listCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
-	defaultCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
-	contentCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
-	registriesCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
-
-	deleteCmd.Flags().BoolVarP(&forceFlag, "force", "f", false, "Force deletion without confirmation")
-	deleteCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
-
-	deleteRegistryCmd.Flags().BoolVarP(&forceFlag, "force", "f", false, "Force deletion without confirmation")
-	deleteRegistryCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
-
-	// get command flags
-	getCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
-
-	// create command flags
-	createCmd.Flags().StringVar(&templateCreateName, "name", "", "Template name")
-	createCmd.Flags().StringVar(&templateCreateFile, "file", "", "Path to Docker Compose file")
-	createCmd.Flags().StringVar(&templateCreateDescription, "description", "", "Template description")
-	createCmd.Flags().StringVar(&templateCreateEnvFile, "env-file", "", "Path to environment file")
-	createCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
-	_ = createCmd.MarkFlagRequired("name")
-	_ = createCmd.MarkFlagRequired("file")
-
-	// update command flags
-	updateCmd.Flags().StringVar(&templateUpdateName, "name", "", "Template name")
-	updateCmd.Flags().StringVar(&templateUpdateFile, "file", "", "Path to Docker Compose file")
-	updateCmd.Flags().StringVar(&templateUpdateDescription, "description", "", "Template description")
-	updateCmd.Flags().StringVar(&templateUpdateEnvFile, "env-file", "", "Path to environment file")
-	updateCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
-
-	// download command flags
-	downloadCmd.Flags().StringVarP(&templateDownloadOutput, "output", "o", "", "Output file path")
-	downloadCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
-
-	// defaults-save command flags
-	defaultsSaveCmd.Flags().StringVar(&templateDefaultsSaveFile, "file", "", "Path to compose content file")
-	defaultsSaveCmd.Flags().StringVar(&templateDefaultsEnvFile, "env-file", "", "Path to environment content file")
-	defaultsSaveCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
-	_ = defaultsSaveCmd.MarkFlagRequired("file")
-
-	// registries update command flags
-	registriesUpdateCmd.Flags().StringVar(&templateRegUpdateName, "name", "", "Registry name")
-	registriesUpdateCmd.Flags().StringVar(&templateRegUpdateURL, "url", "", "Registry URL")
-	registriesUpdateCmd.Flags().StringVar(&templateRegUpdateDesc, "description", "", "Registry description")
-	registriesUpdateCmd.Flags().BoolVar(&templateRegUpdateEnabled, "enabled", false, "Enable registry")
-	registriesUpdateCmd.Flags().BoolVar(&templateRegUpdateDisabled, "disabled", false, "Disable registry")
-	registriesUpdateCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
-
-	// fetch command flags
-	fetchCmd.Flags().StringVar(&templateFetchURL, "url", "", "Registry URL to fetch templates from (required)")
-	_ = fetchCmd.MarkFlagRequired("url")
-	fetchCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
+			path := cmdutil.AppendQuery(types.TemplateFetch(), url.Values{"url": []string{opts.url}})
+			return cmdutil.Run(cmd, c, cmdutil.Spec[template.RemoteRegistry]{
+				Method:         http.MethodGet,
+				Path:           path,
+				FailureMessage: "failed to fetch templates",
+				Render: func(data template.RemoteRegistry) error {
+					output.Success("Remote templates fetched successfully")
+					return nil
+				},
+			})
+		},
+	}
+	cmd.Flags().StringVar(&opts.url, "url", "", "Registry URL to fetch templates from (required)")
+	_ = cmd.MarkFlagRequired("url")
+	return cmd
 }

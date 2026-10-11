@@ -318,7 +318,7 @@ func TestEventService_GetEventSeverityCounts(t *testing.T) {
 
 	counts, err := svc.GetEventSeverityCounts(ctx)
 	require.NoError(t, err)
-	require.Equal(t, EventSeverityCounts{Total: 4, Info: 2, Success: 1, Warning: 0, Error: 1}, counts)
+	require.Equal(t, event.SeverityCounts{Total: 4, Info: 2, Success: 1, Warning: 0, Error: 1}, counts)
 }
 
 func TestEventService_ListEventsPaginated_TypeCategoryFilter(t *testing.T) {

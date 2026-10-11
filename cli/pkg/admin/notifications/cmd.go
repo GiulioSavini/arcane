@@ -9,7 +9,6 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/getarcaneapp/arcane/types/v2/base"
 	"github.com/getarcaneapp/arcane/types/v2/notification"
 	"github.com/spf13/cobra"
 
@@ -18,200 +17,216 @@ import (
 	"github.com/getarcaneapp/arcane/cli/v2/internal/types"
 )
 
-var (
-	jsonOutput     bool
-	notifForceFlag bool
-)
-
-// NotificationsCmd is the parent command for notification operations
-var NotificationsCmd = &cobra.Command{
-	Use:     "notifications",
-	Aliases: []string{"notif", "notify"},
-	Short:   "Manage notifications",
+// Command is the parent command for notification operations
+func Command() *cobra.Command {
+	command := &cobra.Command{
+		Use:     "notifications",
+		Aliases: []string{"notif", "notify"},
+		Short:   "Manage notifications",
+	}
+	cmdutil.SetScope(cmdutil.ScopeResource, command)
+	command.AddCommand(newSettingsCmd())
+	command.AddCommand(newTestProviderCmd())
+	return command
 }
 
-var settingsCmd = &cobra.Command{
-	Use:   "settings",
-	Short: "Manage notification settings",
+func newSettingsCmd() *cobra.Command {
+	command := &cobra.Command{
+		Use:   "settings",
+		Short: "Manage notification settings",
+	}
+	command.AddCommand(newSettingsGetCmd())
+	command.AddCommand(newSettingsSetCmd())
+	command.AddCommand(newSettingsDeleteCmd())
+	return command
 }
 
-var settingsGetCmd = &cobra.Command{
-	Use:          "get",
-	Short:        "Get notification settings",
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := cmdutil.ClientFromCommand(cmd)
-		if err != nil {
-			return err
-		}
-
-		result, err := c.DoJSON[[]notification.Response](cmd.Context(), http.MethodGet, types.NotificationsSettings(c.EnvID()), nil)
-		if err != nil {
-			return fmt.Errorf("failed to get settings: %w", err)
-		}
-
-		if jsonOutput {
-			return cmdutil.PrintJSON(result)
-		}
-
-		headers := []string{"ID", "PROVIDER", "ENABLED"}
-		rows := make([][]string, len(result))
-		for i, setting := range result {
-			rows[i] = []string{
-				strconv.FormatUint(uint64(setting.ID), 10),
-				string(setting.Provider),
-				strconv.FormatBool(setting.Enabled),
-			}
-		}
-
-		if tableErr := cmdutil.PrintTable(cmd, headers, rows, cmdutil.TableSummary{Resource: "notification settings"}); tableErr != nil {
-			return tableErr
-		}
-		return nil
-	},
-}
-
-var settingsDeleteCmd = &cobra.Command{
-	Use:          "delete <provider>",
-	Short:        "Delete notification provider settings",
-	Args:         cobra.ExactArgs(1),
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		if !notifForceFlag {
-			confirmed, err := cmdutil.Confirm(cmd, fmt.Sprintf("Are you sure you want to delete notification settings for %s?", args[0]))
+func newSettingsGetCmd() *cobra.Command {
+	command := &cobra.Command{
+		Use:          "get",
+		Short:        "Get notification settings",
+		SilenceUsage: true,
+		Args:         cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := cmdutil.ClientFromCommand(cmd)
 			if err != nil {
 				return err
 			}
-			if !confirmed {
-				_, _ = fmt.Fprintln(output.Stdout(), "Cancelled")
-				return nil
-			}
-		}
 
-		c, err := cmdutil.ClientFromCommand(cmd)
-		if err != nil {
-			return err
-		}
-
-		result, err := c.DeleteJSON[base.MessageResponse](cmd.Context(), types.NotificationSettingsProvider(c.EnvID(), args[0]))
-		if err != nil {
-			return fmt.Errorf("failed to delete notification settings: %w", err)
-		}
-
-		if jsonOutput {
-			return cmdutil.PrintJSON(result.Data)
-		}
-
-		output.Success("Notification settings for %s deleted successfully", args[0])
-		return nil
-	},
-}
-
-var (
-	setProvider string
-	setEnabled  bool
-	setConfig   string
-	setFile     string
-)
-
-var settingsSetCmd = &cobra.Command{
-	Use:          "set",
-	Short:        "Create or update notification provider settings",
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		var req notification.Update
-		if setFile != "" {
-			data, err := os.ReadFile(setFile)
+			body, err := c.DoRaw(cmd.Context(), http.MethodGet, types.NotificationsSettings(c.EnvID()), nil)
 			if err != nil {
-				return fmt.Errorf("failed to read settings file: %w", err)
+				return fmt.Errorf("failed to get settings: %w", err)
 			}
-			if unmarshalErr := json.Unmarshal(data, &req); unmarshalErr != nil {
-				return fmt.Errorf("failed to parse settings file: %w", unmarshalErr)
+
+			if cmdutil.JSONOutputEnabled(cmd) {
+				return cmdutil.PrintRawJSON(body)
 			}
-		}
 
-		if cmd.Flags().Changed("provider") {
-			req.Provider = notification.Provider(setProvider)
-		}
-		if cmd.Flags().Changed("enabled") {
-			req.Enabled = setEnabled
-		}
-		if cmd.Flags().Changed("config") {
-			if err := json.Unmarshal([]byte(setConfig), &req.Config); err != nil {
-				return fmt.Errorf("failed to parse --config JSON: %w", err)
+			var result []notification.Response
+			if decodeErr := json.Unmarshal(body, &result); decodeErr != nil {
+				return fmt.Errorf("failed to get settings: %w", decodeErr)
 			}
-		}
 
-		if req.Provider == "" {
-			return errors.New("provider is required (use --provider or --file)")
-		}
-		if req.Config == nil {
-			return errors.New("config is required (use --config or --file)")
-		}
+			headers := []string{"ID", "PROVIDER", "ENABLED"}
+			rows := make([][]string, len(result))
+			for i, setting := range result {
+				rows[i] = []string{
+					strconv.FormatUint(uint64(setting.ID), 10),
+					string(setting.Provider),
+					strconv.FormatBool(setting.Enabled),
+				}
+			}
 
-		c, err := cmdutil.ClientFromCommand(cmd)
-		if err != nil {
-			return err
-		}
-
-		result, err := c.DoJSON[notification.Response](cmd.Context(), http.MethodPost, types.NotificationsSettings(c.EnvID()), req)
-		if err != nil {
-			return fmt.Errorf("failed to save notification settings: %w", err)
-		}
-
-		if jsonOutput {
-			return cmdutil.PrintJSON(result)
-		}
-
-		output.Success("Notification settings for %s saved successfully", result.Provider)
-		output.KeyValue("ID", strconv.FormatUint(uint64(result.ID), 10))
-		output.KeyValue("Enabled", strconv.FormatBool(result.Enabled))
-		return nil
-	},
+			if tableErr := cmdutil.PrintTable(cmd, headers, rows, cmdutil.TableSummary{Resource: "notification settings"}); tableErr != nil {
+				return tableErr
+			}
+			return nil
+		},
+	}
+	cmdutil.SetScope(cmdutil.ScopeRead, command)
+	return command
 }
 
-var testProviderCmd = &cobra.Command{
-	Use:          "test <provider>",
-	Short:        "Test a notification provider",
-	Args:         cobra.ExactArgs(1),
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := cmdutil.ClientFromCommand(cmd)
-		if err != nil {
-			return err
-		}
-
-		return cmdutil.RunPostAction[notification.TestResponse](cmd, c, cmdutil.PostActionSpec{
-			Path:           types.NotificationsTestProvider(c.EnvID(), args[0]),
-			FailureMessage: "failed to test notification provider",
-			SuccessMessage: fmt.Sprintf("Notification test for %s successful", args[0]),
-			JSON:           jsonOutput,
-		})
-	},
+func newSettingsDeleteCmd() *cobra.Command {
+	var opts struct {
+		force bool
+	}
+	command := &cobra.Command{
+		Use:          "delete <provider>",
+		Short:        "Delete notification provider settings",
+		Args:         cobra.ExactArgs(1),
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := cmdutil.ClientFromCommand(cmd)
+			if err != nil {
+				return err
+			}
+			return cmdutil.RunDelete(cmd, c, cmdutil.DeleteSpec{
+				Force:          opts.force,
+				Prompt:         fmt.Sprintf("Are you sure you want to delete notification settings for %s?", args[0]),
+				Path:           types.NotificationSettingsProvider(c.EnvID(), args[0]),
+				FailureMessage: "failed to delete notification settings",
+				SuccessMessage: fmt.Sprintf("Notification settings for %s deleted successfully", args[0]),
+			})
+		},
+	}
+	cmdutil.SetResource(providerRef, command)
+	command.Flags().BoolVarP(&opts.force, "force", "f", false, "Force deletion without confirmation")
+	return command
 }
 
-func init() {
-	cmdutil.SetResource(providerRef, settingsDeleteCmd, testProviderCmd)
-	cmdutil.SetScope(cmdutil.ScopeResource, NotificationsCmd)
-	cmdutil.SetScope(cmdutil.ScopeRead, settingsGetCmd)
-	cmdutil.SetScope(cmdutil.ScopeFleet, settingsSetCmd)
-	NotificationsCmd.AddCommand(settingsCmd)
-	NotificationsCmd.AddCommand(testProviderCmd)
+func newSettingsSetCmd() *cobra.Command {
+	var opts struct {
+		provider notification.Provider
+		enabled  bool
+		config   string
+		file     string
+	}
+	command := &cobra.Command{
+		Use:   "set",
+		Short: "Create or update notification provider settings",
+		Example: "  arcane admin notifications settings set --file provider.json\n" +
+			"  arcane admin notifications settings set --provider generic --enabled --provider-config '{\"webhookUrl\":\"https://example.com/notify\"}'",
+		SilenceUsage: true,
+		Args:         cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			var req notification.Update
+			if opts.file != "" {
+				data, err := os.ReadFile(opts.file)
+				if err != nil {
+					return fmt.Errorf("failed to read settings file: %w", err)
+				}
+				if unmarshalErr := json.Unmarshal(data, &req); unmarshalErr != nil {
+					return fmt.Errorf("failed to parse settings file: %w", unmarshalErr)
+				}
+			}
 
-	settingsCmd.AddCommand(settingsGetCmd)
-	settingsCmd.AddCommand(settingsSetCmd)
-	settingsCmd.AddCommand(settingsDeleteCmd)
+			if cmd.Flags().Changed("provider") {
+				req.Provider = opts.provider
+			}
+			if cmd.Flags().Changed("enabled") {
+				req.Enabled = opts.enabled
+			}
+			if cmd.Flags().Changed("provider-config") || cmd.Flags().Changed("config") {
+				configFlag := "--config"
+				if cmd.Flags().Changed("provider-config") {
+					configFlag = "--provider-config"
+				}
+				if configErr := json.Unmarshal([]byte(opts.config), &req.Config); configErr != nil {
+					return fmt.Errorf("failed to parse %s JSON: %w", configFlag, configErr)
+				}
+			}
 
-	settingsGetCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
+			if req.Provider == "" {
+				return errors.New("provider is required (use --provider or --file)")
+			}
+			if req.Config == nil {
+				return errors.New("config is required (use --provider-config or --file)")
+			}
 
-	settingsSetCmd.Flags().StringVar(&setProvider, "provider", "", "Notification provider (e.g. discord, email, telegram)")
-	settingsSetCmd.Flags().BoolVar(&setEnabled, "enabled", false, "Enable the provider")
-	settingsSetCmd.Flags().StringVar(&setConfig, "config", "", "Provider configuration as a JSON object")
-	settingsSetCmd.Flags().StringVar(&setFile, "file", "", "Path to a JSON file with provider, enabled, and config fields")
-	settingsSetCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
-	settingsDeleteCmd.Flags().BoolVarP(&notifForceFlag, "force", "f", false, "Force deletion without confirmation")
-	settingsDeleteCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
-	testProviderCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
+			c, err := cmdutil.ClientFromCommand(cmd)
+			if err != nil {
+				return err
+			}
+
+			body, err := c.DoRaw(cmd.Context(), http.MethodPost, types.NotificationsSettings(c.EnvID()), req)
+			if err != nil {
+				return fmt.Errorf("failed to save notification settings: %w", err)
+			}
+
+			if cmdutil.JSONOutputEnabled(cmd) {
+				return cmdutil.PrintRawJSON(body)
+			}
+
+			var result notification.Response
+			if decodeErr := json.Unmarshal(body, &result); decodeErr != nil {
+				return fmt.Errorf("failed to save notification settings: %w", decodeErr)
+			}
+			output.Success("Notification settings for %s saved successfully", result.Provider)
+			output.KeyValue("ID", strconv.FormatUint(uint64(result.ID), 10))
+			output.KeyValue("Enabled", strconv.FormatBool(result.Enabled))
+			return nil
+		},
+	}
+	cmdutil.SetScope(cmdutil.ScopeFleet, command)
+	cmdutil.EnumVarP(command, command.Flags(), &opts.provider, "provider", "", "", "Notification provider",
+		notification.NotificationProviderDiscord, notification.NotificationProviderEmail, notification.NotificationProviderTelegram,
+		notification.NotificationProviderSignal, notification.NotificationProviderSlack, notification.NotificationProviderNtfy,
+		notification.NotificationProviderPushover, notification.NotificationProviderGotify, notification.NotificationProviderMatrix,
+		notification.NotificationProviderGoogleChat, notification.NotificationProviderGeneric)
+	command.Flags().BoolVar(&opts.enabled, "enabled", false, "Enable the provider")
+	command.Flags().StringVar(&opts.config, "provider-config", "", "Provider configuration as a JSON object")
+	command.Flags().StringVar(&opts.config, "config", "", "Provider configuration as a JSON object")
+	_ = command.Flags().MarkDeprecated("config", "use --provider-config")
+	command.Flags().StringVar(&opts.file, "file", "", "Path to a JSON file with provider, enabled, and config fields")
+	return command
+}
+
+func newTestProviderCmd() *cobra.Command {
+	command := &cobra.Command{
+		Use:          "test <provider>",
+		Short:        "Test a notification provider",
+		Args:         cobra.ExactArgs(1),
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := cmdutil.ClientFromCommand(cmd)
+			if err != nil {
+				return err
+			}
+
+			return cmdutil.Run(cmd, c, cmdutil.Spec[notification.TestResponse]{
+				Method:         http.MethodPost,
+				Path:           types.NotificationsTestProvider(c.EnvID(), args[0]),
+				FailureMessage: "failed to test notification provider",
+				Render: func(notification.TestResponse) error {
+					output.Success("%s", fmt.Sprintf("Notification test for %s successful", args[0]))
+					return nil
+				},
+			})
+		},
+	}
+	cmdutil.SetResource(providerRef, command)
+	return command
 }
 
 var providerRef = cmdutil.ResourceRef[notification.Response, notification.Response]{
@@ -222,6 +237,7 @@ var providerRef = cmdutil.ResourceRef[notification.Response, notification.Respon
 	Matches: func(item notification.Response, lower, original string) bool {
 		return strings.EqualFold(string(item.Provider), original)
 	},
-	Label:   func(item notification.Response) string { return string(item.Provider) },
-	Promote: func(item notification.Response) *notification.Response { return &item },
+	Label:        func(item notification.Response) string { return string(item.Provider) },
+	Promote:      func(item notification.Response) *notification.Response { return &item },
+	IdentifierOf: func(item notification.Response) string { return string(item.Provider) },
 }

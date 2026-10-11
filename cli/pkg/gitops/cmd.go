@@ -1,529 +1,473 @@
 package gitops
 
 import (
+	"cmp"
 	"fmt"
+	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 
 	"github.com/getarcaneapp/arcane/types/v2/gitops"
 	"github.com/spf13/cobra"
+	"go.getarcane.app/kit/pkg"
 
 	"github.com/getarcaneapp/arcane/cli/v2/internal/cmdutil"
 	"github.com/getarcaneapp/arcane/cli/v2/internal/output"
-	"github.com/getarcaneapp/arcane/cli/v2/internal/prompt"
 	"github.com/getarcaneapp/arcane/cli/v2/internal/types"
 )
 
-var (
-	limitFlag       int
-	startFlag       int
-	allFlag         bool
-	forceFlag       bool
-	jsonOutput      bool
-	gitopsFilesPath string
-)
-
-var (
-	gitopsUpdateName        string
-	gitopsUpdateRepoID      string
-	gitopsUpdateBranch      string
-	gitopsUpdateComposePath string
-	gitopsUpdateProjectName string
-	gitopsImportProjectName string
-	gitopsUpdateAutoSync    bool
-	gitopsUpdateInterval    int
-)
-
-// GitopsCmd is the parent command for gitops sync operations
-var GitopsCmd = &cobra.Command{
-	Use:     "gitops",
-	Aliases: []string{"gitops-syncs", "gs"},
-	Short:   "Manage GitOps syncs",
+// Command is the parent command for gitops sync operations
+func Command() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:     "gitops",
+		Aliases: []string{"gitops-syncs", "gs"},
+		Short:   "Manage GitOps syncs",
+	}
+	cmdutil.SetScope(cmdutil.ScopeResource, cmd)
+	cmd.AddCommand(newListCmd())
+	cmd.AddCommand(newCreateCmd())
+	cmd.AddCommand(newGetCmd())
+	cmd.AddCommand(newUpdateCmd())
+	cmd.AddCommand(newDeleteCmd())
+	cmd.AddCommand(newStatusCmd())
+	cmd.AddCommand(newSyncCmd())
+	cmd.AddCommand(newFilesCmd())
+	cmd.AddCommand(newImportCmd())
+	return cmd
 }
 
-var listCmd = &cobra.Command{
-	Use:          "list",
-	Aliases:      []string{"ls"},
-	Short:        "List GitOps syncs",
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := cmdutil.ClientFromCommand(cmd)
-		if err != nil {
-			return err
-		}
-
-		return cmdutil.RunList(cmd, c, cmdutil.ListSpec[gitops.GitOpsSync]{
-			Resource: "gitops syncs",
-			Endpoint: types.GitOpsSyncs(c.EnvID()),
-			Params:   cmdutil.ListParams{Resource: "gitops-syncs", Limit: limitFlag, FallbackDefault: 20, Start: startFlag, All: allFlag},
-			JSON:     jsonOutput,
-			Headers:  []string{"ID", "NAME", "BRANCH", "AUTO-SYNC", "LAST STATUS", "LAST SYNC"},
-			Row: func(sync gitops.GitOpsSync) []string {
-				autoSync := "false"
-				if sync.AutoSync {
-					autoSync = "true"
-				}
-				lastStatus := "-"
-				if sync.LastSyncStatus != nil {
-					lastStatus = *sync.LastSyncStatus
-				}
-				lastSync := "-"
-				if sync.LastSyncAt != nil {
-					lastSync = sync.LastSyncAt.Format("2006-01-02 15:04:05")
-				}
-				return []string{
-					sync.ID,
-					sync.Name,
-					sync.Branch,
-					autoSync,
-					lastStatus,
-					lastSync,
-				}
-			},
-		})
-	},
-}
-
-var createCmd = &cobra.Command{
-	Use:          "create",
-	Short:        "Create a new GitOps sync",
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := cmdutil.ClientFromCommand(cmd)
-		if err != nil {
-			return err
-		}
-
-		name, _ := cmd.Flags().GetString("name")
-		repoID, _ := cmd.Flags().GetString("repo-id")
-		branch, _ := cmd.Flags().GetString("branch")
-		composePath, _ := cmd.Flags().GetString("compose-path")
-		autoSync, _ := cmd.Flags().GetBool("auto-sync")
-		interval, _ := cmd.Flags().GetInt("interval")
-		projectName, _ := cmd.Flags().GetString("project-name")
-
-		req := gitops.CreateSyncRequest{
-			Name:         name,
-			RepositoryID: repoID,
-			Branch:       branch,
-			ComposePath:  composePath,
-			ProjectName:  projectName,
-			AutoSync:     &autoSync,
-		}
-		if cmd.Flags().Changed("interval") {
-			req.SyncInterval = &interval
-		}
-
-		result, err := c.PostJSON[gitops.GitOpsSync](cmd.Context(), types.GitOpsSyncs(c.EnvID()), req)
-		if err != nil {
-			return fmt.Errorf("failed to create gitops sync: %w", err)
-		}
-
-		if jsonOutput {
-			return cmdutil.PrintJSON(result.Data)
-		}
-
-		output.Success("GitOps sync %s created successfully (ID: %s)", result.Data.Name, result.Data.ID)
-		return nil
-	},
-}
-
-var getCmd = &cobra.Command{
-	Use:          "get <sync-id|name>",
-	Short:        "Get GitOps sync details",
-	Args:         cobra.ExactArgs(1),
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := cmdutil.ClientFromCommand(cmd)
-		if err != nil {
-			return err
-		}
-
-		allowPrompt := !jsonOutput && prompt.IsInteractive()
-		resolved, complete, err := gitopsSyncRef.Resolve(cmd.Context(), c, args[0], allowPrompt)
-		if err != nil {
-			return err
-		}
-
-		if !complete {
-			result, getSyncErr := c.GetJSON[gitops.GitOpsSync](cmd.Context(), types.GitOpsSync(c.EnvID(), resolved.ID))
-			if getSyncErr != nil {
-				return fmt.Errorf("failed to get gitops sync: %w", getSyncErr)
+func newListCmd() *cobra.Command {
+	var opts struct {
+		limit int
+		start int
+		all   bool
+	}
+	cmd := &cobra.Command{
+		Use:          "list",
+		Aliases:      []string{"ls"},
+		Short:        "List GitOps syncs",
+		Args:         cobra.NoArgs,
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := cmdutil.ClientFromCommand(cmd)
+			if err != nil {
+				return err
 			}
-			resolved = &result.Data
-		}
 
-		if jsonOutput {
-			return cmdutil.PrintJSON(resolved)
-		}
-
-		output.Header("GitOps Sync Details")
-		output.KeyValue("ID", resolved.ID)
-		output.KeyValue("Name", resolved.Name)
-		output.KeyValue("Branch", resolved.Branch)
-		output.KeyValue("Compose Path", resolved.ComposePath)
-		output.KeyValue("Project Name", resolved.ProjectName)
-		output.KeyValue("Auto Sync", resolved.AutoSync)
-		output.KeyValue("Sync Interval", fmt.Sprintf("%d min", resolved.SyncInterval))
-		if resolved.LastSyncStatus != nil {
-			output.KeyValue("Last Status", *resolved.LastSyncStatus)
-		}
-		if resolved.LastSyncAt != nil {
-			output.KeyValue("Last Sync", resolved.LastSyncAt.Format("2006-01-02 15:04:05"))
-		}
-		if resolved.LastSyncCommit != nil {
-			output.KeyValue("Last Commit", *resolved.LastSyncCommit)
-		}
-		return nil
-	},
+			return cmdutil.RunList(cmd, c, cmdutil.ListSpec[gitops.GitOpsSync]{
+				Resource: "gitops syncs",
+				Endpoint: types.GitOpsSyncs(c.EnvID()),
+				Params:   cmdutil.ListParams{Resource: "gitops-syncs", Limit: opts.limit, FallbackDefault: 20, Start: opts.start, All: opts.all},
+				Headers:  []string{"ID", "NAME", "BRANCH", "AUTO-SYNC", "LAST STATUS", "LAST SYNC"},
+				Row: func(sync gitops.GitOpsSync) []string {
+					return []string{
+						sync.ID,
+						sync.Name,
+						sync.Branch,
+						strconv.FormatBool(sync.AutoSync),
+						cmp.Or(kit.FromPtr(sync.LastSyncStatus), "-"),
+						kit.Ternary(sync.LastSyncAt != nil, kit.FromPtr(sync.LastSyncAt).Format("2006-01-02 15:04:05"), "-"),
+					}
+				},
+			})
+		},
+	}
+	cmdutil.SetScope(cmdutil.ScopeRead, cmd)
+	cmd.Flags().IntVarP(&opts.limit, "limit", "n", 20, "Number of syncs to show")
+	cmd.Flags().IntVar(&opts.start, "start", 0, cmdutil.StartFlagUsage)
+	cmd.Flags().BoolVarP(&opts.all, "all", "a", false, cmdutil.AllFlagUsage)
+	return cmd
 }
 
-var updateCmd = &cobra.Command{
-	Use:          "update <sync-id|name>",
-	Short:        "Update a GitOps sync",
-	Args:         cobra.ExactArgs(1),
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := cmdutil.ClientFromCommand(cmd)
-		if err != nil {
-			return err
-		}
-
-		resolved, _, err := gitopsSyncRef.Resolve(cmd.Context(), c, args[0], false)
-		if err != nil {
-			return err
-		}
-
-		req := gitops.UpdateSyncRequest{}
-		if cmd.Flags().Changed("name") {
-			req.Name = &gitopsUpdateName
-		}
-		if cmd.Flags().Changed("repo-id") {
-			req.RepositoryID = &gitopsUpdateRepoID
-		}
-		if cmd.Flags().Changed("branch") {
-			req.Branch = &gitopsUpdateBranch
-		}
-		if cmd.Flags().Changed("compose-path") {
-			req.ComposePath = &gitopsUpdateComposePath
-		}
-		if cmd.Flags().Changed("project-name") {
-			req.ProjectName = &gitopsUpdateProjectName
-		}
-		if cmd.Flags().Changed("auto-sync") {
-			req.AutoSync = &gitopsUpdateAutoSync
-		}
-		if cmd.Flags().Changed("interval") {
-			req.SyncInterval = &gitopsUpdateInterval
-		}
-
-		resp, err := c.Put(cmd.Context(), types.GitOpsSync(c.EnvID(), resolved.ID), req)
-		if err != nil {
-			return fmt.Errorf("failed to update gitops sync: %w", err)
-		}
-		defer func() { _ = resp.Body.Close() }()
-
-		if ensureSuccessStatusErr := cmdutil.EnsureSuccessStatus(resp); ensureSuccessStatusErr != nil {
-			return fmt.Errorf("failed to update gitops sync: %w", ensureSuccessStatusErr)
-		}
-
-		output.Success("GitOps sync %s updated successfully", resolved.Name)
-		return nil
-	},
-}
-
-var deleteCmd = &cobra.Command{
-	Use:          "delete <sync-id|name>",
-	Aliases:      []string{"rm", "remove"},
-	Short:        "Delete a GitOps sync",
-	Args:         cobra.ExactArgs(1),
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := cmdutil.ClientFromCommand(cmd)
-		if err != nil {
-			return err
-		}
-
-		resolved, _, err := gitopsSyncRef.Resolve(cmd.Context(), c, args[0], false)
-		if err != nil {
-			return err
-		}
-
-		if !forceFlag {
-			display := resolved.Name
-			if display == "" {
-				display = resolved.ID
+func newCreateCmd() *cobra.Command {
+	var opts struct {
+		name        string
+		repoID      string
+		branch      string
+		composePath string
+		projectName string
+		autoSync    bool
+		interval    int
+	}
+	cmd := &cobra.Command{
+		Use:          "create",
+		Short:        "Create a new GitOps sync",
+		Args:         cobra.NoArgs,
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := cmdutil.ClientFromCommand(cmd)
+			if err != nil {
+				return err
 			}
-			confirmed, confirmErr := cmdutil.Confirm(cmd, fmt.Sprintf("Are you sure you want to delete gitops sync %s?", display))
-			if confirmErr != nil {
-				return confirmErr
-			}
-			if !confirmed {
-				_, _ = fmt.Fprintln(output.Stdout(), "Cancelled")
-				return nil
-			}
-		}
 
-		resp, err := c.Delete(cmd.Context(), types.GitOpsSync(c.EnvID(), resolved.ID))
-		if err != nil {
-			return fmt.Errorf("failed to delete gitops sync: %w", err)
-		}
-		defer func() { _ = resp.Body.Close() }()
-		if ensureSuccessStatusErr := cmdutil.EnsureSuccessStatus(resp); ensureSuccessStatusErr != nil {
-			return fmt.Errorf("failed to delete gitops sync: %w", ensureSuccessStatusErr)
-		}
+			req := gitops.CreateSyncRequest{
+				Name:         opts.name,
+				RepositoryID: opts.repoID,
+				Branch:       opts.branch,
+				ComposePath:  opts.composePath,
+				ProjectName:  opts.projectName,
+				AutoSync:     &opts.autoSync,
+				SyncInterval: kit.Ternary(cmd.Flags().Changed("interval"), &opts.interval, nil),
+			}
 
-		output.Success("GitOps sync %s deleted successfully", resolved.Name)
-		return nil
-	},
+			return cmdutil.Run(cmd, c, cmdutil.Spec[gitops.GitOpsSync]{
+				Method:         http.MethodPost,
+				Path:           types.GitOpsSyncs(c.EnvID()),
+				Body:           req,
+				FailureMessage: "failed to create gitops sync",
+				Render: func(data gitops.GitOpsSync) error {
+					output.Success("GitOps sync %s created successfully (ID: %s)", data.Name, data.ID)
+					return nil
+				},
+			})
+		},
+	}
+	cmdutil.SetScope(cmdutil.ScopeDestination, cmd)
+	cmd.Flags().StringVar(&opts.name, "name", "", "Name of the sync configuration")
+	cmd.Flags().StringVar(&opts.repoID, "repo-id", "", "Repository ID")
+	cmd.Flags().StringVar(&opts.branch, "branch", "", "Branch to sync from")
+	cmd.Flags().StringVar(&opts.composePath, "compose-path", "", "Path to docker-compose file")
+	cmd.Flags().BoolVar(&opts.autoSync, "auto-sync", false, "Enable automatic sync")
+	cmd.Flags().IntVar(&opts.interval, "interval", 0, "Sync interval in minutes")
+	cmd.Flags().StringVar(&opts.projectName, "project-name", "", "Project name for the sync")
+	_ = cmd.MarkFlagRequired("name")
+	_ = cmd.MarkFlagRequired("repo-id")
+	_ = cmd.MarkFlagRequired("branch")
+	_ = cmd.MarkFlagRequired("compose-path")
+	return cmd
 }
 
-var statusCmd = &cobra.Command{
-	Use:          "status <sync-id|name>",
-	Short:        "Get GitOps sync status",
-	Args:         cobra.ExactArgs(1),
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := cmdutil.ClientFromCommand(cmd)
-		if err != nil {
-			return err
-		}
+func newGetCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:          "get <sync-id|name>",
+		Short:        "Get GitOps sync details",
+		Args:         cobra.ExactArgs(1),
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := cmdutil.ClientFromCommand(cmd)
+			if err != nil {
+				return err
+			}
 
-		resolved, _, err := gitopsSyncRef.Resolve(cmd.Context(), c, args[0], false)
-		if err != nil {
-			return err
-		}
+			resolved, err := gitopsSyncRef.Fetch(cmd.Context(), c, args[0], cmdutil.AllowPrompt(cmd))
+			if err != nil {
+				return err
+			}
 
-		result, err := c.GetJSON[gitops.SyncStatus](cmd.Context(), types.GitOpsSyncStatus(c.EnvID(), resolved.ID))
-		if err != nil {
-			return fmt.Errorf("failed to get gitops sync status: %w", err)
-		}
+			if cmdutil.JSONOutputEnabled(cmd) {
+				return cmdutil.PrintJSON(resolved)
+			}
 
-		if jsonOutput {
-			return cmdutil.PrintJSON(result.Data)
-		}
-
-		output.Header("GitOps Sync Status")
-		output.KeyValue("ID", result.Data.ID)
-		output.KeyValue("Auto Sync", result.Data.AutoSync)
-		if result.Data.NextSyncAt != nil {
-			output.KeyValue("Next Sync", result.Data.NextSyncAt.Format("2006-01-02 15:04:05"))
-		}
-		if result.Data.LastSyncAt != nil {
-			output.KeyValue("Last Sync", result.Data.LastSyncAt.Format("2006-01-02 15:04:05"))
-		}
-		if result.Data.LastSyncStatus != nil {
-			output.KeyValue("Last Status", *result.Data.LastSyncStatus)
-		}
-		if result.Data.LastSyncError != nil {
-			output.KeyValue("Last Error", *result.Data.LastSyncError)
-		}
-		if result.Data.LastSyncCommit != nil {
-			output.KeyValue("Last Commit", *result.Data.LastSyncCommit)
-		}
-		return nil
-	},
-}
-
-var syncCmd = &cobra.Command{
-	Use:          "sync <sync-id|name>",
-	Short:        "Trigger a GitOps sync",
-	Args:         cobra.ExactArgs(1),
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := cmdutil.ClientFromCommand(cmd)
-		if err != nil {
-			return err
-		}
-
-		resolved, _, err := gitopsSyncRef.Resolve(cmd.Context(), c, args[0], false)
-		if err != nil {
-			return err
-		}
-
-		result, err := c.PostJSON[gitops.SyncResult](cmd.Context(), types.GitOpsSyncTrigger(c.EnvID(), resolved.ID), nil)
-		if err != nil {
-			return fmt.Errorf("failed to trigger gitops sync: %w", err)
-		}
-
-		if jsonOutput {
-			return cmdutil.PrintJSON(result.Data)
-		}
-
-		if result.Data.Success {
-			output.Success("Sync triggered successfully: %s", result.Data.Message)
+			output.Header("GitOps Sync Details")
+			output.KeyValue("ID", resolved.ID)
+			output.KeyValue("Name", resolved.Name)
+			output.KeyValue("Branch", resolved.Branch)
+			output.KeyValue("Compose Path", resolved.ComposePath)
+			output.KeyValue("Project Name", resolved.ProjectName)
+			output.KeyValue("Auto Sync", resolved.AutoSync)
+			output.KeyValue("Sync Interval", fmt.Sprintf("%d min", resolved.SyncInterval))
+			if resolved.LastSyncStatus != nil {
+				output.KeyValue("Last Status", *resolved.LastSyncStatus)
+			}
+			if resolved.LastSyncAt != nil {
+				output.KeyValue("Last Sync", resolved.LastSyncAt.Format("2006-01-02 15:04:05"))
+			}
+			if resolved.LastSyncCommit != nil {
+				output.KeyValue("Last Commit", *resolved.LastSyncCommit)
+			}
 			return nil
-		}
-
-		errMsg := ""
-		if result.Data.Error != nil {
-			errMsg = *result.Data.Error
-		}
-		return fmt.Errorf("sync failed: %s %s", result.Data.Message, errMsg)
-	},
+		},
+	}
+	cmdutil.SetResource(gitopsSyncRef, cmd)
+	return cmd
 }
 
-var filesCmd = &cobra.Command{
-	Use:          "files <sync-id|name>",
-	Short:        "List files from GitOps sync repository",
-	Args:         cobra.ExactArgs(1),
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := cmdutil.ClientFromCommand(cmd)
-		if err != nil {
-			return err
-		}
-
-		resolved, _, err := gitopsSyncRef.Resolve(cmd.Context(), c, args[0], false)
-		if err != nil {
-			return err
-		}
-
-		filesPath := types.GitOpsSyncFiles(c.EnvID(), resolved.ID)
-		if gitopsFilesPath != "" {
-			filesPath = cmdutil.AppendQuery(filesPath, url.Values{"path": []string{gitopsFilesPath}})
-		}
-
-		result, err := c.GetJSON[gitops.BrowseResponse](cmd.Context(), filesPath)
-		if err != nil {
-			return fmt.Errorf("failed to get gitops sync files: %w", err)
-		}
-
-		files := result.Data.Files
-		if jsonOutput {
-			return cmdutil.PrintJSON(files)
-		}
-
-		headers := []string{"NAME", "TYPE", "PATH", "SIZE"}
-		rows := flattenFileTree(files, 0)
-
-		return output.Table(headers, rows)
-	},
-}
-
-var importCmd = &cobra.Command{
-	Use:          "import",
-	Short:        "Import a GitOps sync configuration",
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := cmdutil.ClientFromCommand(cmd)
-		if err != nil {
-			return err
-		}
-
-		name, _ := cmd.Flags().GetString("name")
-		repo, _ := cmd.Flags().GetString("repo-url")
-		branch, _ := cmd.Flags().GetString("branch")
-		composePath, _ := cmd.Flags().GetString("compose-path")
-		autoSync, _ := cmd.Flags().GetBool("auto-sync")
-		interval, _ := cmd.Flags().GetInt("interval")
-
-		req := gitops.ImportGitOpsSyncRequest{
-			SyncName:          name,
-			GitRepo:           repo,
-			Branch:            branch,
-			DockerComposePath: composePath,
-			AutoSync:          autoSync,
-			SyncInterval:      interval,
-			ProjectName:       gitopsImportProjectName,
-		}
-
-		// The endpoint accepts a batch, so a single sync still has to be wrapped
-		// in an array.
-		result, err := c.PostJSON[gitops.ImportGitOpsSyncResponse](cmd.Context(), types.GitOpsSyncsImport(c.EnvID()), []gitops.ImportGitOpsSyncRequest{req})
-		if err != nil {
-			return fmt.Errorf("failed to import gitops sync: %w", err)
-		}
-
-		if jsonOutput {
-			return cmdutil.PrintJSON(result.Data)
-		}
-
-		output.Success("Import completed: %d succeeded, %d failed", result.Data.SuccessCount, result.Data.FailedCount)
-		if len(result.Data.Errors) > 0 {
-			output.Warning("Errors:")
-			for _, e := range result.Data.Errors {
-				_, _ = fmt.Fprintf(output.Stdout(), "  - %s\n", e)
+func newUpdateCmd() *cobra.Command {
+	var opts struct {
+		name        string
+		repoID      string
+		branch      string
+		composePath string
+		projectName string
+		autoSync    bool
+		interval    int
+	}
+	cmd := &cobra.Command{
+		Use:          "update <sync-id|name>",
+		Short:        "Update a GitOps sync",
+		Args:         cobra.ExactArgs(1),
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := cmdutil.ClientFromCommand(cmd)
+			if err != nil {
+				return err
 			}
-		}
-		return nil
-	},
+
+			resolved, _, err := gitopsSyncRef.Resolve(cmd.Context(), c, args[0], false)
+			if err != nil {
+				return err
+			}
+
+			req := gitops.UpdateSyncRequest{
+				Name:         kit.Ternary(cmd.Flags().Changed("name"), &opts.name, nil),
+				RepositoryID: kit.Ternary(cmd.Flags().Changed("repo-id"), &opts.repoID, nil),
+				Branch:       kit.Ternary(cmd.Flags().Changed("branch"), &opts.branch, nil),
+				ComposePath:  kit.Ternary(cmd.Flags().Changed("compose-path"), &opts.composePath, nil),
+				ProjectName:  kit.Ternary(cmd.Flags().Changed("project-name"), &opts.projectName, nil),
+				AutoSync:     kit.Ternary(cmd.Flags().Changed("auto-sync"), &opts.autoSync, nil),
+				SyncInterval: kit.Ternary(cmd.Flags().Changed("interval"), &opts.interval, nil),
+			}
+
+			return cmdutil.Run(cmd, c, cmdutil.Spec[gitops.GitOpsSync]{
+				Method:         http.MethodPut,
+				Path:           types.GitOpsSync(c.EnvID(), resolved.ID),
+				Body:           req,
+				FailureMessage: "failed to update gitops sync",
+				Render: func(gitops.GitOpsSync) error {
+					output.Success("GitOps sync %s updated successfully", resolved.Name)
+					return nil
+				},
+			})
+		},
+	}
+	cmd.Flags().StringVar(&opts.name, "name", "", "Name of the sync configuration")
+	cmd.Flags().StringVar(&opts.repoID, "repo-id", "", "Repository ID")
+	cmd.Flags().StringVar(&opts.branch, "branch", "", "Branch to sync from")
+	cmd.Flags().StringVar(&opts.composePath, "compose-path", "", "Path to docker-compose file")
+	cmd.Flags().StringVar(&opts.projectName, "project-name", "", "Project name for the sync")
+	cmd.Flags().BoolVar(&opts.autoSync, "auto-sync", false, "Enable automatic sync")
+	cmd.Flags().IntVar(&opts.interval, "interval", 0, "Sync interval in minutes")
+	cmdutil.SetResource(gitopsSyncRef, cmd)
+	return cmd
 }
 
-func init() {
-	cmdutil.SetScope(cmdutil.ScopeResource, GitopsCmd)
-	cmdutil.SetScope(cmdutil.ScopeRead, listCmd)
-	cmdutil.SetScope(cmdutil.ScopeDestination, createCmd, importCmd)
-	GitopsCmd.AddCommand(listCmd)
-	GitopsCmd.AddCommand(createCmd)
-	GitopsCmd.AddCommand(getCmd)
-	GitopsCmd.AddCommand(updateCmd)
-	GitopsCmd.AddCommand(deleteCmd)
-	GitopsCmd.AddCommand(statusCmd)
-	GitopsCmd.AddCommand(syncCmd)
-	GitopsCmd.AddCommand(filesCmd)
-	GitopsCmd.AddCommand(importCmd)
+func newDeleteCmd() *cobra.Command {
+	var opts struct {
+		force bool
+	}
+	cmd := &cobra.Command{
+		Use:          "delete <sync-id|name>",
+		Aliases:      []string{"rm", "remove"},
+		Short:        "Delete a GitOps sync",
+		Args:         cobra.ExactArgs(1),
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := cmdutil.ClientFromCommand(cmd)
+			if err != nil {
+				return err
+			}
 
-	// List command flags
-	listCmd.Flags().IntVarP(&limitFlag, "limit", "n", 20, "Number of syncs to show")
-	listCmd.Flags().IntVar(&startFlag, "start", 0, cmdutil.StartFlagUsage)
-	listCmd.Flags().BoolVarP(&allFlag, "all", "a", false, cmdutil.AllFlagUsage)
-	listCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
+			resolved, _, err := gitopsSyncRef.Resolve(cmd.Context(), c, args[0], false)
+			if err != nil {
+				return err
+			}
 
-	// Create command flags
-	createCmd.Flags().String("name", "", "Name of the sync configuration")
-	createCmd.Flags().String("repo-id", "", "Repository ID")
-	createCmd.Flags().String("branch", "", "Branch to sync from")
-	createCmd.Flags().String("compose-path", "", "Path to docker-compose file")
-	createCmd.Flags().Bool("auto-sync", false, "Enable automatic sync")
-	createCmd.Flags().Int("interval", 0, "Sync interval in minutes")
-	createCmd.Flags().String("project-name", "", "Project name for the sync")
-	createCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
-	_ = createCmd.MarkFlagRequired("name")
-	_ = createCmd.MarkFlagRequired("repo-id")
-	_ = createCmd.MarkFlagRequired("branch")
-	_ = createCmd.MarkFlagRequired("compose-path")
+			return cmdutil.RunDelete(cmd, c, cmdutil.DeleteSpec{
+				Force:          opts.force,
+				Prompt:         fmt.Sprintf("Are you sure you want to delete gitops sync %s?", cmp.Or(resolved.Name, resolved.ID)),
+				Path:           types.GitOpsSync(c.EnvID(), resolved.ID),
+				Body:           nil,
+				FailureMessage: "failed to delete gitops sync",
+				SuccessMessage: fmt.Sprintf("GitOps sync %s deleted successfully", resolved.Name),
+			})
+		},
+	}
+	cmd.Flags().BoolVarP(&opts.force, "force", "f", false, "Force delete without confirmation")
+	cmdutil.SetResource(gitopsSyncRef, cmd)
+	return cmd
+}
 
-	// Get command flags
-	getCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
+func newStatusCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:          "status <sync-id|name>",
+		Short:        "Get GitOps sync status",
+		Args:         cobra.ExactArgs(1),
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := cmdutil.ClientFromCommand(cmd)
+			if err != nil {
+				return err
+			}
 
-	// Update command flags
-	updateCmd.Flags().StringVar(&gitopsUpdateName, "name", "", "Name of the sync configuration")
-	updateCmd.Flags().StringVar(&gitopsUpdateRepoID, "repo-id", "", "Repository ID")
-	updateCmd.Flags().StringVar(&gitopsUpdateBranch, "branch", "", "Branch to sync from")
-	updateCmd.Flags().StringVar(&gitopsUpdateComposePath, "compose-path", "", "Path to docker-compose file")
-	updateCmd.Flags().StringVar(&gitopsUpdateProjectName, "project-name", "", "Project name for the sync")
-	updateCmd.Flags().BoolVar(&gitopsUpdateAutoSync, "auto-sync", false, "Enable automatic sync")
-	updateCmd.Flags().IntVar(&gitopsUpdateInterval, "interval", 0, "Sync interval in minutes")
-	updateCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
+			resolved, _, err := gitopsSyncRef.Resolve(cmd.Context(), c, args[0], false)
+			if err != nil {
+				return err
+			}
 
-	// Delete command flags
-	deleteCmd.Flags().BoolVarP(&forceFlag, "force", "f", false, "Force delete without confirmation")
-	deleteCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
+			return cmdutil.Run(cmd, c, cmdutil.Spec[gitops.SyncStatus]{
+				Method:         http.MethodGet,
+				Path:           types.GitOpsSyncStatus(c.EnvID(), resolved.ID),
+				FailureMessage: "failed to get gitops sync status",
+				Render: func(data gitops.SyncStatus) error {
+					output.Header("GitOps Sync Status")
+					output.KeyValue("ID", data.ID)
+					output.KeyValue("Auto Sync", data.AutoSync)
+					if data.NextSyncAt != nil {
+						output.KeyValue("Next Sync", data.NextSyncAt.Format("2006-01-02 15:04:05"))
+					}
+					if data.LastSyncAt != nil {
+						output.KeyValue("Last Sync", data.LastSyncAt.Format("2006-01-02 15:04:05"))
+					}
+					if data.LastSyncStatus != nil {
+						output.KeyValue("Last Status", *data.LastSyncStatus)
+					}
+					if data.LastSyncError != nil {
+						output.KeyValue("Last Error", *data.LastSyncError)
+					}
+					if data.LastSyncCommit != nil {
+						output.KeyValue("Last Commit", *data.LastSyncCommit)
+					}
+					return nil
+				},
+			})
+		},
+	}
+	cmdutil.SetResource(gitopsSyncRef, cmd)
+	return cmd
+}
 
-	// Status command flags
-	statusCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
+func newSyncCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:          "sync <sync-id|name>",
+		Short:        "Trigger a GitOps sync",
+		Args:         cobra.ExactArgs(1),
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := cmdutil.ClientFromCommand(cmd)
+			if err != nil {
+				return err
+			}
 
-	// Sync command flags
-	syncCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
+			resolved, _, err := gitopsSyncRef.Resolve(cmd.Context(), c, args[0], false)
+			if err != nil {
+				return err
+			}
 
-	// Files command flags
-	filesCmd.Flags().StringVar(&gitopsFilesPath, "path", "", "Path within the repository to browse")
-	filesCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
+			return cmdutil.Run(cmd, c, cmdutil.Spec[gitops.SyncResult]{
+				Method:         http.MethodPost,
+				Path:           types.GitOpsSyncTrigger(c.EnvID(), resolved.ID),
+				Body:           nil,
+				FailureMessage: "failed to trigger gitops sync",
+				Render: func(data gitops.SyncResult) error {
+					if data.Success {
+						output.Success("Sync triggered successfully: %s", data.Message)
+						return nil
+					}
+					return fmt.Errorf("sync failed: %s %s", data.Message, kit.FromPtr(data.Error))
+				},
+			})
+		},
+	}
+	cmdutil.SetResource(gitopsSyncRef, cmd)
+	return cmd
+}
 
-	// Import command flags
-	importCmd.Flags().String("name", "", "Name of the sync configuration")
-	importCmd.Flags().String("repo-url", "", "Git repository URL")
-	importCmd.Flags().String("branch", "", "Branch to sync from")
-	importCmd.Flags().String("compose-path", "", "Path to docker-compose file")
-	importCmd.Flags().Bool("auto-sync", false, "Enable automatic sync")
-	importCmd.Flags().Int("interval", 5, "Sync interval in minutes")
-	importCmd.Flags().StringVar(&gitopsImportProjectName, "project-name", "", "Project name for the sync")
-	importCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
-	_ = importCmd.MarkFlagRequired("name")
-	_ = importCmd.MarkFlagRequired("repo-url")
-	_ = importCmd.MarkFlagRequired("branch")
-	_ = importCmd.MarkFlagRequired("compose-path")
+func newFilesCmd() *cobra.Command {
+	var opts struct {
+		path string
+	}
+	cmd := &cobra.Command{
+		Use:          "files <sync-id|name>",
+		Short:        "List files from GitOps sync repository",
+		Args:         cobra.ExactArgs(1),
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := cmdutil.ClientFromCommand(cmd)
+			if err != nil {
+				return err
+			}
+
+			resolved, _, err := gitopsSyncRef.Resolve(cmd.Context(), c, args[0], false)
+			if err != nil {
+				return err
+			}
+
+			filesPath := types.GitOpsSyncFiles(c.EnvID(), resolved.ID)
+			if opts.path != "" {
+				filesPath = cmdutil.AppendQuery(filesPath, url.Values{"path": []string{opts.path}})
+			}
+
+			return cmdutil.Run(cmd, c, cmdutil.Spec[gitops.BrowseResponse]{
+				Method:         http.MethodGet,
+				Path:           filesPath,
+				FailureMessage: "failed to get gitops sync files",
+				Render: func(data gitops.BrowseResponse) error {
+					headers := []string{"NAME", "TYPE", "PATH", "SIZE"}
+					return output.Table(headers, flattenFileTree(data.Files, 0))
+				},
+			})
+		},
+	}
+	cmd.Flags().StringVar(&opts.path, "path", "", "Path within the repository to browse")
+	cmdutil.SetResource(gitopsSyncRef, cmd)
+	return cmd
+}
+
+func newImportCmd() *cobra.Command {
+	var opts struct {
+		name        string
+		repoURL     string
+		branch      string
+		composePath string
+		autoSync    bool
+		interval    int
+		projectName string
+	}
+	cmd := &cobra.Command{
+		Use:          "import",
+		Short:        "Import a GitOps sync configuration",
+		Args:         cobra.NoArgs,
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := cmdutil.ClientFromCommand(cmd)
+			if err != nil {
+				return err
+			}
+
+			req := gitops.ImportGitOpsSyncRequest{
+				SyncName:          opts.name,
+				GitRepo:           opts.repoURL,
+				Branch:            opts.branch,
+				DockerComposePath: opts.composePath,
+				AutoSync:          opts.autoSync,
+				SyncInterval:      opts.interval,
+				ProjectName:       opts.projectName,
+			}
+
+			// The endpoint accepts a batch, so a single sync still has to be wrapped
+			// in an array.
+			return cmdutil.Run(cmd, c, cmdutil.Spec[gitops.ImportGitOpsSyncResponse]{
+				Method:         http.MethodPost,
+				Path:           types.GitOpsSyncsImport(c.EnvID()),
+				Body:           []gitops.ImportGitOpsSyncRequest{req},
+				FailureMessage: "failed to import gitops sync",
+				Render: func(data gitops.ImportGitOpsSyncResponse) error {
+					output.Success("Import completed: %d succeeded, %d failed", data.SuccessCount, data.FailedCount)
+					if len(data.Errors) > 0 {
+						output.Warning("Errors:")
+						for _, e := range data.Errors {
+							_, _ = fmt.Fprintf(output.Stdout(), "  - %s\n", e)
+						}
+					}
+					return nil
+				},
+			})
+		},
+	}
+	cmdutil.SetScope(cmdutil.ScopeDestination, cmd)
+	cmd.Flags().StringVar(&opts.name, "name", "", "Name of the sync configuration")
+	cmd.Flags().StringVar(&opts.repoURL, "repo-url", "", "Git repository URL")
+	cmd.Flags().StringVar(&opts.branch, "branch", "", "Branch to sync from")
+	cmd.Flags().StringVar(&opts.composePath, "compose-path", "", "Path to docker-compose file")
+	cmd.Flags().BoolVar(&opts.autoSync, "auto-sync", false, "Enable automatic sync")
+	cmd.Flags().IntVar(&opts.interval, "interval", 5, "Sync interval in minutes")
+	cmd.Flags().StringVar(&opts.projectName, "project-name", "", "Project name for the sync")
+	_ = cmd.MarkFlagRequired("name")
+	_ = cmd.MarkFlagRequired("repo-url")
+	_ = cmd.MarkFlagRequired("branch")
+	_ = cmd.MarkFlagRequired("compose-path")
+	return cmd
 }
 
 var gitopsSyncRef = cmdutil.ResourceRef[gitops.GitOpsSync, gitops.GitOpsSync]{
@@ -533,26 +477,14 @@ var gitopsSyncRef = cmdutil.ResourceRef[gitops.GitOpsSync, gitops.GitOpsSync]{
 	IDHint:            "the sync ID",
 	ListCmd:           "arcane gitops list",
 	GetPath:           types.GitOpsSync,
+	IdentifierOf:      func(item gitops.GitOpsSync) string { return item.ID },
 	ListPath:          types.GitOpsSyncs,
 	Matches: func(item gitops.GitOpsSync, identifierLower, original string) bool {
-		idLower := strings.ToLower(item.ID)
-		if idLower == identifierLower || (len(identifierLower) >= 4 && strings.HasPrefix(idLower, identifierLower)) {
-			return true
-		}
-		if strings.Contains(idLower, identifierLower) {
-			return true
-		}
-		if strings.Contains(strings.ToLower(item.Name), identifierLower) {
-			return true
-		}
-		return strings.EqualFold(item.Name, original)
+		return strings.Contains(strings.ToLower(item.ID), identifierLower) ||
+			strings.Contains(strings.ToLower(item.Name), identifierLower) || strings.EqualFold(item.Name, original)
 	},
 	Label: func(match gitops.GitOpsSync) string {
-		lastStatus := "-"
-		if match.LastSyncStatus != nil {
-			lastStatus = *match.LastSyncStatus
-		}
-		return fmt.Sprintf("%s (%s, %s)", match.Name, match.ID, lastStatus)
+		return fmt.Sprintf("%s (%s, %s)", match.Name, match.ID, cmp.Or(kit.FromPtr(match.LastSyncStatus), "-"))
 	},
 	Promote: func(match gitops.GitOpsSync) *gitops.GitOpsSync { return &match },
 }
@@ -560,16 +492,11 @@ var gitopsSyncRef = cmdutil.ResourceRef[gitops.GitOpsSync, gitops.GitOpsSync]{
 func flattenFileTree(nodes []gitops.FileTreeNode, depth int) [][]string {
 	var rows [][]string
 	for _, node := range nodes {
-		prefix := strings.Repeat("  ", depth)
-		size := "-"
-		if node.Type == gitops.FileTreeNodeTypeFile {
-			size = output.Bytes(node.Size)
-		}
 		rows = append(rows, []string{
-			prefix + node.Name,
+			strings.Repeat("  ", depth) + node.Name,
 			string(node.Type),
 			node.Path,
-			size,
+			kit.Ternary(node.Type == gitops.FileTreeNodeTypeFile, output.Bytes(node.Size), "-"),
 		})
 		if len(node.Children) > 0 {
 			rows = append(rows, flattenFileTree(node.Children, depth+1)...)

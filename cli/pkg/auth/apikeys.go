@@ -2,172 +2,150 @@ package auth
 
 import (
 	"fmt"
+	"net/http"
 	"time"
 
-	apikeytypes "github.com/getarcaneapp/arcane/types/v2/apikey"
+	"github.com/getarcaneapp/arcane/types/v2/apikey"
 	"github.com/spf13/cobra"
+	kit "go.getarcane.app/kit/pkg"
 
 	"github.com/getarcaneapp/arcane/cli/v2/internal/cmdutil"
 	"github.com/getarcaneapp/arcane/cli/v2/internal/output"
 	"github.com/getarcaneapp/arcane/cli/v2/internal/types"
 )
 
-var (
-	apiKeyForceFlag         bool
-	apiKeyCreateDescription string
-	apiKeyCreateExpiresAt   string
-)
-
-// apiKeysCmd is the parent command for the caller's own (personal) API keys.
-// Personal keys inherit the owner's role permissions; scoped keys with
-// granular grants are managed via `arcane admin api-keys`.
-var apiKeysCmd = &cobra.Command{
-	Use:     "api-keys",
-	Aliases: []string{"apikeys", "key"},
-	Short:   "Manage your own API keys",
-	Long: "Manage the current user's personal API keys. Personal keys inherit the owner's role permissions. Creating and " +
-		"deleting them requires a session login (an API key cannot mint or remove other keys).",
+// apiKeysCmd manages personal keys, which inherit the owner's role permissions.
+// Scoped keys are managed through `arcane admin api-keys`.
+func newAPIKeysCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:     "api-keys",
+		Aliases: []string{"apikeys", "key"},
+		Short:   "Manage your own API keys",
+		Long: "Manage the current user's personal API keys. Personal keys inherit the owner's role permissions. Creating and " +
+			"deleting them requires a session login (an API key cannot mint or remove other keys).",
+	}
+	cmd.AddCommand(newAPIKeysListCmd(), newAPIKeysCreateCmd(), newAPIKeysDeleteCmd())
+	return cmd
 }
 
-var apiKeysListCmd = &cobra.Command{
-	Use:          "list",
-	Aliases:      []string{"ls"},
-	Short:        "List your API keys",
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := cmdutil.ClientFromCommand(cmd)
-		if err != nil {
-			return err
-		}
-
-		result, err := c.GetJSON[[]apikeytypes.ApiKey](cmd.Context(), types.AuthMeApiKeys())
-		if err != nil {
-			return fmt.Errorf("failed to list API keys: %w", err)
-		}
-
-		if cmdutil.JSONOutputEnabled(cmd) || jsonOutput {
-			return cmdutil.PrintJSON(result.Data)
-		}
-
-		if len(result.Data) == 0 {
-			output.Info("No API keys found")
-			return nil
-		}
-
-		headers := []string{"ID", "NAME", "KIND", "PREFIX", "EXPIRES", "LAST USED", "CREATED"}
-		rows := make([][]string, len(result.Data))
-		for i, key := range result.Data {
-			expires := "never"
-			if key.ExpiresAt != nil {
-				expires = key.ExpiresAt.Format("2006-01-02 15:04")
-			}
-			lastUsed := "never"
-			if key.LastUsedAt != nil {
-				lastUsed = key.LastUsedAt.Format("2006-01-02 15:04")
-			}
-			rows[i] = []string{
-				key.ID,
-				key.Name,
-				key.Kind,
-				key.KeyPrefix,
-				expires,
-				lastUsed,
-				key.CreatedAt.Format("2006-01-02 15:04"),
-			}
-		}
-		return output.Table(headers, rows)
-	},
-}
-
-var apiKeysCreateCmd = &cobra.Command{
-	Use:          "create <name>",
-	Short:        "Create a personal API key",
-	Args:         cobra.ExactArgs(1),
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		c, err := cmdutil.ClientFromCommand(cmd)
-		if err != nil {
-			return err
-		}
-
-		req := apikeytypes.CreateUserApiKey{Name: args[0]}
-		if cmd.Flags().Changed("description") {
-			req.Description = &apiKeyCreateDescription
-		}
-		if apiKeyCreateExpiresAt != "" {
-			parsed, parseErr := time.Parse(time.RFC3339, apiKeyCreateExpiresAt)
-			if parseErr != nil {
-				return fmt.Errorf("invalid --expires-at format (use RFC3339): %w", parseErr)
-			}
-			req.ExpiresAt = &parsed
-		}
-
-		result, err := c.PostJSON[apikeytypes.ApiKeyCreatedDto](cmd.Context(), types.AuthMeApiKeys(), req)
-		if err != nil {
-			return fmt.Errorf("failed to create API key: %w", err)
-		}
-
-		if cmdutil.JSONOutputEnabled(cmd) || jsonOutput {
-			return cmdutil.PrintJSON(result.Data)
-		}
-
-		output.Success("API key created")
-		output.KeyValue("ID", result.Data.ID)
-		output.KeyValue("Name", result.Data.Name)
-		output.Warning("The key secret is shown only once — store it now:")
-		output.KeyValue("Key", result.Data.Key)
-		return nil
-	},
-}
-
-var apiKeysDeleteCmd = &cobra.Command{
-	Use:          "delete <id>",
-	Aliases:      []string{"rm", "remove"},
-	Short:        "Delete one of your API keys",
-	Args:         cobra.ExactArgs(1),
-	SilenceUsage: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		if !apiKeyForceFlag {
-			confirmed, err := cmdutil.Confirm(cmd, fmt.Sprintf("Are you sure you want to delete API key %s?", args[0]))
+func newAPIKeysListCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:          "list",
+		Aliases:      []string{"ls"},
+		Short:        "List your API keys",
+		SilenceUsage: true,
+		Args:         cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := cmdutil.ClientFromCommand(cmd)
 			if err != nil {
 				return err
 			}
-			if !confirmed {
-				_, _ = fmt.Fprintln(output.Stdout(), "Cancelled")
-				return nil
-			}
-		}
 
-		c, err := cmdutil.ClientFromCommand(cmd)
-		if err != nil {
-			return err
-		}
+			return cmdutil.Run(cmd, c, cmdutil.Spec[[]apikey.ApiKey]{
+				Method:         http.MethodGet,
+				Path:           types.AuthMeApiKeys(),
+				FailureMessage: "failed to list API keys",
+				Render: func(data []apikey.ApiKey) error {
+					if len(data) == 0 {
+						output.Info("No API keys found")
+						return nil
+					}
 
-		resp, err := c.Delete(cmd.Context(), types.AuthMeApiKey(args[0]))
-		if err != nil {
-			return fmt.Errorf("failed to delete API key: %w", err)
-		}
-		defer func() { _ = resp.Body.Close() }()
-		if ensureSuccessStatusErr := cmdutil.EnsureSuccessStatus(resp); ensureSuccessStatusErr != nil {
-			return fmt.Errorf("failed to delete API key: %w", ensureSuccessStatusErr)
-		}
-
-		output.Success("API key deleted")
-		return nil
-	},
+					headers := []string{"ID", "NAME", "KIND", "PREFIX", "EXPIRES", "LAST USED", "CREATED"}
+					rows := make([][]string, len(data))
+					for i, key := range data {
+						rows[i] = []string{
+							key.ID,
+							key.Name,
+							key.Kind,
+							key.KeyPrefix,
+							kit.Ternary(key.ExpiresAt != nil, kit.FromPtr(key.ExpiresAt).Format("2006-01-02 15:04"), "never"),
+							kit.Ternary(key.LastUsedAt != nil, kit.FromPtr(key.LastUsedAt).Format("2006-01-02 15:04"), "never"),
+							key.CreatedAt.Format("2006-01-02 15:04"),
+						}
+					}
+					return output.Table(headers, rows)
+				},
+			})
+		},
+	}
 }
 
-func init() {
-	AuthCmd.AddCommand(apiKeysCmd)
-	apiKeysCmd.AddCommand(apiKeysListCmd)
-	apiKeysCmd.AddCommand(apiKeysCreateCmd)
-	apiKeysCmd.AddCommand(apiKeysDeleteCmd)
+func newAPIKeysCreateCmd() *cobra.Command {
+	var opts struct {
+		description string
+		expiresAt   string
+	}
+	cmd := &cobra.Command{
+		Use:          "create <name>",
+		Short:        "Create a personal API key",
+		Args:         cobra.ExactArgs(1),
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := cmdutil.ClientFromCommand(cmd)
+			if err != nil {
+				return err
+			}
 
-	apiKeysListCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
+			var expiresAt *time.Time
+			if opts.expiresAt != "" {
+				parsed, parseErr := time.Parse(time.RFC3339, opts.expiresAt)
+				if parseErr != nil {
+					return fmt.Errorf("invalid --expires-at format (use RFC3339): %w", parseErr)
+				}
+				expiresAt = &parsed
+			}
 
-	apiKeysCreateCmd.Flags().StringVar(&apiKeyCreateDescription, "description", "", "Description of the API key")
-	apiKeysCreateCmd.Flags().StringVar(&apiKeyCreateExpiresAt, "expires-at", "", "Expiration date (RFC3339 format)")
-	apiKeysCreateCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output in JSON format")
+			return cmdutil.Run(cmd, c, cmdutil.Spec[apikey.ApiKeyCreatedDto]{
+				Method: http.MethodPost,
+				Path:   types.AuthMeApiKeys(),
+				Body: apikey.CreateUserApiKey{
+					Name:        args[0],
+					Description: kit.Ternary(cmd.Flags().Changed("description"), &opts.description, nil),
+					ExpiresAt:   expiresAt,
+				},
+				FailureMessage: "failed to create API key",
+				Render: func(data apikey.ApiKeyCreatedDto) error {
+					output.Success("API key created")
+					output.KeyValue("ID", data.ID)
+					output.KeyValue("Name", data.Name)
+					output.Warning("The key secret is shown only once — store it now:")
+					output.KeyValue("Key", data.Key)
+					return nil
+				},
+			})
+		},
+	}
+	cmd.Flags().StringVar(&opts.description, "description", "", "Description of the API key")
+	cmd.Flags().StringVar(&opts.expiresAt, "expires-at", "", "Expiration date (RFC3339 format)")
+	return cmd
+}
 
-	apiKeysDeleteCmd.Flags().BoolVarP(&apiKeyForceFlag, "force", "f", false, "Force deletion without confirmation")
+func newAPIKeysDeleteCmd() *cobra.Command {
+	var opts struct {
+		force bool
+	}
+	cmd := &cobra.Command{
+		Use:          "delete <id>",
+		Aliases:      []string{"rm", "remove"},
+		Short:        "Delete one of your API keys",
+		Args:         cobra.ExactArgs(1),
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := cmdutil.ClientFromCommand(cmd)
+			if err != nil {
+				return err
+			}
+
+			return cmdutil.RunDelete(cmd, c, cmdutil.DeleteSpec{
+				Force:          opts.force,
+				Prompt:         fmt.Sprintf("Are you sure you want to delete API key %s?", args[0]),
+				Path:           types.AuthMeApiKey(args[0]),
+				FailureMessage: "failed to delete API key",
+				SuccessMessage: "API key deleted",
+			})
+		},
+	}
+	cmd.Flags().BoolVarP(&opts.force, "force", "f", false, "Force deletion without confirmation")
+	return cmd
 }

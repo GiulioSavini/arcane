@@ -13,9 +13,7 @@ import (
 	"github.com/getarcaneapp/arcane/cli/v2/internal/types"
 )
 
-// s3DestinationRef resolves an S3 destination by ID or name: exact ID via the
-// GET endpoint, then exact name (case-insensitive), then substring match over
-// the saved destinations.
+// s3DestinationRef resolves exact IDs, then case-insensitive names and substrings.
 var s3DestinationRef = cmdutil.ResourceRef[backup.S3Destination, backup.S3Destination]{
 	Singular: "S3 destination",
 	Plural:   "S3 destinations",
