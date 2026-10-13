@@ -1,3 +1,64 @@
+## v2.16.0
+
+### New features
+
+- remember last-used shell per compose service ([\#4348](https://github.com/getarcaneapp/arcane/pull/4348) by @kmendell)
+- disable Gravatar by default and allow ENABLE_GRAVATAR on any in… ([\#4349](https://github.com/getarcaneapp/arcane/pull/4349) by @kmendell)
+- confirm before bulk updating containers and projects ([\#4347](https://github.com/getarcaneapp/arcane/pull/4347) by @kmendell)
+- middle-click to close editor tabs and Ctrl/Cmd+S to save projects ([\#4333](https://github.com/getarcaneapp/arcane/pull/4333) by @DominikZublasing)
+- support icon_url in remote template registries ([\#4350](https://github.com/getarcaneapp/arcane/pull/4350) by @kmendell)
+- add development/beta version branding ([2158fe7](https://github.com/getarcaneapp/arcane/commit/2158fe7da7d4009c8e46397ddbf8e5996ff319ad) by @kmendell)
+- add OpenTelemetry metrics, traces, and logs ([\#4367](https://github.com/getarcaneapp/arcane/pull/4367) by @kmendell)
+- allow ECR registries to use the AWS default credential chain ([\#4357](https://github.com/getarcaneapp/arcane/pull/4357) by @Guik)
+- improve ntfy notification formatting ([\#4336](https://github.com/getarcaneapp/arcane/pull/4336) by @maghuro)
+- multiplexed edge tunnel and redesigned connection view ([\#4375](https://github.com/getarcaneapp/arcane/pull/4375) by @kmendell)
+- add all environments ui preview ([\#4389](https://github.com/getarcaneapp/arcane/pull/4389) by @kmendell)
+
+### CLI - New features
+
+- add all environment preview to cli ([c8ec324](https://github.com/getarcaneapp/arcane/commit/c8ec324170782afb1f755ac1f632f58f362de465) by @kmendell)
+- add sigstore-verified self-update preview ([\#4380](https://github.com/getarcaneapp/arcane/pull/4380) by @kmendell)
+
+### Bug fixes
+
+- duplicate role assignments cause a 500 in the user editor ([\#4332](https://github.com/getarcaneapp/arcane/pull/4332) by @DominikZublasing)
+- enforce SQLite foreign keys and remove orphaned authorization records ([\#4339](https://github.com/getarcaneapp/arcane/pull/4339) by @kmendell)
+- allow schedule updates for disabled jobs ([e7317f0](https://github.com/getarcaneapp/arcane/commit/e7317f0262761fced7783981724cf7716b3948e9) by @kmendell)
+- recognize JSON in container logs ([20c2438](https://github.com/getarcaneapp/arcane/commit/20c24389f7d9ec91da0dac1361098b977f8b0893) by @kmendell)
+- virtualize large tables and confirm loading all vulnerabilities ([\#4340](https://github.com/getarcaneapp/arcane/pull/4340) by @kmendell)
+- lock table height to viewport ([7d8b207](https://github.com/getarcaneapp/arcane/commit/7d8b207a32f9393110312e76b5ccf14ce85fd7c7) by @kmendell)
+- reuse unclaimed project directories on create ([\#4343](https://github.com/getarcaneapp/arcane/pull/4343) by @kmendell)
+- prune local backup repositories daily to free deleted backup data ([\#4235](https://github.com/getarcaneapp/arcane/pull/4235) by @GiulioSavini)
+- trust only configured TRUSTED_PROXIES for client IP extraction ([\#4351](https://github.com/getarcaneapp/arcane/pull/4351) by @kmendell)
+- mark direct agents online when the dashboard reaches them ([\#4362](https://github.com/getarcaneapp/arcane/pull/4362) by @kmendell)
+- only report environment count from the manager ([17c223a](https://github.com/getarcaneapp/arcane/commit/17c223aa07020058362174161cd904b30def5159) by @kmendell)
+- stop the app when the Francis host fails ([\#4371](https://github.com/getarcaneapp/arcane/pull/4371) by @kmendell)
+- keep SQLite tuning on the actor store and stop fsyncing on commit ([\#4372](https://github.com/getarcaneapp/arcane/pull/4372) by @kmendell)
+- stop checking api path for auto login when disabled ([64eb4d3](https://github.com/getarcaneapp/arcane/commit/64eb4d3588a9ea4f35f684a90bf2539ce80ebab3) by @kmendell)
+- require verified email before merging OIDC accounts ([\#4381](https://github.com/getarcaneapp/arcane/pull/4381) by @kmendell)
+- gate actions on variables permissions instead of templates:update ([\#4382](https://github.com/getarcaneapp/arcane/pull/4382) by @kmendell)
+- allow self-upgrade helpers through Wollomatic socket proxy ([\#4383](https://github.com/getarcaneapp/arcane/pull/4383) by @kmendell)
+- match scans by layer diff IDs ([ebb5a1f](https://github.com/getarcaneapp/arcane/commit/ebb5a1ff6da46e5fe41e4b003b48f91c120d9a0d) by @kmendell)
+- stop stale user writes from overwriting profiles ([ae7641d](https://github.com/getarcaneapp/arcane/commit/ae7641d7f477973b3832799b888fe581a742895b) by @kmendell)
+- correct action button overflow and compact menus ([94b1658](https://github.com/getarcaneapp/arcane/commit/94b16586821322962f0cc3316f483d905a131789) by @kmendell)
+
+### CLI - Bug fixes
+
+- show json stream output ([ace2c8d](https://github.com/getarcaneapp/arcane/commit/ace2c8da5ff7aa59d6d8b8c2432f34085b8fc85f) by @kmendell)
+- show correct formatted config ([e8b83db](https://github.com/getarcaneapp/arcane/commit/e8b83db33039e8eb8168c13a943dc4647e296691) by @kmendell)
+
+### Performance improvements
+
+- stream edge responses, pool proxy connections, and clean up edge package ([\#4354](https://github.com/getarcaneapp/arcane/pull/4354) by @kmendell)
+
+### Other
+
+- migrate jobs to use fan out workflows ([\#4356](https://github.com/getarcaneapp/arcane/pull/4356) by @kmendell)
+- standardize on github.com/docker/go-units ([\#4377](https://github.com/getarcaneapp/arcane/pull/4377) by @kmendell)
+- constructor-based commands, generic helpers, shared types ([0d07bea](https://github.com/getarcaneapp/arcane/commit/0d07bea3fd7699a345d0347502f5ffe5c93dfd8d) by @kmendell)
+- store auth config in a seperate auth.json file ([\#4379](https://github.com/getarcaneapp/arcane/pull/4379) by @kmendell)
+
+**Full Changelog**: https://github.com/getarcaneapp/arcane/compare/v2.15.1...v2.16.0
 ## v2.15.1
 
 ### Bug fixes
