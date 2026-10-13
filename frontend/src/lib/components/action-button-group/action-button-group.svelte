@@ -55,8 +55,8 @@
 		})).filter((g) => g.items.length > 0)
 	);
 	const showMenu = $derived(secondary.length > 0 || menuGroups.length > 0);
-	// With no menu-only items the trigger exists solely to fold secondaries on narrow screens.
-	const menuIsMobileOnly = $derived(menuGroups.length === 0);
+	// Without menu-only items the trigger only folds secondaries: icon ones below sm, labelled ones below lg or when compact.
+	const menuIsMobileOnly = $derived(menuGroups.length === 0 && !(compact && secondaryLabelled.length > 0));
 	const foldBreakpoint = $derived(secondaryLabelled.length > 0 ? 'lg' : 'sm');
 	// Labelled secondaries fold into the menu below lg, or whenever the row is compact.
 	const secondariesInline = $derived(!compact);
@@ -67,7 +67,8 @@
 
 	function overflows() {
 		if (!rootEl || !rowEl) return false;
-		return rowEl.scrollWidth > rootEl.clientWidth + 0.5;
+		// Rects keep subpixel widths; scrollWidth/clientWidth round independently and can differ by 1px.
+		return rowEl.getBoundingClientRect().width > rootEl.getBoundingClientRect().width + 1;
 	}
 
 	function remeasure() {
@@ -279,11 +280,7 @@
 								action="base"
 								tone="outline-primary"
 								{size}
-								class={cn(
-									'max-sm:size-9 max-sm:p-0',
-									compact && 'size-9 p-0',
-									menuIsMobileOnly && !compact && `${foldBreakpoint}:hidden`
-								)}
+								class={cn('max-sm:size-9 max-sm:p-0', compact && 'size-9 p-0', menuIsMobileOnly && `${foldBreakpoint}:hidden`)}
 								aria-label={m.common_more_actions()}
 							>
 								{#if compact}
