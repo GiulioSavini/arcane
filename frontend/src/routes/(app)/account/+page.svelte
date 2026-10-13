@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { useQueryClient } from '@tanstack/svelte-query';
 	import { toast } from 'svelte-sonner';
 	import { Temporal } from 'temporal-polyfill';
 
@@ -12,6 +13,7 @@
 	import { useUrlTab } from '#lib/hooks/use-url-tab.svelte.js';
 	import { UserIcon, SettingsIcon, TestIcon } from '#lib/icons/index.js';
 	import { m } from '#lib/paraglide/messages.js';
+	import { queryKeys } from '#lib/query/query-keys.js';
 	import { userService } from '#lib/services/user-service.js';
 	import settingsStore from '#lib/stores/config-store.svelte.js';
 	import userStore from '#lib/stores/user-store.svelte.js';
@@ -53,6 +55,7 @@
 		return BUILT_IN_ROLE_LABELS[roleId]?.() ?? roleId.replace(/^role_/, '').replace(/_/g, ' ');
 	}
 
+	const queryClient = useQueryClient();
 	const currentUser = $derived(userStore.current);
 	const isOidcUser = $derived(Boolean(currentUser?.oidcSubjectId));
 
@@ -119,6 +122,7 @@
 						email: profileEmail.trim()
 					});
 					await userStore.setUser(updated);
+					await queryClient.invalidateQueries({ queryKey: queryKeys.users.all });
 					if (profileDraft === submittedDraft) profileDraft = null;
 					toast.success(m.account_profile_updated());
 				})()

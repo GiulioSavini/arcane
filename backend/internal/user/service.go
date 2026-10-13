@@ -11,6 +11,7 @@ import (
 	"maps"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/getarcaneapp/arcane/types/v2/user"
 	"go.getarcane.app/kit/normalization"
@@ -290,6 +291,20 @@ func (s *UserService) UpdateUser(ctx context.Context, localUser *User, actorPerm
 		return nil, err
 	}
 	return localUser, nil
+}
+
+// TouchLastLogin updates only the user's last login time.
+func (s *UserService) TouchLastLogin(ctx context.Context, userID string, at time.Time) error {
+	err := s.db.DB.WithContext(ctx).
+		Model(&User{}).
+		Where("id = ?", userID).
+		Updates(map[string]any{
+			"last_login": at,
+		}).Error
+	if err != nil {
+		return fmt.Errorf("failed to update user last login: %w", err)
+	}
+	return nil
 }
 
 func normalizeUsernameInternal(username string) (string, error) {

@@ -123,11 +123,16 @@
 		}
 
 		const userData: UserSubmission = {
-			displayName: data.displayName,
 			roleAssignments: data.roleAssignments
 		};
 
-		if (data.email) {
+		// When editing, only send profile fields that changed so a stale form
+		// can't overwrite newer values
+		if (!isEditMode || data.displayName.trim() !== (userToEdit?.displayName ?? '').trim()) {
+			userData.displayName = data.displayName;
+		}
+
+		if (data.email && (!isEditMode || data.email.trim() !== (userToEdit?.email ?? '').trim())) {
 			userData.email = data.email;
 		}
 

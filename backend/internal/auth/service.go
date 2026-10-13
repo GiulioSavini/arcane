@@ -239,11 +239,12 @@ func (s *AuthService) AuthenticateLocalPrimary(ctx context.Context, username, pa
 		return nil, ErrInvalidCredentials
 	}
 
-	localUser.LastLogin = new(time.Now())
-	userCopy := new(*localUser)
+	userID := localUser.ID
+	now := time.Now()
+	localUser.LastLogin = &now
 	s.runInBackground(ctx, "update_last_login", func(ctx context.Context) error {
-		if _, updateUserErr := s.userService.UpdateUser(ctx, userCopy, nil); updateUserErr != nil {
-			return fmt.Errorf("failed to update user's last login time: %w", updateUserErr)
+		if touchErr := s.userService.TouchLastLogin(ctx, userID, now); touchErr != nil {
+			return fmt.Errorf("failed to update user's last login time: %w", touchErr)
 		}
 		return nil
 	})
@@ -402,7 +403,7 @@ func (s *AuthService) findOrCreateOidcUser(ctx context.Context, userInfo auth.Oi
 						slog.WarnContext(ctx, "failed to sync OIDC role assignments on user merge", "error", syncErr, "userId", merged.ID)
 					}
 				}
-				return existingUser, false, nil
+				return merged, false, nil
 			}
 		}
 	}
@@ -508,23 +509,23 @@ func (s *AuthService) resolveOidcUsername(ctx context.Context, userInfo auth.Oid
 }
 
 func (s *AuthService) updateOidcUser(ctx context.Context, localUser *user.User, userInfo auth.OidcUserInfo, tokenResp *auth.OidcTokenResponse) (*user.User, error) {
-	if userInfo.Name != "" && localUser.DisplayName == nil {
-		localUser.DisplayName = new(userInfo.Name)
-	}
-	if userInfo.Email != "" && localUser.Email == nil {
-		localUser.Email = new(userInfo.Email)
-	}
-
-	s.persistOidcTokens(localUser, tokenResp)
-
-	localUser.LastLogin = new(time.Now())
-	if _, err := s.userService.UpdateUser(ctx, localUser, nil); err != nil {
+	updated, err := s.userService.AttachOidcSubjectTransactional(ctx, localUser.ID, userInfo.Subject, func(u *user.User) {
+		if userInfo.Name != "" && u.DisplayName == nil {
+			u.DisplayName = new(userInfo.Name)
+		}
+		if userInfo.Email != "" && u.Email == nil {
+			u.Email = new(userInfo.Email)
+		}
+		s.persistOidcTokens(u, tokenResp)
+		u.LastLogin = new(time.Now())
+	})
+	if err != nil {
 		return nil, err
 	}
-	if err := s.syncOidcRoleAssignments(ctx, localUser, userInfo, tokenResp); err != nil {
-		slog.WarnContext(ctx, "failed to sync OIDC role assignments on user update", "error", err, "userId", localUser.ID)
+	if syncErr := s.syncOidcRoleAssignments(ctx, updated, userInfo, tokenResp); syncErr != nil {
+		slog.WarnContext(ctx, "failed to sync OIDC role assignments on user update", "error", syncErr, "userId", updated.ID)
 	}
-	return localUser, nil
+	return updated, nil
 }
 
 // syncOidcRoleAssignments rebuilds the user's `source='oidc'` role assignments
