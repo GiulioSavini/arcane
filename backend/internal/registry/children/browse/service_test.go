@@ -28,9 +28,9 @@ import (
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/pagination"
 )
 
-// newTestRegistryInternal starts an in-memory OCI registry and returns its
+// newTestRegistry starts an in-memory OCI registry and returns its
 // host as "localhost:PORT" so go-containerregistry resolves it over plain HTTP.
-func newTestRegistryInternal(t *testing.T) string {
+func newTestRegistry(t *testing.T) string {
 	t.Helper()
 	server := httptest.NewServer(registry.New(registry.Logger(log.New(io.Discard, "", 0))))
 	t.Cleanup(server.Close)
@@ -39,16 +39,16 @@ func newTestRegistryInternal(t *testing.T) string {
 	return "localhost:" + serverURL.Port()
 }
 
-// testRegistriesInternal is an in-memory registry store keyed by ID.
-type testRegistriesInternal map[string]containerregistry.Credential
+// testRegistries is an in-memory registry store keyed by ID.
+type testRegistries map[string]containerregistry.Credential
 
-func (r testRegistriesInternal) add(registryURL, username, token string) string {
+func (r testRegistries) add(registryURL, username, token string) string {
 	id := fmt.Sprintf("registry-%d", len(r)+1)
 	r[id] = containerregistry.Credential{URL: registryURL, Username: username, Token: token, Enabled: true}
 	return id
 }
 
-func newTestServiceInternal(registries testRegistriesInternal) *Service {
+func newTestService(registries testRegistries) *Service {
 	return NewService(
 		func(_ context.Context, id string) (containerregistry.ContainerRegistry, *containerregistry.Credential, error) {
 			credential, ok := registries[id]
@@ -68,87 +68,90 @@ func newTestServiceInternal(registries testRegistriesInternal) *Service {
 	)
 }
 
-func platformImageInternal(t *testing.T, platform v1.Platform, created time.Time) v1.Image {
+func platformImage(t *testing.T, platform v1.Platform, created time.Time) v1.Image {
 	t.Helper()
 
 	img, err := random.Image(128, 2)
 	require.NoError(t, err)
 	cfg, err := img.ConfigFile()
 	require.NoError(t, err)
-	cfg = cfg.DeepCopy()
-	cfg.OS = platform.OS
-	cfg.Architecture = platform.Architecture
-	cfg.Variant = platform.Variant
-	cfg.Created = v1.Time{Time: created}
-	img, err = mutate.ConfigFile(img, cfg)
+	img, err = mutate.ConfigFile(img, &v1.ConfigFile{
+		Architecture: platform.Architecture,
+		Created:      v1.Time{Time: created},
+		History:      cfg.History,
+		OS:           platform.OS,
+		RootFS:       cfg.RootFS,
+		Config:       cfg.Config,
+		Variant:      platform.Variant,
+	})
 	require.NoError(t, err)
 	return img
 }
 
-func mustParseReferenceInternal(t *testing.T, imageRef string) name.Reference {
+func mustParseReference(t *testing.T, imageRef string) name.Reference {
 	t.Helper()
 	ref, err := name.ParseReference(imageRef)
 	require.NoError(t, err)
 	return ref
 }
 
-func writeImageInternal(t *testing.T, imageRef string, img v1.Image, options ...remote.Option) {
+func writeImage(t *testing.T, imageRef string, img v1.Image, options ...remote.Option) {
 	t.Helper()
-	require.NoError(t, remote.Write(mustParseReferenceInternal(t, imageRef), img, options...))
+	require.NoError(t, remote.Write(mustParseReference(t, imageRef), img, options...))
 }
 
-func imageSizeInternal(t *testing.T, img v1.Image) int64 {
+func imageSize(t *testing.T, img v1.Image) int64 {
 	t.Helper()
 	digest, err := img.Digest()
 	require.NoError(t, err)
-	platform, err := tagPlatformInternal(img, nil, digest)
+	platform, err := tagPlatform(img, nil, digest)
 	require.NoError(t, err)
 	return platform.Size
 }
 
-func browseParamsInternal(search string) pagination.QueryParams {
+func browseParams(search string) pagination.QueryParams {
 	return pagination.QueryParams{
 		Search: search,
 		Start:  0, Limit: 20,
 	}
 }
 
-func TestService_ListRepositoriesInternal(t *testing.T) {
-	host := newTestRegistryInternal(t)
-	img := platformImageInternal(t, v1.Platform{OS: "linux", Architecture: "amd64"}, time.Now())
-	writeImageInternal(t, host+"/team/api:1.0", img)
-	writeImageInternal(t, host+"/team/web:1.0", img)
-	writeImageInternal(t, host+"/other/tool:1.0", img)
+func TestService_ListRepositories(t *testing.T) {
+	host := newTestRegistry(t)
+	img := platformImage(t, v1.Platform{OS: "linux", Architecture: "amd64"}, time.Now())
+	writeImage(t, host+"/team/api:1.0", img)
+	writeImage(t, host+"/team/web:1.0", img)
+	writeImage(t, host+"/other/tool:1.0", img)
 
-	registries := testRegistriesInternal{}
-	svc := newTestServiceInternal(registries)
+	registries := testRegistries{}
+	svc := newTestService(registries)
 	ctx := t.Context()
 
 	id := registries.add(host, "", "")
-	repositories, page, err := svc.ListRepositories(ctx, id, browseParamsInternal(""))
+	repositories, page, err := svc.ListRepositories(ctx, id, browseParams(""))
 	require.NoError(t, err)
-	assert.Equal(t, []string{"other/tool", "team/api", "team/web"}, repositoryNamesInternal(repositories))
+	assert.Equal(t, []string{"other/tool", "team/api", "team/web"}, repositoryNames(repositories))
 	assert.EqualValues(t, 3, page.TotalItems)
 
-	repositories, _, err = svc.ListRepositories(ctx, id, browseParamsInternal("web"))
+	repositories, _, err = svc.ListRepositories(ctx, id, browseParams("web"))
 	require.NoError(t, err)
-	assert.Equal(t, []string{"team/web"}, repositoryNamesInternal(repositories))
+	assert.Equal(t, []string{"team/web"}, repositoryNames(repositories))
 
 	namespacedID := registries.add("http://"+host+"/team/", "", "")
-	repositories, _, err = svc.ListRepositories(ctx, namespacedID, browseParamsInternal(""))
+	repositories, _, err = svc.ListRepositories(ctx, namespacedID, browseParams(""))
 	require.NoError(t, err)
-	assert.Equal(t, []string{"team/api", "team/web"}, repositoryNamesInternal(repositories))
+	assert.Equal(t, []string{"team/api", "team/web"}, repositoryNames(repositories))
 }
 
-func TestService_ListRepositoryTagsSingleImageInternal(t *testing.T) {
-	host := newTestRegistryInternal(t)
+func TestService_ListRepositoryTagsSingleImage(t *testing.T) {
+	host := newTestRegistry(t)
 	created := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
-	img := platformImageInternal(t, v1.Platform{OS: "linux", Architecture: "arm64", Variant: "v8"}, created)
-	writeImageInternal(t, host+"/team/api:1.0", img)
-	writeImageInternal(t, host+"/team/api:2.0", img)
+	img := platformImage(t, v1.Platform{OS: "linux", Architecture: "arm64", Variant: "v8"}, created)
+	writeImage(t, host+"/team/api:1.0", img)
+	writeImage(t, host+"/team/api:2.0", img)
 
-	registries := testRegistriesInternal{}
-	svc := newTestServiceInternal(registries)
+	registries := testRegistries{}
+	svc := newTestService(registries)
 	id := registries.add(host, "", "")
 
 	tags, page, err := svc.ListRepositoryTags(t.Context(), id, "team/api", pagination.QueryParams{Start: 0, Limit: 1})
@@ -158,7 +161,7 @@ func TestService_ListRepositoryTagsSingleImageInternal(t *testing.T) {
 
 	digest, err := img.Digest()
 	require.NoError(t, err)
-	size := imageSizeInternal(t, img)
+	size := imageSize(t, img)
 
 	tag := tags[0]
 	assert.Equal(t, "1.0", tag.Name)
@@ -173,12 +176,12 @@ func TestService_ListRepositoryTagsSingleImageInternal(t *testing.T) {
 	assert.Equal(t, "v8", tag.Platforms[0].Variant)
 }
 
-func TestService_ListRepositoryTagsIndexInternal(t *testing.T) {
-	host := newTestRegistryInternal(t)
+func TestService_ListRepositoryTagsIndex(t *testing.T) {
+	host := newTestRegistry(t)
 	amd64 := v1.Platform{OS: "linux", Architecture: "amd64"}
 	arm64 := v1.Platform{OS: "linux", Architecture: "arm64"}
-	amd64Image := platformImageInternal(t, amd64, time.Now())
-	arm64Image := platformImageInternal(t, arm64, time.Now())
+	amd64Image := platformImage(t, amd64, time.Now())
+	arm64Image := platformImage(t, arm64, time.Now())
 	attestation, err := random.Image(32, 1)
 	require.NoError(t, err)
 
@@ -191,16 +194,16 @@ func TestService_ListRepositoryTagsIndexInternal(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, remote.WriteIndex(ref, index))
 
-	registries := testRegistriesInternal{}
-	svc := newTestServiceInternal(registries)
+	registries := testRegistries{}
+	svc := newTestService(registries)
 	id := registries.add(host, "", "")
 
-	tags, _, err := svc.ListRepositoryTags(t.Context(), id, "team/api", browseParamsInternal(""))
+	tags, _, err := svc.ListRepositoryTags(t.Context(), id, "team/api", browseParams(""))
 	require.NoError(t, err)
 	require.Len(t, tags, 1)
 
-	amd64Size := imageSizeInternal(t, amd64Image)
-	arm64Size := imageSizeInternal(t, arm64Image)
+	amd64Size := imageSize(t, amd64Image)
+	arm64Size := imageSize(t, arm64Image)
 
 	tag := tags[0]
 	assert.Empty(t, tag.Error)
@@ -212,14 +215,14 @@ func TestService_ListRepositoryTagsIndexInternal(t *testing.T) {
 	assert.Equal(t, "arm64", tag.Platforms[1].Architecture)
 }
 
-func TestService_DeleteRepositoryTagInternal(t *testing.T) {
-	host := newTestRegistryInternal(t)
-	deleted := platformImageInternal(t, v1.Platform{OS: "linux", Architecture: "amd64"}, time.Now())
-	writeImageInternal(t, host+"/team/api:1.0", deleted)
-	writeImageInternal(t, host+"/team/api:2.0", platformImageInternal(t, v1.Platform{OS: "linux", Architecture: "amd64"}, time.Now()))
+func TestService_DeleteRepositoryTag(t *testing.T) {
+	host := newTestRegistry(t)
+	deleted := platformImage(t, v1.Platform{OS: "linux", Architecture: "amd64"}, time.Now())
+	writeImage(t, host+"/team/api:1.0", deleted)
+	writeImage(t, host+"/team/api:2.0", platformImage(t, v1.Platform{OS: "linux", Architecture: "amd64"}, time.Now()))
 
-	registries := testRegistriesInternal{}
-	svc := newTestServiceInternal(registries)
+	registries := testRegistries{}
+	svc := newTestService(registries)
 	id := registries.add(host, "", "")
 	ctx := t.Context()
 
@@ -229,13 +232,13 @@ func TestService_DeleteRepositoryTagInternal(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, deletedDigest.String(), digest)
 
-	_, err = remote.Head(mustParseReferenceInternal(t, host+"/team/api@"+digest))
+	_, err = remote.Head(mustParseReference(t, host+"/team/api@"+digest))
 	require.Error(t, err)
-	_, err = remote.Head(mustParseReferenceInternal(t, host+"/team/api:2.0"))
+	_, err = remote.Head(mustParseReference(t, host+"/team/api:2.0"))
 	require.NoError(t, err)
 }
 
-func TestService_BrowseUsesStoredCredentialsInternal(t *testing.T) {
+func TestService_BrowseUsesStoredCredentials(t *testing.T) {
 	registryHandler := registry.New(registry.Logger(log.New(io.Discard, "", 0)))
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		username, password, ok := r.BasicAuth()
@@ -251,29 +254,29 @@ func TestService_BrowseUsesStoredCredentialsInternal(t *testing.T) {
 	require.NoError(t, err)
 	host := "localhost:" + serverURL.Port()
 
-	writeImageInternal(t, host+"/private/app:1.0", platformImageInternal(t, v1.Platform{OS: "linux", Architecture: "amd64"}, time.Now()),
+	writeImage(t, host+"/private/app:1.0", platformImage(t, v1.Platform{OS: "linux", Architecture: "amd64"}, time.Now()),
 		remote.WithAuth(&authn.Basic{Username: "robot", Password: "secret"}))
 
-	registries := testRegistriesInternal{}
-	svc := newTestServiceInternal(registries)
+	registries := testRegistries{}
+	svc := newTestService(registries)
 	ctx := t.Context()
 
 	id := registries.add(host, "robot", "secret")
-	repositories, _, err := svc.ListRepositories(ctx, id, browseParamsInternal(""))
+	repositories, _, err := svc.ListRepositories(ctx, id, browseParams(""))
 	require.NoError(t, err)
-	assert.Equal(t, []string{"private/app"}, repositoryNamesInternal(repositories))
+	assert.Equal(t, []string{"private/app"}, repositoryNames(repositories))
 
 	anonymousID := registries.add(host, "", "")
-	_, _, err = svc.ListRepositories(ctx, anonymousID, browseParamsInternal(""))
+	_, _, err = svc.ListRepositories(ctx, anonymousID, browseParams(""))
 	assert.ErrorIs(t, err, common.ErrBadRequest)
 }
 
-func TestService_BrowseErrorsInternal(t *testing.T) {
-	host := newTestRegistryInternal(t)
-	writeImageInternal(t, host+"/team/api:1.0", platformImageInternal(t, v1.Platform{OS: "linux", Architecture: "amd64"}, time.Now()))
+func TestService_BrowseErrors(t *testing.T) {
+	host := newTestRegistry(t)
+	writeImage(t, host+"/team/api:1.0", platformImage(t, v1.Platform{OS: "linux", Architecture: "amd64"}, time.Now()))
 
-	registries := testRegistriesInternal{}
-	svc := newTestServiceInternal(registries)
+	registries := testRegistries{}
+	svc := newTestService(registries)
 	id := registries.add(host, "", "")
 	namespacedID := registries.add("http://"+host+"/team/", "", "")
 
@@ -285,7 +288,7 @@ func TestService_BrowseErrorsInternal(t *testing.T) {
 		{
 			name: "unknown registry",
 			call: func(ctx context.Context) error {
-				_, _, err := svc.ListRepositories(ctx, "missing", browseParamsInternal(""))
+				_, _, err := svc.ListRepositories(ctx, "missing", browseParams(""))
 				return err
 			},
 			wantErr: common.ErrNotFound,
@@ -293,7 +296,7 @@ func TestService_BrowseErrorsInternal(t *testing.T) {
 		{
 			name: "empty repository",
 			call: func(ctx context.Context) error {
-				_, _, err := svc.ListRepositoryTags(ctx, id, " / ", browseParamsInternal(""))
+				_, _, err := svc.ListRepositoryTags(ctx, id, " / ", browseParams(""))
 				return err
 			},
 			wantErr: common.ErrValidation,
@@ -301,7 +304,7 @@ func TestService_BrowseErrorsInternal(t *testing.T) {
 		{
 			name: "tags outside registry namespace",
 			call: func(ctx context.Context) error {
-				_, _, err := svc.ListRepositoryTags(ctx, namespacedID, "other/tool", browseParamsInternal(""))
+				_, _, err := svc.ListRepositoryTags(ctx, namespacedID, "other/tool", browseParams(""))
 				return err
 			},
 			wantErr: common.ErrValidation,
@@ -331,7 +334,7 @@ func TestService_BrowseErrorsInternal(t *testing.T) {
 	}
 }
 
-func repositoryNamesInternal(repositories []containerregistry.Repository) []string {
+func repositoryNames(repositories []containerregistry.Repository) []string {
 	names := make([]string, 0, len(repositories))
 	for _, repository := range repositories {
 		names = append(names, repository.Name)

@@ -1,5 +1,3 @@
-// Package registry owns registry credentials, digest inspection, pull usage,
-// synchronization, and the registry HTTP surface.
 package registry
 
 import (

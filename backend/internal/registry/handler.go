@@ -15,8 +15,6 @@ import (
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/utils/handlerutil"
 )
 
-const registryRemoteSyncFailureMessageInternal = "Failed to fan out registry sync to remote environments"
-
 // ContainerRegistryHandler handles container registry management endpoints.
 type ContainerRegistryHandler struct {
 	registryService      *ContainerRegistryService
@@ -63,9 +61,7 @@ func NewHandler(registryService *ContainerRegistryService, syncRemoteRegistries 
 
 // ListRegistries returns a paginated list of container registries.
 func (h *ContainerRegistryHandler) ListRegistries(ctx context.Context, input *ListContainerRegistriesInput) (*handlerutil.Page[containerregistry.ContainerRegistry], error) {
-	params := handlerutil.PaginationParams(input.Start, input.Limit, input.Sort, input.Order, input.Search)
-
-	registries, paginationResp, err := h.registryService.GetRegistriesPaginated(ctx, params)
+	registries, paginationResp, err := h.registryService.GetRegistriesPaginated(ctx, handlerutil.PaginationParams(input.Start, input.Limit, input.Sort, input.Order, input.Search))
 	if err != nil {
 		return nil, huma.Error500InternalServerError("Failed to list registries: " + err.Error())
 	}
@@ -173,7 +169,7 @@ func (h *ContainerRegistryHandler) TestRegistry(ctx context.Context, input *Test
 	}
 
 	// ECR registries use a different auth flow: generate a temporary token via AWS API.
-	if reg.RegistryType == "ecr" {
+	if reg.RegistryType == RegistryTypeECR {
 		if testECRRegistryErr := h.registryService.TestECRRegistry(ctx, reg); testECRRegistryErr != nil {
 			return nil, huma.Error400BadRequest("Registry test failed: " + testECRRegistryErr.Error())
 		}
@@ -189,10 +185,11 @@ func (h *ContainerRegistryHandler) TestRegistry(ctx context.Context, input *Test
 		return nil, huma.Error400BadRequest("Registry test failed: " + testRegistryErr.Error())
 	}
 
-	noCredentials := strings.TrimSpace(reg.Username) == "" && strings.TrimSpace(decryptedToken) == ""
-	msg := kit.Ternary(noCredentials, "Registry saved (no credentials to test)", "Authentication succeeded")
-
-	return handlerutil.MessageOutput(msg, ""), nil
+	return handlerutil.MessageOutput(kit.Ternary(
+		strings.TrimSpace(reg.Username) == "" && strings.TrimSpace(decryptedToken) == "",
+		"Registry saved (no credentials to test)",
+		"Authentication succeeded",
+	), ""), nil
 }
 
 // SyncRegistries syncs container registries from a remote source.
@@ -210,11 +207,9 @@ func (h *ContainerRegistryHandler) triggerRemoteRegistrySync(ctx context.Context
 		return
 	}
 
-	detachedCtx := context.WithoutCancel(ctx)
-
 	go func(syncCtx context.Context, syncReason string) {
 		if err := h.syncRemoteRegistries(syncCtx); err != nil {
-			slog.WarnContext(syncCtx, registryRemoteSyncFailureMessageInternal, "reason", syncReason, "error", err.Error())
+			slog.WarnContext(syncCtx, "Failed to fan out registry sync to remote environments", "reason", syncReason, "error", err.Error())
 		}
-	}(detachedCtx, reason)
+	}(context.WithoutCancel(ctx), reason)
 }
