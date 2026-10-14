@@ -62,6 +62,11 @@ import (
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/utils/notifications"
 )
 
+var testDockerService = &docker.DockerClientService{Client: func() *client.Client {
+	cli, _ := client.New(client.WithHost("tcp://127.0.0.1:1"), client.WithAPIVersion("1.41"))
+	return cli
+}()}
+
 type fakeDockerClientProvider struct {
 	client any
 }
@@ -507,7 +512,7 @@ func TestUpdaterService_PullImageAdapter(t *testing.T) {
 		registrySvc := registry.NewContainerRegistryService(db, nil, kv.NewKVService(db), nil)
 		imageSvc := image.NewImageService(db, dockerSvc, registrySvc, nil, nil, event.NewEventService(db, nil, nil), nil, nil)
 		envSvc := environment.NewEnvironmentService(db, nil, nil, nil, nil, nil)
-		projectSvc := project.NewProjectService(db, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+		projectSvc := project.NewProjectService(db, nil, nil, nil, testDockerService, nil, nil, nil, nil, nil, nil)
 		projectSvc.RegistryCredentialsProvider = envSvc.GetEnabledRegistryCredentials
 		svc, svcErr := NewUpdaterService(db, nil, dockerSvc, projectSvc, nil, nil, nil, imageSvc, nil, nil, nil, nil, nil, nil, nil)
 		require.NoError(t, svcErr)

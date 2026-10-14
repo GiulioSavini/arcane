@@ -3,6 +3,7 @@
 package deployment
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"slices"
 
 	composetypes "github.com/compose-spec/compose-go/v2/types"
+	"github.com/docker/compose/v5/pkg/api"
 	"github.com/getarcaneapp/arcane/types/v2"
 	"github.com/getarcaneapp/arcane/types/v2/containerregistry"
 	projecttypes "github.com/getarcaneapp/arcane/types/v2/project"
@@ -34,8 +36,7 @@ type Builder interface {
 	BuildSettings() buildtypes.BuildSettings
 }
 
-// Service runs the image side of deployments: pulls, update reconciliation,
-// builds and namespace dependent discovery.
+// Service runs the image side of deployments: pulls, update reconciliation, builds and dependents.
 type Service struct {
 	settingsService *settings.SettingsService
 	imageService    *image.ImageService
@@ -44,11 +45,15 @@ type Service struct {
 }
 
 func New(settingsService *settings.SettingsService, imageService *image.ImageService, dockerService *docker.DockerClientService, buildService Builder) *Service {
-	return &Service{settingsService: settingsService, imageService: imageService, dockerService: dockerService, buildService: buildService}
+	return &Service{
+		settingsService: settingsService,
+		imageService:    imageService,
+		dockerService:   dockerService,
+		buildService:    buildService,
+	}
 }
 
-// Pull pulls one image within the configured pull timeout and reconciles its
-// update state.
+// Pull pulls one image within the configured pull timeout and reconciles its update state.
 func (s *Service) Pull(
 	ctx context.Context,
 	imageRef string,
@@ -56,10 +61,6 @@ func (s *Service) Pull(
 	user usertypes.Actor,
 	credentials []containerregistry.Credential,
 ) error {
-	if s == nil || s.imageService == nil {
-		return errors.New("image service not available")
-	}
-
 	cfg := s.settingsService.GetSettingsConfig()
 
 	pullCtx, pullCancel := context.WithTimeout(ctx, timeouts.GetDuration(cfg.DockerImagePullTimeout.AsInt(), timeouts.DefaultDockerImagePull))
@@ -78,11 +79,8 @@ func (s *Service) Pull(
 	return nil
 }
 
-// NamespaceDependents splits projects.NamespaceDependents into
-// services with a running container and services with only stopped ones, so a
-// stopped dependent is recreated but not started, and a declared-but-never-
-// created dependent is left alone. A ComposePs failure treats every dependent
-// as running: a dangling namespace reference is the worse outcome.
+// NamespaceDependents splits dependents into running and stopped-only services; never-created ones are skipped.
+// A ComposePs failure treats every dependent as running, since a dangling namespace reference is worse.
 func (s *Service) NamespaceDependents(ctx context.Context, compProj *composetypes.Project, services []string) (running, stopped []string) {
 	if len(services) == 0 {
 		return nil, nil
@@ -97,17 +95,14 @@ func (s *Service) NamespaceDependents(ctx context.Context, compProj *composetype
 		return deps, nil
 	}
 	for _, name := range deps {
-		var found, isRunning bool
-		for _, summary := range summaries {
-			if summary.Service == name {
-				found = true
-				isRunning = isRunning || summary.State == "running"
-			}
-		}
 		switch {
-		case isRunning:
+		case slices.ContainsFunc(summaries, func(summary api.ContainerSummary) bool {
+			return summary.Service == name && summary.State == "running"
+		}):
 			running = append(running, name)
-		case found:
+		case slices.ContainsFunc(summaries, func(summary api.ContainerSummary) bool {
+			return summary.Service == name
+		}):
 			stopped = append(stopped, name)
 		}
 	}
@@ -116,35 +111,22 @@ func (s *Service) NamespaceDependents(ctx context.Context, compProj *composetype
 
 // ImageOperations wires image pulls, existence checks and builds for Compose.
 func (s *Service) ImageOperations(user *usertypes.Actor, credentials []containerregistry.Credential) projecttypes.ComposeImageOperations {
-	operations := projecttypes.ComposeImageOperations{
+	return projecttypes.ComposeImageOperations{
+		Exists:     s.imageService.ImageExistsLocally,
+		LastTagged: s.imageService.ImageLastTagTime,
 		Pull: func(ctx context.Context, image string, progress io.Writer) error {
-			actor := usertypes.SystemUser
-			if user != nil {
-				actor = *user
-			}
-			return s.Pull(ctx, image, progress, actor, credentials)
+			return s.Pull(ctx, image, progress, *cmp.Or(user, &usertypes.SystemUser), credentials)
 		},
-	}
-	if s.imageService != nil {
-		operations.Exists = s.imageService.ImageExistsLocally
-		operations.LastTagged = s.imageService.ImageLastTagTime
-	}
-	if s.buildService != nil {
-		operations.BuildProvider = s.buildService.BuildSettings().BuildProvider
-		operations.Build = func(ctx context.Context, request buildtypes.BuildRequest, progress io.Writer, service string) error {
+		Build: func(ctx context.Context, request buildtypes.BuildRequest, progress io.Writer, service string) error {
 			_, err := s.buildService.BuildImage(ctx, types.LocalDockerEnvironmentID, request, progress, service, user)
 			return err
-		}
+		},
+		BuildProvider: s.buildService.BuildSettings().BuildProvider,
 	}
-	return operations
 }
 
-// PrepareProjectBindDirectories creates missing bind-mount sources inside
-// projectPath as Arcane's runtime user before deploys; Docker would create them as root (#4132).
-//
-// Only sources with Compose's automatic host path creation are considered.
-// Existing paths, sources escaping the project lexically or through a symlink
-// (#4195), and sources Arcane cannot inspect are left to Docker.
+// PrepareProjectBindDirectories creates missing auto-created bind sources as Arcane's user, not root (#4132).
+// Existing, escaping (#4195) and uninspectable sources are left to Docker.
 func PrepareProjectBindDirectories(projectPath string) projects.PrepareProjectFunc {
 	return func(ctx context.Context, project *composetypes.Project) error {
 		for _, serviceName := range slices.Sorted(maps.Keys(project.Services)) {

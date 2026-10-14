@@ -12,6 +12,7 @@ import (
 
 	"github.com/getarcaneapp/arcane/types/v2/user"
 	"github.com/libtnb/sqlite"
+	"github.com/moby/moby/client"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
@@ -19,6 +20,7 @@ import (
 	"github.com/getarcaneapp/arcane/backend/v2/internal/common"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/config"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/database"
+	dockerInternal "github.com/getarcaneapp/arcane/backend/v2/internal/docker"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/event"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/gitrepo"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/imageupdate"
@@ -27,6 +29,11 @@ import (
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/gitutil"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/projects"
 )
+
+var testDockerService = &dockerInternal.DockerClientService{Client: func() *client.Client {
+	cli, _ := client.New(client.WithHost("tcp://127.0.0.1:1"), client.WithAPIVersion("1.41"))
+	return cli
+}()}
 
 func setupSyncTestService(t *testing.T) (*Service, *database.DB, string) {
 	t.Helper()
@@ -48,7 +55,7 @@ func setupSyncTestService(t *testing.T) (*Service, *database.DB, string) {
 	require.NoError(t, settingsService.SetStringSetting(ctx, "projectsDirectory", projectsDir))
 
 	eventService := event.NewEventService(arcaneDB, config.Load(), nil)
-	projectService := projectpkg.NewProjectService(arcaneDB, settingsService, eventService, nil, nil, nil, nil, nil, config.Load(), nil, nil)
+	projectService := projectpkg.NewProjectService(arcaneDB, settingsService, eventService, nil, testDockerService, nil, nil, nil, config.Load(), nil, nil)
 
 	limits := func(_ context.Context, sync *projectpkg.GitOpsSync) (int, int64, int64) {
 		return sync.MaxSyncFiles, sync.MaxSyncTotalSize, sync.MaxSyncBinarySize

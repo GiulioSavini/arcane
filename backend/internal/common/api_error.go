@@ -119,6 +119,8 @@ func ToAPIError(err error) *APIError {
 		return NewAPIError(err.Error(), APIErrorCodeTimeout, http.StatusGatewayTimeout)
 	case errors.Is(err, ErrUnavailable):
 		return NewAPIError(err.Error(), APIErrorCodeInternalServerError, http.StatusServiceUnavailable)
+	case errors.Is(err, ErrInsufficientStorage):
+		return NewAPIError(err.Error(), APIErrorCodeInternalServerError, http.StatusInsufficientStorage)
 	}
 
 	return NewAPIError(err.Error(), APIErrorCodeInternalServerError, http.StatusInternalServerError)

@@ -20,7 +20,6 @@ import (
 	imagetypes "github.com/getarcaneapp/arcane/types/v2/image"
 	"github.com/getarcaneapp/arcane/types/v2/project"
 	"github.com/moby/moby/api/types/container"
-	"github.com/moby/moby/client"
 	"go.getarcane.app/docker"
 	"go.getarcane.app/kit/pkg"
 	"go.getarcane.app/sys/cgroup"
@@ -46,22 +45,21 @@ type Service struct {
 }
 
 func New(db *database.DB, dockerService *dockerInternal.DockerClientService, imageService *image.ImageService, settingsService *settings.SettingsService) *Service {
-	return &Service{db: db, dockerService: dockerService, imageService: imageService, settingsService: settingsService}
+	return &Service{
+		db:              db,
+		dockerService:   dockerService,
+		imageService:    imageService,
+		settingsService: settingsService,
+	}
 }
 
-// ComposeContainers routes the global compose-container
-// list through the shared Docker client singleton when one is wired, avoiding
-// a fresh docker CLI per call.
+// ComposeContainers lists global compose containers through the shared Docker client, avoiding a fresh docker CLI per call.
 func (s *Service) ComposeContainers(ctx context.Context) ([]container.Summary, error) {
-	var dockerClient client.APIClient
-	if s.dockerService != nil {
-		cli, err := s.dockerService.GetClient(ctx)
-		if err != nil {
-			return nil, err
-		}
-		dockerClient = cli
+	cli, err := s.dockerService.GetClient(ctx)
+	if err != nil {
+		return nil, err
 	}
-	return projects.ListGlobalComposeContainers(ctx, dockerClient, s.dockerService.DockerHost())
+	return projects.ListGlobalComposeContainers(ctx, cli, s.dockerService.DockerHost())
 }
 
 // ComposeServices reports every Compose service with its container state,
@@ -83,17 +81,14 @@ func (s *Service) ComposeServices(
 		slog.ErrorContext(ctx, "compose ps error", "projectName", composeProject.Name, "error", err)
 		return nil, fmt.Errorf("failed to get compose services status: %w", err)
 	}
-	// Compose ps omits image IDs, so one container list supplies them; a listing
-	// failure only leaves image-level checks unmatched.
+	// Compose ps omits image IDs; a listing failure only leaves image-level checks unmatched.
 	imageIDs := make(map[string]string)
-	if s.dockerService != nil {
-		if summaries, listErr := s.ComposeContainers(ctx); listErr != nil {
-			slog.WarnContext(ctx, "failed to list containers for project image identity", "projectName", composeProject.Name, "error", listErr)
-		} else {
-			for _, c := range summaries {
-				if docker.ComposeProjectLabel(c.Labels) == composeProject.Name && c.ImageID != "" {
-					imageIDs[c.ID] = c.ImageID
-				}
+	if summaries, listErr := s.ComposeContainers(ctx); listErr != nil {
+		slog.WarnContext(ctx, "failed to list containers for project image identity", "projectName", composeProject.Name, "error", listErr)
+	} else {
+		for _, c := range summaries {
+			if docker.ComposeProjectLabel(c.Labels) == composeProject.Name && c.ImageID != "" {
+				imageIDs[c.ID] = c.ImageID
 			}
 		}
 	}
@@ -101,40 +96,28 @@ func (s *Service) ComposeServices(
 
 	have := map[string]bool{}
 	var services []project.RuntimeService
-
-	// Create a map for quick lookup of service config
-	serviceConfigs := make(map[string]types.ServiceConfig)
-	for _, svc := range composeProject.Services {
-		serviceConfigs[svc.Name] = svc
-	}
-
 	for _, c := range containers {
-		var health *string
-		if c.Health != "" {
-			health = new(string(c.Health))
-		}
-
-		var svcConfig *types.ServiceConfig
-		if cfg, ok := serviceConfigs[c.Service]; ok {
-			svcConfig = &cfg
-		}
-
 		resolvedIcon := iconcatalog.Resolve(catalog, cmp.Or(
 			projects.FindArcaneIconSet(c.Labels),
 			meta.ServiceIconSets[c.Service],
 			meta.ProjectIcon,
 		))
 		services = append(services, project.RuntimeService{
-			Name:             c.Service,
-			Image:            c.Image,
-			Status:           string(c.State),
-			ContainerID:      c.ID,
-			ContainerName:    c.Name,
-			Ports:            projects.FormatPorts(c.Publishers),
-			Health:           health,
-			IconLightURL:     resolvedIcon.IconLightURL,
-			IconDarkURL:      resolvedIcon.IconDarkURL,
-			ServiceConfig:    svcConfig,
+			Name:          c.Service,
+			Image:         c.Image,
+			Status:        string(c.State),
+			ContainerID:   c.ID,
+			ContainerName: c.Name,
+			Ports:         projects.FormatPorts(c.Publishers),
+			Health:        kit.Ternary(c.Health != "", new(string(c.Health)), nil),
+			IconLightURL:  resolvedIcon.IconLightURL,
+			IconDarkURL:   resolvedIcon.IconDarkURL,
+			ServiceConfig: func() *types.ServiceConfig {
+				if cfg, ok := composeProject.Services[c.Service]; ok {
+					return &cfg
+				}
+				return nil
+			}(),
 			ContainerLabels:  c.Labels,
 			RedeployDisabled: labels.ShouldDisableArcaneServerRedeploy(c.Labels, c.ID, currentContainerID, currentContainerErr),
 			ImageID:          imageIDs[c.ID],
@@ -173,35 +156,34 @@ func (s *Service) IncludeFiles(ctx context.Context, composeFile string) []projec
 	// Load environment variables so that include paths with ${VAR} references are expanded
 	cfg := s.settingsService.GetSettingsOrDefaults(ctx)
 	projectsDirectory, _ := projects.GetProjectsDirectory(ctx, strings.TrimSpace(cfg.ProjectsDirectory.Value))
-	envLoader := projects.NewEnvLoader(projectsDirectory, filepath.Dir(composeFile), kit.ParseOrDefault(cfg.AutoInjectEnv.Value, false, strconv.ParseBool))
-	envMap, _, _ := envLoader.LoadEnvironment(ctx)
+	envMap, _, _ := projects.NewEnvLoader(projectsDirectory, filepath.Dir(composeFile), kit.ParseOrDefault(cfg.AutoInjectEnv.Value, false, strconv.ParseBool)).LoadEnvironment(ctx)
 
 	includes, parseErr := projects.ParseIncludes(composeFile, envMap, false)
-	if parseErr == nil {
-		var includeFiles []project.IncludeFile
-		for _, inc := range includes {
-			includeFiles = append(includeFiles, project.IncludeFile{
-				Path:         inc.Path,
-				RelativePath: inc.RelativePath,
-			})
-		}
-		return includeFiles
+	if parseErr != nil {
+		slog.WarnContext(ctx, "Failed to parse includes", "error", parseErr, "path", composeFile)
+		return nil
 	}
-	slog.WarnContext(ctx, "Failed to parse includes", "error", parseErr, "path", composeFile)
-	return nil
+	var includeFiles []project.IncludeFile
+	for _, inc := range includes {
+		includeFiles = append(includeFiles, project.IncludeFile{
+			Path:         inc.Path,
+			RelativePath: inc.RelativePath,
+		})
+	}
+	return includeFiles
 }
 
 // ContainerUpdateInfo returns update checks scoped to the projects' running containers.
-func (s *Service) ContainerUpdateInfo(ctx context.Context, details []project.Details) map[string]*imagetypes.UpdateInfo {
-	if s == nil || s.imageService == nil {
-		return nil
-	}
+func (s *Service) ContainerUpdateInfo(ctx context.Context, services []project.RuntimeService) map[string]*imagetypes.UpdateInfo {
 	var containers []container.Summary
-	for _, detail := range details {
-		for _, service := range detail.RuntimeServices {
-			if service.ContainerID != "" {
-				containers = append(containers, container.Summary{ID: service.ContainerID, Image: service.Image, ImageID: service.ImageID, Labels: service.ContainerLabels})
-			}
+	for _, service := range services {
+		if service.ContainerID != "" {
+			containers = append(containers, container.Summary{
+				ID:      service.ContainerID,
+				Image:   service.Image,
+				ImageID: service.ImageID,
+				Labels:  service.ContainerLabels,
+			})
 		}
 	}
 	scoped, err := s.imageService.GetUpdateInfoByContainers(ctx, containers)
@@ -214,7 +196,7 @@ func (s *Service) ContainerUpdateInfo(ctx context.Context, details []project.Det
 
 // ServiceUpdateRecords loads per-service update checks for the projects.
 func (s *Service) ServiceUpdateRecords(ctx context.Context, projectIDs []string) []imageupdate.ImageUpdateRecord {
-	if s == nil || s.db == nil || len(projectIDs) == 0 {
+	if len(projectIDs) == 0 {
 		return nil
 	}
 	var records []imageupdate.ImageUpdateRecord
@@ -234,10 +216,8 @@ func Logs(ctx context.Context, projectName string, logsChan chan<- string, follo
 
 	// Reader goroutine: forward lines to channel
 	go func() {
-		// Closing the read half unblocks any pending pw.Write in ComposeLogs.
-		// Without it, an abandoned tail (ctx cancel, or a >1MiB line tripping
-		// bufio.ErrTooLong) wedges the writer goroutine forever and this
-		// function never collects its second done value.
+		// Closing the read half unblocks a pending pw.Write in ComposeLogs after an abandoned tail
+		// (ctx cancel or bufio.ErrTooLong); otherwise the writer goroutine wedges forever.
 		defer func() { _ = pr.CloseWithError(io.ErrClosedPipe) }()
 
 		sc := bufio.NewScanner(pr)
@@ -261,10 +241,7 @@ func Logs(ctx context.Context, projectName string, logsChan chan<- string, follo
 	}()
 
 	// Wait for both goroutines to finish to avoid sending on a closed channel
-	err1 := <-done
-	err2 := <-done
-
-	for _, e := range []error{err1, err2} {
+	for _, e := range []error{<-done, <-done} {
 		if e != nil && !errors.Is(e, io.EOF) && !errors.Is(e, context.Canceled) {
 			return e
 		}
@@ -275,8 +252,7 @@ func Logs(ctx context.Context, projectName string, logsChan chan<- string, follo
 func MergeProjectContainerUpdateInfo(base map[string]*imagetypes.UpdateInfo, services []project.RuntimeService, scoped map[string]*imagetypes.UpdateInfo) map[string]*imagetypes.UpdateInfo {
 	result := make(map[string]*imagetypes.UpdateInfo, len(base))
 	maps.Copy(result, base)
-	// Shared image results are dropped for references used only by services
-	// that opted out of update checks.
+	// Shared image results are dropped for references used only by services that opted out of update checks.
 	monitored := make(map[string]bool)
 	for _, service := range services {
 		imageRef := strings.TrimSpace(service.Image)
@@ -300,28 +276,40 @@ func MergeProjectContainerUpdateInfo(base map[string]*imagetypes.UpdateInfo, ser
 		if imageRef == "" {
 			continue
 		}
-		merged := *info
-		if seen[imageRef] {
-			previous := result[imageRef]
-			merged.HasUpdate = merged.HasUpdate || previous.HasUpdate
-			if previous.CheckTime.After(merged.CheckTime) {
-				merged.CheckTime = previous.CheckTime
-			}
-			if previous.LatestVersion != merged.LatestVersion || previous.LatestDigest != merged.LatestDigest || previous.UpdateType != merged.UpdateType {
-				merged.LatestVersion, merged.LatestDigest, merged.UpdateType = "", "", ""
-			}
-			if merged.Error == "" {
-				merged.Error = previous.Error
-			}
+		previous := kit.Ternary(seen[imageRef], result[imageRef], info)
+		result[imageRef] = &imagetypes.UpdateInfo{ //exhaustruct:enforce
+			CheckTime: kit.Ternary(previous.CheckTime.After(info.CheckTime), previous.CheckTime, info.CheckTime),
+			UpdateType: kit.Ternary(
+				previous.LatestVersion != info.LatestVersion || previous.LatestDigest != info.LatestDigest || previous.UpdateType != info.UpdateType,
+				"",
+				info.UpdateType,
+			),
+			CurrentVersion: info.CurrentVersion,
+			LatestVersion: kit.Ternary(
+				previous.LatestVersion != info.LatestVersion || previous.LatestDigest != info.LatestDigest || previous.UpdateType != info.UpdateType,
+				"",
+				info.LatestVersion,
+			),
+			CurrentDigest: info.CurrentDigest,
+			LatestDigest: kit.Ternary(
+				previous.LatestVersion != info.LatestVersion || previous.LatestDigest != info.LatestDigest || previous.UpdateType != info.UpdateType,
+				"",
+				info.LatestDigest,
+			),
+			Error:          cmp.Or(info.Error, previous.Error),
+			AuthMethod:     info.AuthMethod,
+			AuthUsername:   info.AuthUsername,
+			AuthRegistry:   info.AuthRegistry,
+			ResponseTimeMs: info.ResponseTimeMs,
+			HasUpdate:      info.HasUpdate || previous.HasUpdate,
+			UsedCredential: info.UsedCredential,
 		}
-		result[imageRef] = &merged
 		seen[imageRef] = true
 	}
 	return result
 }
 
-// ConfiguredRuntimeServiceUpdateInfo binds runtime checks to the current Compose
-// source, since container labels may predate an operator edit.
+// ConfiguredRuntimeServiceUpdateInfo binds runtime checks to the current Compose source, since labels may predate an edit.
 func ConfiguredRuntimeServiceUpdateInfo(services []types.ServiceConfig, runtime []project.RuntimeService, scoped map[string]*imagetypes.UpdateInfo) map[string]*imagetypes.UpdateInfo {
 	configs := make(map[string]types.ServiceConfig, len(services))
 	for _, service := range services {
@@ -329,19 +317,18 @@ func ConfiguredRuntimeServiceUpdateInfo(services []types.ServiceConfig, runtime 
 	}
 	grouped := make(map[string][]project.RuntimeService)
 	for _, service := range runtime {
-		name := service.Name
-		if name == "" {
-			name = docker.ComposeServiceLabel(service.ContainerLabels)
-		}
-		config, ok := configs[name]
+		config, ok := configs[cmp.Or(service.Name, docker.ComposeServiceLabel(service.ContainerLabels))]
 		if !ok || scoped[service.ContainerID] == nil {
 			continue
 		}
 		if imageref.UpdatePolicyKey(config.Image, config.Labels) != imageref.UpdatePolicyKey(service.Image, service.ContainerLabels) {
 			continue
 		}
-		service.Image = config.Image
-		grouped[name] = append(grouped[name], service)
+		grouped[config.Name] = append(grouped[config.Name], project.RuntimeService{
+			ContainerLabels: service.ContainerLabels,
+			Image:           config.Image,
+			ContainerID:     service.ContainerID,
+		})
 	}
 	result := make(map[string]*imagetypes.UpdateInfo, len(grouped))
 	for name, replicas := range grouped {
@@ -350,7 +337,8 @@ func ConfiguredRuntimeServiceUpdateInfo(services []types.ServiceConfig, runtime 
 	return result
 }
 
-func ExcludeHiddenRuntimeServices(details []project.Details) (map[string]map[string]bool, map[string]map[string]bool) {
+func ExcludeHiddenRuntimeServices(details []project.Details) ([][]project.RuntimeService, map[string]map[string]bool, map[string]map[string]bool) {
+	visibleByIndex := make([][]project.RuntimeService, len(details))
 	hiddenServicesByProjectID := make(map[string]map[string]bool)
 	hiddenRefsByProjectID := make(map[string]map[string]bool)
 	for i := range details {
@@ -358,8 +346,7 @@ func ExcludeHiddenRuntimeServices(details []project.Details) (map[string]map[str
 		hiddenRefs := make(map[string]bool)
 		visibleServices := make([]project.RuntimeService, 0, len(details[i].RuntimeServices))
 		for _, service := range details[i].RuntimeServices {
-			hidden, _ := kit.ParseBool(service.ContainerLabels[libarcane.HiddenResourceLabel])
-			if hidden {
+			if hidden, _ := kit.ParseBool(service.ContainerLabels[libarcane.HiddenResourceLabel]); hidden {
 				hiddenServices[service.Name] = true
 				hiddenRefs[service.Image] = true
 				continue
@@ -372,45 +359,36 @@ func ExcludeHiddenRuntimeServices(details []project.Details) (map[string]map[str
 		}
 		hiddenServicesByProjectID[details[i].ID] = hiddenServices
 		hiddenRefsByProjectID[details[i].ID] = hiddenRefs
-		details[i].RuntimeServices = visibleServices
+		visibleByIndex[i] = visibleServices
 	}
-	return hiddenServicesByProjectID, hiddenRefsByProjectID
+	return visibleByIndex, hiddenServicesByProjectID, hiddenRefsByProjectID
 }
 
-// ResolveDetailsOverride returns the override file name and content, hidden when
-// a COMPOSE_FILE selection omits it since deploy would ignore edits to it.
+// ResolveDetailsOverride returns the override file name and content, hidden when a COMPOSE_FILE selection omits it.
 func ResolveDetailsOverride(projectPath, overrideContent string, composeSelection []string) (fileName, content string) {
 	overridePath := projects.DetectComposeOverrideFile(projectPath)
 	if len(composeSelection) > 0 {
 		if overridePath == "" {
 			return "", ""
 		}
-		// Selection entries are absolute and cleaned; compare full paths so a
-		// same-named file in a subdirectory is not the project-root override.
+		// Selection entries are absolute; full paths keep a same-named subdirectory file from matching.
 		absOverride, err := filepath.Abs(filepath.Clean(overridePath))
 		if err != nil || !slices.Contains(composeSelection, absOverride) {
 			return "", ""
 		}
 	}
-	if overridePath != "" {
-		fileName = filepath.Base(overridePath)
-	}
-	return fileName, overrideContent
+	return kit.Ternary(overridePath != "", filepath.Base(overridePath), ""), overrideContent
 }
 
-// ComposeSelectionRelativePaths returns a multi-file COMPOSE_FILE selection as
-// ordered project-relative paths; nil for single or empty selections.
+// ComposeSelectionRelativePaths returns a multi-file COMPOSE_FILE selection as ordered project-relative paths.
 func ComposeSelectionRelativePaths(projectPath string, selection []string) []string {
 	if len(selection) <= 1 {
 		return nil
 	}
 	rels := make([]string, 0, len(selection))
 	for _, f := range selection {
-		if rel, err := filepath.Rel(projectPath, f); err == nil {
-			rels = append(rels, rel)
-		} else {
-			rels = append(rels, filepath.Base(f))
-		}
+		rel, err := filepath.Rel(projectPath, f)
+		rels = append(rels, kit.Ternary(err == nil, rel, filepath.Base(f)))
 	}
 	return rels
 }

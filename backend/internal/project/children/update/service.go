@@ -22,7 +22,9 @@ import (
 	"github.com/getarcaneapp/arcane/types/v2/project"
 	"github.com/getarcaneapp/arcane/types/v2/volume"
 	"github.com/moby/moby/client"
+	"github.com/samber/mo"
 	"go.getarcane.app/acfs"
+	"go.getarcane.app/kit/pkg"
 	"go.getarcane.app/updater"
 	"go.getarcane.app/updater/pkg/utils/tagpolicy"
 	"go.getarcane.app/updater/refs"
@@ -36,9 +38,8 @@ import (
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/projects"
 )
 
-// Service edits project Compose sources for image updates and persists
-// rename journals in the KV store. Project rows stay with the parent, which
-// supplies their state through callbacks.
+// Service edits Compose sources for image updates and persists rename journals in the KV store.
+// Project rows stay with the parent, which supplies their state through callbacks.
 type Service struct {
 	kv              *kv.KVService
 	dockerService   *docker.DockerClientService
@@ -84,10 +85,6 @@ func (s *Service) SyncState(ctx context.Context) SyncState {
 		SkipDiscoveredPaths: make(map[string]struct{}),
 		ProtectSeenPaths:    make(map[string]struct{}),
 	}
-	if s == nil || s.kv == nil {
-		return state
-	}
-
 	entries, err := s.kv.ListByPrefix(ctx, project.RenameJournalKeyPrefix)
 	if err != nil {
 		slog.WarnContext(ctx, "failed to list project rename journals during filesystem sync", "error", err)
@@ -117,11 +114,7 @@ func (s *Service) SyncState(ctx context.Context) SyncState {
 // Prepare builds the journal for renaming a project, or nil when the name
 // does not change.
 func (s *Service) Prepare(projectID, oldName, oldPath string, oldDirName, name *string, projectsDirectory string, migration volume.Migration) *project.RenameJournal {
-	if s == nil || s.kv == nil || name == nil {
-		return nil
-	}
-
-	newName := strings.TrimSpace(*name)
+	newName := strings.TrimSpace(kit.FromPtr(name))
 	if newName == "" || oldName == newName {
 		return nil
 	}
@@ -131,33 +124,41 @@ func (s *Service) Prepare(projectID, oldName, oldPath string, oldDirName, name *
 		return nil
 	}
 
-	journal := &project.RenameJournal{
+	return &project.RenameJournal{
 		ProjectID:  projectID,
 		OldName:    oldName,
 		NewName:    newName,
 		OldPath:    filepath.Clean(oldPath),
 		NewPath:    filepath.Clean(filepath.Join(projectsDirectory, newDirName)),
+		OldDirName: mo.PointerToOption(oldDirName).ToPointer(),
 		NewDirName: newDirName,
 		Phase:      project.RenameJournalPhaseStarted,
+		Volumes: func() []volume.JournalVolume {
+			if source, ok := migration.(volume.JournalSource); ok {
+				return source.JournalVolumes()
+			}
+			return nil
+		}(),
 	}
-	if oldDirName != nil {
-		journal.OldDirName = new(*oldDirName)
-	}
-
-	if source, ok := migration.(volume.JournalSource); ok {
-		journal.Volumes = source.JournalVolumes()
-	}
-
-	return journal
 }
 
 // WriteJournal stores the journal at the given phase.
 func (s *Service) WriteJournal(ctx context.Context, journal *project.RenameJournal, phase string) error {
-	if s == nil || s.kv == nil || journal == nil {
+	if journal == nil {
 		return nil
 	}
-	journal.Phase = phase
-	journal.UpdatedAt = time.Now().UTC()
+	*journal = project.RenameJournal{ //exhaustruct:enforce
+		ProjectID:  journal.ProjectID,
+		OldName:    journal.OldName,
+		NewName:    journal.NewName,
+		OldPath:    journal.OldPath,
+		NewPath:    journal.NewPath,
+		OldDirName: journal.OldDirName,
+		NewDirName: journal.NewDirName,
+		Phase:      phase,
+		Volumes:    journal.Volumes,
+		UpdatedAt:  time.Now().UTC(),
+	}
 
 	payload, err := json.Marshal(journal)
 	if err != nil {
@@ -170,39 +171,8 @@ func (s *Service) WriteJournal(ctx context.Context, journal *project.RenameJourn
 	return nil
 }
 
-func (s *Service) clearJournal(ctx context.Context, projectID string) error {
-	if s == nil || s.kv == nil || strings.TrimSpace(projectID) == "" {
-		return nil
-	}
-	return s.kv.Delete(ctx, project.RenameJournalKeyPrefix+projectID)
-}
-
-func (s *Service) writeRollbackCleanup(ctx context.Context, journal *project.RenameJournal) error {
-	if s == nil || s.kv == nil || journal == nil || strings.TrimSpace(journal.ProjectID) == "" || len(journal.Volumes) == 0 {
-		return nil
-	}
-
-	cleanup := project.RenameRollbackCleanup{
-		ProjectID: journal.ProjectID,
-		OldName:   journal.OldName,
-		OldPath:   filepath.Clean(journal.OldPath),
-		NewName:   journal.NewName,
-		NewPath:   filepath.Clean(journal.NewPath),
-		Volumes:   journal.Volumes,
-		UpdatedAt: time.Now().UTC(),
-	}
-	payload, err := json.Marshal(cleanup)
-	if err != nil {
-		return fmt.Errorf("marshal project rename rollback cleanup: %w", err)
-	}
-	if setErr := s.kv.Set(ctx, project.RenameRollbackCleanupKeyPrefix+journal.ProjectID, string(payload)); setErr != nil {
-		return fmt.Errorf("write project rename rollback cleanup: %w", setErr)
-	}
-	return nil
-}
-
 func (s *Service) clearRollbackCleanup(ctx context.Context, projectID string) error {
-	if s == nil || s.kv == nil || strings.TrimSpace(projectID) == "" {
+	if strings.TrimSpace(projectID) == "" {
 		return nil
 	}
 	return s.kv.Delete(ctx, project.RenameRollbackCleanupKeyPrefix+projectID)
@@ -210,10 +180,6 @@ func (s *Service) clearRollbackCleanup(ctx context.Context, projectID string) er
 
 // RecoverAll replays every pending rename journal and rollback cleanup.
 func (s *Service) RecoverAll(ctx context.Context) error {
-	if s == nil || s.kv == nil {
-		return nil
-	}
-
 	entries, err := s.kv.ListByPrefix(ctx, project.RenameJournalKeyPrefix)
 	if err != nil {
 		return err
@@ -226,7 +192,20 @@ func (s *Service) RecoverAll(ctx context.Context) error {
 			recoverErr = errors.Join(recoverErr, fmt.Errorf("decode project rename journal %s: %w", entry.Key, unmarshalErr))
 			continue
 		}
-		if journalErr := s.recoverJournal(ctx, &journal); journalErr != nil {
+		if strings.TrimSpace(journal.ProjectID) == "" {
+			continue
+		}
+		name, path, found, stateErr := s.projectState(ctx, journal.ProjectID)
+		if stateErr != nil {
+			recoverErr = errors.Join(recoverErr, fmt.Errorf("recover project rename journal %s: load project for rename recovery: %w", entry.Key, stateErr))
+			continue
+		}
+		if journalErr := projects.RecoverRenameJournal(
+			ctx,
+			&journal,
+			found && (name == journal.NewName || filepath.Clean(path) == filepath.Clean(journal.NewPath)),
+			s.Operations(),
+		); journalErr != nil {
 			recoverErr = errors.Join(recoverErr, fmt.Errorf("recover project rename journal %s: %w", entry.Key, journalErr))
 		}
 	}
@@ -241,7 +220,27 @@ func (s *Service) RecoverAll(ctx context.Context) error {
 			recoverErr = errors.Join(recoverErr, fmt.Errorf("decode project rename rollback cleanup %s: %w", entry.Key, unmarshalErr))
 			continue
 		}
-		if cleanupErr := s.recoverRollbackCleanup(ctx, &cleanup); cleanupErr != nil {
+		if cleanupErr := func() error {
+			if strings.TrimSpace(cleanup.ProjectID) == "" {
+				return nil
+			}
+			if len(cleanup.Volumes) == 0 {
+				return s.clearRollbackCleanup(ctx, cleanup.ProjectID)
+			}
+			name, path, found, stateErr := s.projectState(ctx, cleanup.ProjectID)
+			if stateErr != nil {
+				return fmt.Errorf("load project for rename rollback cleanup: %w", stateErr)
+			}
+			if !found {
+				slog.WarnContext(ctx, "clearing project rename rollback cleanup because project no longer exists", "projectId", cleanup.ProjectID)
+				return s.clearRollbackCleanup(ctx, cleanup.ProjectID)
+			}
+			if name != cleanup.OldName || filepath.Clean(path) != filepath.Clean(cleanup.OldPath) {
+				slog.WarnContext(ctx, "clearing project rename rollback cleanup because project state changed", "projectId", cleanup.ProjectID, "projectName", name, "projectPath", path)
+				return s.clearRollbackCleanup(ctx, cleanup.ProjectID)
+			}
+			return projects.CleanupRenameRollbackTargets(ctx, &cleanup, s.Operations())
+		}(); cleanupErr != nil {
 			recoverErr = errors.Join(recoverErr, fmt.Errorf("recover project rename rollback cleanup %s: %w", entry.Key, cleanupErr))
 		}
 	}
@@ -250,7 +249,7 @@ func (s *Service) RecoverAll(ctx context.Context) error {
 
 // RecoverProject replays one project's pending rename journal.
 func (s *Service) RecoverProject(ctx context.Context, projectID string) error {
-	if s == nil || s.kv == nil || strings.TrimSpace(projectID) == "" {
+	if strings.TrimSpace(projectID) == "" {
 		return nil
 	}
 
@@ -263,73 +262,95 @@ func (s *Service) RecoverProject(ctx context.Context, projectID string) error {
 	if unmarshalErr := json.Unmarshal([]byte(raw), &journal); unmarshalErr != nil {
 		return fmt.Errorf("decode project rename journal: %w", unmarshalErr)
 	}
-	return s.recoverJournal(ctx, &journal)
-}
-
-func (s *Service) recoverJournal(ctx context.Context, journal *project.RenameJournal) error {
-	if s == nil || journal == nil || strings.TrimSpace(journal.ProjectID) == "" {
+	if strings.TrimSpace(journal.ProjectID) == "" {
 		return nil
 	}
-
 	name, path, found, stateErr := s.projectState(ctx, journal.ProjectID)
 	if stateErr != nil {
 		return fmt.Errorf("load project for rename recovery: %w", stateErr)
 	}
-
-	projectCommitted := found && (name == journal.NewName || filepath.Clean(path) == filepath.Clean(journal.NewPath))
-	return projects.RecoverRenameJournal(ctx, journal, projectCommitted, s.Operations())
+	return projects.RecoverRenameJournal(ctx, &journal, found && (name == journal.NewName || filepath.Clean(path) == filepath.Clean(journal.NewPath)), s.Operations())
 }
 
-func (s *Service) recoverRollbackCleanup(ctx context.Context, cleanup *project.RenameRollbackCleanup) error {
-	if s == nil || cleanup == nil || strings.TrimSpace(cleanup.ProjectID) == "" {
-		return nil
+// RollbackFailedUpdate rolls a directory rename back, restores the pre-update files,
+// and replays an active rename journal.
+func (s *Service) RollbackFailedUpdate(
+	ctx context.Context,
+	projectID, projectsDirectory, originalPath, currentPath string,
+	backup *projects.ProjectUpdateBackup,
+	journalActive bool,
+	err error,
+) error {
+	// The rollback runs detached so a cancelled update cannot leave the directory renamed. Paths sharing a parent
+	// stay confined; an imported project elsewhere crosses roots and cannot be confined.
+	renameErr := func() error {
+		switch {
+		case currentPath == originalPath:
+			return nil
+		case filepath.Dir(originalPath) == filepath.Dir(currentPath):
+			return acfs.Rename(context.WithoutCancel(ctx), filepath.Dir(originalPath), "/"+filepath.Base(currentPath), "/"+filepath.Base(originalPath))
+		}
+		return os.Rename(currentPath, originalPath)
+	}()
+	if renameErr != nil {
+		slog.WarnContext(ctx, "failed to rollback project directory rename", "from", currentPath, "to", originalPath, "error", renameErr)
 	}
-	if len(cleanup.Volumes) == 0 {
-		return s.clearRollbackCleanup(ctx, cleanup.ProjectID)
+	if backup != nil {
+		if restoreErr := projects.RestoreProjectDirectoryBackup(ctx, projectsDirectory, kit.Ternary(renameErr == nil, originalPath, currentPath), backup); restoreErr != nil {
+			err = errors.Join(err, fmt.Errorf("failed to restore project files after update failure: %w", restoreErr))
+		}
 	}
-
-	name, path, found, stateErr := s.projectState(ctx, cleanup.ProjectID)
-	if stateErr != nil {
-		return fmt.Errorf("load project for rename rollback cleanup: %w", stateErr)
+	if journalActive {
+		if recoverErr := s.RecoverProject(ctx, projectID); recoverErr != nil {
+			err = errors.Join(err, fmt.Errorf("project rename recovery failed: %w", recoverErr))
+		}
 	}
-	if !found {
-		slog.WarnContext(ctx, "clearing project rename rollback cleanup because project no longer exists", "projectId", cleanup.ProjectID)
-		return s.clearRollbackCleanup(ctx, cleanup.ProjectID)
-	}
-
-	if name != cleanup.OldName || filepath.Clean(path) != filepath.Clean(cleanup.OldPath) {
-		slog.WarnContext(ctx, "clearing project rename rollback cleanup because project state changed", "projectId", cleanup.ProjectID, "projectName", name, "projectPath", path)
-		return s.clearRollbackCleanup(ctx, cleanup.ProjectID)
-	}
-
-	return projects.CleanupRenameRollbackTargets(ctx, cleanup, s.Operations())
-}
-
-func (s *Service) dockerClient(ctx context.Context, dockerRequired bool) (*client.Client, error) {
-	if !dockerRequired {
-		return nil, nil
-	}
-	if s.dockerService == nil {
-		return nil, errors.New("docker service unavailable")
-	}
-
-	dockerClient, err := s.dockerService.GetClient(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect to Docker: %w", err)
-	}
-
-	return dockerClient, nil
+	return err
 }
 
 // Operations exposes journal persistence to the shared rename engine.
 func (s *Service) Operations() project.RenameRecoveryOperations {
 	return project.RenameRecoveryOperations{
-		Docker:               s.dockerClient,
-		WriteJournal:         s.WriteJournal,
-		ClearJournal:         s.clearJournal,
+		Docker: func(ctx context.Context, dockerRequired bool) (*client.Client, error) {
+			if !dockerRequired {
+				return nil, nil
+			}
+			dockerClient, err := s.dockerService.GetClient(ctx)
+			if err != nil {
+				return nil, fmt.Errorf("failed to connect to Docker: %w", err)
+			}
+			return dockerClient, nil
+		},
+		WriteJournal: s.WriteJournal,
+		ClearJournal: func(ctx context.Context, projectID string) error {
+			if strings.TrimSpace(projectID) == "" {
+				return nil
+			}
+			return s.kv.Delete(ctx, project.RenameJournalKeyPrefix+projectID)
+		},
 		ClearRollbackCleanup: s.clearRollbackCleanup,
-		WriteRollbackCleanup: s.writeRollbackCleanup,
-		RestoreState:         s.restoreState,
+		WriteRollbackCleanup: func(ctx context.Context, journal *project.RenameJournal) error {
+			if strings.TrimSpace(kit.FromPtr(journal).ProjectID) == "" || len(journal.Volumes) == 0 {
+				return nil
+			}
+			payload, err := json.Marshal(project.RenameRollbackCleanup{
+				ProjectID: journal.ProjectID,
+				OldName:   journal.OldName,
+				OldPath:   filepath.Clean(journal.OldPath),
+				NewName:   journal.NewName,
+				NewPath:   filepath.Clean(journal.NewPath),
+				Volumes:   journal.Volumes,
+				UpdatedAt: time.Now().UTC(),
+			})
+			if err != nil {
+				return fmt.Errorf("marshal project rename rollback cleanup: %w", err)
+			}
+			if setErr := s.kv.Set(ctx, project.RenameRollbackCleanupKeyPrefix+journal.ProjectID, string(payload)); setErr != nil {
+				return fmt.Errorf("write project rename rollback cleanup: %w", setErr)
+			}
+			return nil
+		},
+		RestoreState: s.restoreState,
 	}
 }
 
@@ -355,7 +376,7 @@ func PersistProjectServiceImages(ctx context.Context, projectPath, logical strin
 }
 
 func composeImageField(node *yaml.Node, key string) *yaml.Node {
-	if node == nil || node.Kind != yaml.MappingNode {
+	if kit.FromPtr(node).Kind != yaml.MappingNode {
 		return nil
 	}
 	for i := 0; i+1 < len(node.Content); i += 2 {
@@ -405,7 +426,7 @@ func PrepareProjectServiceImages(source []byte, effective *types.Project, change
 		return nil, nil, errors.New("tag updates do not rewrite Compose includes; update their source manually")
 	}
 	servicesNode := composeImageField(document.Content[0], "services")
-	if servicesNode == nil || servicesNode.Kind != yaml.MappingNode {
+	if kit.FromPtr(servicesNode).Kind != yaml.MappingNode {
 		return nil, nil, errors.New("Compose source has no services mapping") //nolint:staticcheck // Preserve the existing error message.
 	}
 	serviceNames := make([]string, 0, len(changes))
@@ -428,7 +449,7 @@ func PrepareProjectServiceImages(source []byte, effective *types.Project, change
 			return nil, nil, fmt.Errorf("tag updates do not rewrite extended service %s; update its source manually", name)
 		}
 		imageNode := composeImageField(serviceNode, "image")
-		if imageNode == nil || imageNode.Kind != yaml.ScalarNode || imageNode.Tag != "!!str" {
+		if kit.FromPtr(imageNode).Kind != yaml.ScalarNode || imageNode.Tag != "!!str" {
 			return nil, nil, fmt.Errorf("service %s requires an explicit image scalar in the authoritative Compose file", name)
 		}
 		if !strings.Contains(imageNode.Value, "$") && refs.NormalizeImageUpdateRef(imageNode.Value) != expected && refs.NormalizeImageUpdateRef(imageNode.Value) != target {
@@ -455,15 +476,15 @@ func PrepareProjectServiceImages(source []byte, effective *types.Project, change
 // and renders the target in the scalar's original style.
 func composeImageSourceEdit(source []byte, node *yaml.Node, target string) (composeImageEdit, error) {
 	const lineBreaks = "\r\n\u0085\u2028\u2029"
-	edit := composeImageEdit{start: len(source) - len(bytes.TrimPrefix(source, []byte("\xEF\xBB\xBF")))}
+	start := len(source) - len(bytes.TrimPrefix(source, []byte("\xEF\xBB\xBF")))
 	for line, column := 1, 1; line < node.Line || (line == node.Line && column < node.Column); column++ {
-		if edit.start >= len(source) {
-			return edit, errors.New("image scalar position is outside the Compose source")
+		if start >= len(source) {
+			return composeImageEdit{}, errors.New("image scalar position is outside the Compose source")
 		}
-		r, size := utf8.DecodeRune(source[edit.start:])
-		edit.start += size
-		if r == '\r' && bytes.HasPrefix(source[edit.start:], []byte("\n")) {
-			edit.start++
+		r, size := utf8.DecodeRune(source[start:])
+		start += size
+		if r == '\r' && bytes.HasPrefix(source[start:], []byte("\n")) {
+			start++
 		}
 		if strings.ContainsRune(lineBreaks, r) {
 			line, column = line+1, 0
@@ -471,31 +492,31 @@ func composeImageSourceEdit(source []byte, node *yaml.Node, target string) (comp
 	}
 	// The shortest same-line span that decodes to the parsed value is the scalar's source text, including tags and escapes.
 	found := false
-	for edit.end = edit.start; !found && edit.end < len(source); {
-		r, size := utf8.DecodeRune(source[edit.end:])
+	end := start
+	for !found && end < len(source) {
+		r, size := utf8.DecodeRune(source[end:])
 		if strings.ContainsRune(lineBreaks, r) {
 			break
 		}
-		edit.end += size
+		end += size
 		var decoded string
-		found = yaml.Unmarshal(source[edit.start:edit.end], &decoded) == nil && decoded == node.Value
+		found = yaml.Unmarshal(source[start:end], &decoded) == nil && decoded == node.Value
 	}
 	if !found {
-		return edit, errors.New("tag updates require a single-line image scalar")
+		return composeImageEdit{}, errors.New("tag updates require a single-line image scalar")
 	}
 	text, err := yaml.Marshal(&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Style: node.Style, Value: target})
-	edit.text = bytes.TrimSuffix(text, []byte("\n"))
-	if err != nil || bytes.ContainsAny(edit.text, "\r\n") {
-		return edit, fmt.Errorf("image %s cannot be written as a single-line scalar", target)
+	if err != nil || bytes.ContainsAny(bytes.TrimSuffix(text, []byte("\n")), "\r\n") {
+		return composeImageEdit{}, fmt.Errorf("image %s cannot be written as a single-line scalar", target)
 	}
-	return edit, nil
+	return composeImageEdit{start: start, end: end, text: bytes.TrimSuffix(text, []byte("\n"))}, nil
 }
 
 // EnsureProjectEnvReadable rejects operator-driven file writes into a project
 // whose .env exists but cannot be read by the runtime user.
 func EnsureProjectEnvReadable(ctx context.Context, projectsDirectory, projectPath string) error {
 	cfgErr := projects.CheckProjectEnvAccess(ctx, projectsDirectory, projectPath)
-	if cfgErr == nil || !cfgErr.BlocksOperations {
+	if !kit.FromPtr(cfgErr).BlocksOperations {
 		return nil
 	}
 	return common.Classify(
@@ -516,38 +537,33 @@ func (s *Service) ImageChanges(ctx context.Context, effective *types.Project, gi
 	changes := make(map[string]updatertypes.ServiceImageChange)
 	for _, key := range effective.ServiceNames() {
 		service := effective.Services[key]
-		name := service.Name
 		configuredPolicy := policy.TagPolicy(service.Labels)
 		if service.Build != nil && (configuredPolicy.Strategy == "" || configuredPolicy.Strategy == "auto") && configuredPolicy.Constraint == "" && configuredPolicy.TagPattern == "" {
 			continue
 		}
-		immutable := refs.IsDigestPinnedReference(service.Image) || refs.IsImageIDLikeReference(service.Image)
-		if configuredPolicy.Strategy == "tag" && immutable {
-			return nil, fmt.Errorf("service %s has an immutable image reference", name)
+		if configuredPolicy.Strategy == "tag" && (refs.IsDigestPinnedReference(service.Image) || refs.IsImageIDLikeReference(service.Image)) {
+			return nil, fmt.Errorf("service %s has an immutable image reference", service.Name)
 		}
 		tagPolicy, err := tagpolicy.Resolve(service.Image, configuredPolicy)
 		if err != nil {
-			return nil, fmt.Errorf("resolve service %s update policy: %w", name, err)
+			return nil, fmt.Errorf("resolve service %s update policy: %w", service.Name, err)
 		}
 		if tagPolicy.Strategy == "digest" {
 			continue
 		}
 		switch {
 		case policy.IsUpdateDisabled(service.Labels):
-			return nil, fmt.Errorf("updates are disabled for service %s", name)
+			return nil, fmt.Errorf("updates are disabled for service %s", service.Name)
 		case service.Build != nil:
-			return nil, fmt.Errorf("tag discovery is unsupported for locally built service %s", name)
+			return nil, fmt.Errorf("tag discovery is unsupported for locally built service %s", service.Name)
 		case gitOpsManaged:
 			return nil, errors.New("tag updates cannot edit a GitOps-managed project; update image tags in the source repository")
-		case immutable:
-			return nil, fmt.Errorf("service %s has an immutable image reference", name)
+		case refs.IsDigestPinnedReference(service.Image) || refs.IsImageIDLikeReference(service.Image):
+			return nil, fmt.Errorf("service %s has an immutable image reference", service.Name)
 		}
 		parsed, err := refs.NormalizeReference(service.Image)
 		if err != nil {
-			return nil, fmt.Errorf("parse service %s image: %w", name, err)
-		}
-		if s.registryService == nil {
-			return nil, errors.New("registry service unavailable for tag updates")
+			return nil, fmt.Errorf("parse service %s image: %w", service.Name, err)
 		}
 		credentials, err := s.credentials(ctx)
 		if err != nil {
@@ -555,14 +571,17 @@ func (s *Service) ImageChanges(ctx context.Context, effective *types.Project, gi
 		}
 		tags, err := s.registryService.ListImageTags(ctx, service.Image, credentials)
 		if err != nil {
-			return nil, fmt.Errorf("list service %s image tags: %w", name, err)
+			return nil, fmt.Errorf("list service %s image tags: %w", service.Name, err)
 		}
 		selected, err := tagpolicy.Select(parsed.Tag, tags, tagPolicy)
 		if err != nil {
-			return nil, fmt.Errorf("select service %s image tag: %w", name, err)
+			return nil, fmt.Errorf("select service %s image tag: %w", service.Name, err)
 		}
 		if selected != parsed.Tag {
-			changes[key] = updatertypes.ServiceImageChange{ExpectedRef: service.Image, TargetRef: parsed.RegistryHost + "/" + parsed.Repository + ":" + selected}
+			changes[key] = updatertypes.ServiceImageChange{
+				ExpectedRef: service.Image,
+				TargetRef:   parsed.RegistryHost + "/" + parsed.Repository + ":" + selected,
+			}
 		}
 	}
 	return changes, nil

@@ -8,82 +8,70 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+
+	"github.com/getarcaneapp/arcane/backend/v2/pkg/projects"
 )
 
 func describeLifecyclePathAccess(projectPath, resolvedScriptPath string) string {
-	var lines []string
-
-	lines = append(lines,
-		fmt.Sprintf(
-			"Arcane process identity: uid=%d gid=%d.",
-			os.Geteuid(),
-			os.Getegid(),
-		),
+	lines := []string{
+		fmt.Sprintf("Arcane process identity: uid=%d gid=%d.", os.Geteuid(), os.Getegid()),
 		"Path inspection:",
-	)
+	}
 
-	// Walk from the project root down to the script; fall back to the two
-	// endpoints when the script resolves outside the project.
-	paths := []string{projectPath, resolvedScriptPath}
+	// Walk from the project root down to the script; fall back to the endpoints when it resolves outside the project.
 	absProject, projectErr := filepath.Abs(projectPath)
 	absScript, scriptErr := filepath.Abs(resolvedScriptPath)
 	relative, relErr := filepath.Rel(absProject, absScript)
-	switch {
-	case projectErr != nil:
-	case scriptErr != nil:
-		paths = []string{absProject, resolvedScriptPath}
-	case relErr != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)):
-		paths = []string{absProject, absScript}
-	default:
-		paths = []string{absProject}
-		current := absProject
-		for component := range strings.SplitSeq(relative, string(filepath.Separator)) {
-			if component == "" || component == "." {
-				continue
-			}
-			current = filepath.Join(current, component)
-			paths = append(paths, current)
+	for _, candidate := range func() []string {
+		switch {
+		case projectErr != nil:
+			return []string{projectPath, resolvedScriptPath}
+		case scriptErr != nil:
+			return []string{absProject, resolvedScriptPath}
+		case relErr != nil || !projects.IsSafeSubdirectory(absProject, absScript):
+			return []string{absProject, absScript}
 		}
-	}
-
-	for _, candidate := range paths {
-		// os.* rather than acfs: diagnostics walk arbitrary ancestor directories
-		// of a user-configured path, so no confinement root exists for them.
+		paths := []string{absProject}
+		for component := range strings.SplitSeq(relative, string(filepath.Separator)) {
+			if component != "" && component != "." {
+				paths = append(paths, filepath.Join(paths[len(paths)-1], component))
+			}
+		}
+		return paths
+	}() {
+		// os.* rather than acfs: diagnostics walk arbitrary ancestors of a user-configured path with no confinement root.
 		info, err := os.Lstat(candidate)
 		if err != nil {
 			lines = append(lines, fmt.Sprintf("  %q: %v", candidate, err))
 			break
 		}
-
-		owner := "uid=unknown gid=unknown"
-		if stat, ok := info.Sys().(*syscall.Stat_t); ok {
-			owner = fmt.Sprintf("uid=%d gid=%d", stat.Uid, stat.Gid)
-		}
-
-		fileType := "other"
-		switch {
-		case info.Mode()&os.ModeSymlink != 0:
-			fileType = "symlink"
-		case info.IsDir():
-			fileType = "directory"
-		case info.Mode().IsRegular():
-			fileType = "regular"
-		}
-
 		lines = append(lines, fmt.Sprintf(
 			"  %q: mode=%s permissions=%04o %s type=%s",
 			candidate,
 			info.Mode(),
 			info.Mode().Perm(),
-			owner,
-			fileType,
+			func() string {
+				if stat, ok := info.Sys().(*syscall.Stat_t); ok {
+					return fmt.Sprintf("uid=%d gid=%d", stat.Uid, stat.Gid)
+				}
+				return "uid=unknown gid=unknown"
+			}(),
+			func() string {
+				switch {
+				case info.Mode()&os.ModeSymlink != 0:
+					return "symlink"
+				case info.IsDir():
+					return "directory"
+				case info.Mode().IsRegular():
+					return "regular"
+				}
+				return "other"
+			}(),
 		))
 	}
 
-	lines = append(lines,
+	return strings.Join(append(lines,
 		"Ensure the Arcane process can traverse every parent directory and inspect the script.",
 		"A script mode of 0755 is not sufficient when a parent directory lacks execute permission or ownership, ACLs, or mount permissions block access.",
-	)
-
-	return strings.Join(lines, " ")
+	), " ")
 }

@@ -32,14 +32,15 @@ func (e *classified) Is(target error) bool { return errors.Is(e.kind, target) }
 
 //nolint:staticcheck // Preserve existing API error messages.
 var (
-	ErrBadRequest   = errors.New("kind: bad request")
-	ErrValidation   = errors.New("kind: validation failed")
-	ErrUnauthorized = errors.New("kind: unauthorized")
-	ErrForbidden    = errors.New("kind: forbidden")
-	ErrNotFound     = errors.New("kind: not found")
-	ErrConflict     = errors.New("kind: conflict")
-	ErrTimeout      = errors.New("kind: timeout")
-	ErrUnavailable  = errors.New("kind: service unavailable")
+	ErrBadRequest          = errors.New("kind: bad request")
+	ErrValidation          = errors.New("kind: validation failed")
+	ErrUnauthorized        = errors.New("kind: unauthorized")
+	ErrForbidden           = errors.New("kind: forbidden")
+	ErrNotFound            = errors.New("kind: not found")
+	ErrConflict            = errors.New("kind: conflict")
+	ErrTimeout             = errors.New("kind: timeout")
+	ErrUnavailable         = errors.New("kind: service unavailable")
+	ErrInsufficientStorage = errors.New("kind: insufficient storage")
 
 	ErrFeatureDisabled                   = Classify(ErrForbidden, errors.New("feature disabled"))
 	ErrInvalidToken                      = errors.New("invalid token")

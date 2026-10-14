@@ -18,6 +18,7 @@ import (
 	"go.getarcane.app/docker"
 	kit "go.getarcane.app/kit/pkg"
 
+	"github.com/getarcaneapp/arcane/backend/v2/internal/common"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane/volumehelper"
 )
@@ -270,7 +271,7 @@ func EnsureRenameTargetAbsent(ctx context.Context, dockerClient *client.Client, 
 		}
 		return fmt.Errorf("inspect target volume %s: %w", newName, err)
 	}
-	return &volumetypes.ProjectVolumeRenameConflictError{VolumeName: newName}
+	return common.Classify(common.ErrConflict, &volumetypes.ProjectVolumeRenameConflictError{VolumeName: newName})
 }
 
 func EnsureRenameSourceDetached(ctx context.Context, dockerClient *client.Client, oldName string) error {
@@ -279,7 +280,7 @@ func EnsureRenameSourceDetached(ctx context.Context, dockerClient *client.Client
 		return fmt.Errorf("inspect containers using source volume %s: %w", oldName, err)
 	}
 	if len(containerIDs) > 0 {
-		return &volumetypes.ProjectVolumeRenameInUseError{VolumeName: oldName, ContainerIDs: containerIDs}
+		return common.Classify(common.ErrConflict, &volumetypes.ProjectVolumeRenameInUseError{VolumeName: oldName, ContainerIDs: containerIDs})
 	}
 	return nil
 }
@@ -375,11 +376,11 @@ func copyProjectVolumeDataInternal(ctx context.Context, dockerClient *client.Cli
 	})
 	if err != nil {
 		if isProjectVolumeCopyNoSpaceErrorInternal(err) {
-			return &volumetypes.ProjectVolumeRenameInsufficientSpaceError{
+			return common.Classify(common.ErrInsufficientStorage, &volumetypes.ProjectVolumeRenameInsufficientSpaceError{
 				SourceVolume: sourceVolume,
 				TargetVolume: targetVolume,
 				Detail:       err.Error(),
-			}
+			})
 		}
 		return fmt.Errorf("write target volume archive: %w", err)
 	}

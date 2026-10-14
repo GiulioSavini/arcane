@@ -5,9 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 
@@ -15,13 +12,12 @@ import (
 	projecttypes "github.com/getarcaneapp/arcane/types/v2/project"
 	usertypes "github.com/getarcaneapp/arcane/types/v2/user"
 	"github.com/samber/mo"
-	"go.getarcane.app/acfs"
 	"go.getarcane.app/builds/types"
+	kit "go.getarcane.app/kit/pkg"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 
 	"github.com/getarcaneapp/arcane/backend/v2/internal/settings"
-	"github.com/getarcaneapp/arcane/backend/v2/pkg/projects"
 )
 
 type builder interface {
@@ -34,7 +30,7 @@ type builder interface {
 type projectMetadataEnv struct {
 	projectsDirectory string
 	autoInjectEnv     bool
-	// settings is the snapshot shared by compose loads; nil resolves lazily.
+	// settings is the snapshot shared by compose loads.
 	settings *settings.Settings
 	// gitOpsComposePaths maps preloaded GitOps sync IDs to their configured
 	// compose paths. Sync IDs that were preloaded but have no row map to "",
@@ -50,10 +46,7 @@ type projectMetadataEnv struct {
 }
 
 func gitOpsSyncID(proj *Project) string {
-	if proj == nil || proj.GitOpsManagedBy == nil {
-		return ""
-	}
-	return strings.TrimSpace(*proj.GitOpsManagedBy)
+	return strings.TrimSpace(kit.FromPtr(proj.GitOpsManagedBy))
 }
 
 // composeFile memoizes successful compose file resolutions for the request.
@@ -74,9 +67,6 @@ func (env *projectMetadataEnv) composeFile(projectID string, resolve func() (str
 		return "", err
 	}
 	env.composeFilesMu.Lock()
-	if env.composeFiles == nil {
-		env.composeFiles = make(map[string]string)
-	}
 	env.composeFiles[projectID] = path
 	env.composeFilesMu.Unlock()
 	return path, nil
@@ -153,63 +143,6 @@ func deleteProjectWithTags(tx *gorm.DB, projectID string) error {
 	if err := tx.Delete(&Project{}, "id = ?", projectID).Error; err != nil {
 		return fmt.Errorf("delete project: %w", err)
 	}
-	return nil
-}
-
-// resolveAuthoritativeProjectName enforces that a top-level `name:` in
-// the compose file is authoritative over the submitted project name. For
-// name-only renames, it checks the compose file on disk so the lock can't be
-// bypassed via the API.
-func resolveAuthoritativeProjectName(ctx context.Context, proj *Project, name, composeContent *string) *string {
-	if composeContent != nil {
-		if yamlName := projects.ComposeContentProjectName(*composeContent); yamlName != "" {
-			return &yamlName
-		}
-		return name
-	}
-	if name != nil {
-		if onDiskCompose, _, readErr := projects.ReadProjectFiles(ctx, proj.Path, ""); readErr == nil {
-			if yamlName := projects.ComposeContentProjectName(onDiskCompose); yamlName != "" {
-				return &yamlName
-			}
-		}
-	}
-	return name
-}
-
-func withProjectRenameRollback(ctx context.Context, proj *Project, projectStateCommitted *bool, run func() error) error {
-	originalPath := proj.Path
-	originalDirName := proj.DirName
-
-	if err := run(); err != nil {
-		if projectStateCommitted != nil && *projectStateCommitted {
-			return err
-		}
-		if proj.Path != originalPath {
-			// The rollback has to run even when the caller's context is already
-			// cancelled, or a cancelled update leaves the directory renamed
-			// with the database still pointing at the original path.
-			rollbackCtx := context.WithoutCancel(ctx)
-
-			// Both paths share a parent whenever the rename stayed inside the
-			// projects directory; an imported project can sit elsewhere, in
-			// which case the move crosses roots and cannot be confined.
-			var renameErr error
-			if parent := filepath.Dir(originalPath); parent == filepath.Dir(proj.Path) {
-				renameErr = acfs.Rename(rollbackCtx, parent, "/"+filepath.Base(proj.Path), "/"+filepath.Base(originalPath))
-			} else {
-				renameErr = os.Rename(proj.Path, originalPath)
-			}
-			if renameErr != nil {
-				slog.WarnContext(ctx, "failed to rollback project directory rename", "from", proj.Path, "to", originalPath, "error", renameErr)
-				return err
-			}
-			proj.Path = originalPath
-			proj.DirName = originalDirName
-		}
-		return err
-	}
-
 	return nil
 }
 

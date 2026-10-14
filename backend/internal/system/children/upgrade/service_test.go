@@ -13,11 +13,13 @@ import (
 	versiontypes "github.com/getarcaneapp/arcane/types/v2/version"
 	"github.com/libtnb/sqlite"
 	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/client"
 	"github.com/stretchr/testify/require"
 	"gorm.io/gorm"
 
 	"github.com/getarcaneapp/arcane/backend/v2/internal/common"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/database"
+	dockerInternal "github.com/getarcaneapp/arcane/backend/v2/internal/docker"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/event"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/project"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/settings"
@@ -25,6 +27,11 @@ import (
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/remenv"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/scheduler/flow/flowtest"
 )
+
+var testDockerService = &dockerInternal.DockerClientService{Client: func() *client.Client {
+	cli, _ := client.New(client.WithHost("tcp://127.0.0.1:1"), client.WithAPIVersion("1.41"))
+	return cli
+}()}
 
 // TestService_UpgradeFlag tests the upgrading flag behavior
 func TestService_UpgradeFlag(t *testing.T) {
@@ -337,7 +344,7 @@ func TestResolveSelfUpgradeTargetImage(t *testing.T) {
 				}
 				require.NoError(t, db.Create(&project.Project{ID: "project-arcane", Name: "arcane", Path: projectPath}).Error)
 			}
-			svc := NewService(db, nil, nil, nil, nil, project.NewProjectService(db, settingsSvc, nil, nil, nil, nil, nil, nil, nil, nil, nil), nil)
+			svc := NewService(db, nil, nil, nil, nil, project.NewProjectService(db, settingsSvc, nil, nil, testDockerService, nil, nil, nil, nil, nil, nil), nil)
 			current := container.InspectResponse{Config: &container.Config{
 				Image:  tt.runtime,
 				Labels: map[string]string{"com.docker.compose.project": "arcane", "com.docker.compose.service": "server"},

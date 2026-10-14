@@ -20,6 +20,7 @@ import (
 	"github.com/go-git/go-git/v5/plumbing/transport/client"
 	"github.com/go-git/go-git/v5/plumbing/transport/server"
 	"github.com/libtnb/sqlite"
+	mobyclient "github.com/moby/moby/client"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.getarcane.app/kit/pkg"
@@ -29,6 +30,7 @@ import (
 	"github.com/getarcaneapp/arcane/backend/v2/internal/common"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/config"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/database"
+	dockerInternal "github.com/getarcaneapp/arcane/backend/v2/internal/docker"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/environment"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/event"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/gitops/children/backup"
@@ -44,6 +46,11 @@ import (
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/scheduler/runs"
 	francistest "github.com/getarcaneapp/arcane/backend/v2/pkg/utils/francis/testing"
 )
+
+var testDockerService = &dockerInternal.DockerClientService{Client: func() *mobyclient.Client {
+	cli, _ := mobyclient.New(mobyclient.WithHost("tcp://127.0.0.1:1"), mobyclient.WithAPIVersion("1.41"))
+	return cli
+}()}
 
 func setupGitOpsProjectTestDB(t *testing.T) *database.DB {
 	t.Helper()
@@ -88,7 +95,7 @@ func setupGitOpsSyncDirectoryTestService(t *testing.T) (*GitOpsSyncService, *dat
 	require.NoError(t, settingsService.SetStringSetting(ctx, "projectsDirectory", projectsDir))
 
 	eventService := event.NewEventService(db, config.Load(), nil)
-	projectService := projectpkg.NewProjectService(db, settingsService, eventService, nil, nil, nil, nil, nil, config.Load(), nil, nil)
+	projectService := projectpkg.NewProjectService(db, settingsService, eventService, nil, testDockerService, nil, nil, nil, config.Load(), nil, nil)
 
 	return NewGitOpsSyncService(db, nil, projectService, nil, eventService, settingsService), db, projectsDir
 }
@@ -145,7 +152,7 @@ func setupGitOpsSyncRemoteTestService(t *testing.T, files map[string]string) (*G
 	require.NoError(t, settingsService.SetStringSetting(ctx, "projectsDirectory", projectsDir))
 
 	eventService := event.NewEventService(db, config.Load(), nil)
-	projectService := projectpkg.NewProjectService(db, settingsService, eventService, nil, nil, nil, nil, nil, config.Load(), nil, nil)
+	projectService := projectpkg.NewProjectService(db, settingsService, eventService, nil, testDockerService, nil, nil, nil, config.Load(), nil, nil)
 	repoService := gitrepo.NewGitRepositoryService(db, t.TempDir(), eventService, settingsService)
 
 	service := NewGitOpsSyncService(db, repoService, projectService, nil, eventService, settingsService)
@@ -1109,7 +1116,7 @@ func setupGitOpsBackupTestService(t *testing.T) *backupTestEnv {
 	require.NoError(t, settingsService.SetStringSetting(ctx, "projectsDirectory", projectsDir))
 
 	eventService := event.NewEventService(db, config.Load(), nil)
-	projectService := projectpkg.NewProjectService(db, settingsService, eventService, nil, nil, nil, nil, nil, config.Load(), nil, nil)
+	projectService := projectpkg.NewProjectService(db, settingsService, eventService, nil, testDockerService, nil, nil, nil, config.Load(), nil, nil)
 	repoService := gitrepo.NewGitRepositoryService(db, t.TempDir(), eventService, settingsService)
 
 	service := NewGitOpsSyncService(db, repoService, projectService, nil, eventService, settingsService)

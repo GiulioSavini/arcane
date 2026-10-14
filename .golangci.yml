@@ -108,7 +108,7 @@ linters:
         - style
 
     gocognit:
-      min-complexity: 40
+      min-complexity: 45
 
     importas:
       alias:

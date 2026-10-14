@@ -3,13 +3,14 @@
 package tags
 
 import (
+	"cmp"
 	"errors"
 	"fmt"
-	"sort"
+	"slices"
 	"strings"
 
 	"github.com/getarcaneapp/arcane/types/v2/project"
-	"go.getarcane.app/kit/pkg"
+	kit "go.getarcane.app/kit/pkg"
 
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/projects"
 )
@@ -82,8 +83,12 @@ func ApplyUpdate(store Store, projectID, name string, color project.TagColor, at
 	if err != nil {
 		return fmt.Errorf("resolve project tag color: %w", err)
 	}
-	resolvedColor := kit.Ternary(found, storedColor, color)
-	if attachErr := store.InsertIgnoringConflict(project.TagAssignment{ProjectID: projectID, Name: name, Source: project.TagSourceUI, Color: resolvedColor}); attachErr != nil {
+	if attachErr := store.InsertIgnoringConflict(project.TagAssignment{
+		ProjectID: projectID,
+		Name:      name,
+		Source:    project.TagSourceUI,
+		Color:     kit.Ternary(found, storedColor, color),
+	}); attachErr != nil {
 		return fmt.Errorf("attach UI project tag: %w", attachErr)
 	}
 	return nil
@@ -99,7 +104,12 @@ func ReplaceCompose(store Store, projectID string, normalized []project.TagOptio
 	}
 	rows := make([]project.TagAssignment, 0, len(normalized))
 	for _, tag := range normalized {
-		rows = append(rows, project.TagAssignment{ProjectID: projectID, Name: tag.Name, Source: project.TagSourceCompose, Color: tag.Color})
+		rows = append(rows, project.TagAssignment{
+			ProjectID: projectID,
+			Name:      tag.Name,
+			Source:    project.TagSourceCompose,
+			Color:     tag.Color,
+		})
 	}
 	if err := store.Insert(rows); err != nil {
 		return fmt.Errorf("replace Compose project tags: %w", err)
@@ -123,7 +133,12 @@ func AttachInitial(store Store, projectID string, uiTags []string, colors map[st
 				return err
 			}
 		}
-		rows = append(rows, project.TagAssignment{ProjectID: projectID, Name: tag, Source: project.TagSourceUI, Color: color})
+		rows = append(rows, project.TagAssignment{
+			ProjectID: projectID,
+			Name:      tag,
+			Source:    project.TagSourceUI,
+			Color:     color,
+		})
 	}
 	if err := store.Insert(rows); err != nil {
 		return fmt.Errorf("attach initial project tags: %w", err)
@@ -138,16 +153,26 @@ func Group(rows []project.TagAssignment) map[string][]project.Tag {
 	for _, row := range rows {
 		tags := result[row.ProjectID]
 		if len(tags) == 0 || tags[len(tags)-1].Name != row.Name {
-			tags = append(tags, project.Tag{Name: row.Name, Color: row.Color})
+			result[row.ProjectID] = append(tags, project.Tag{
+				Name:    row.Name,
+				Color:   row.Color,
+				Sources: []project.TagSource{row.Source},
+			})
+			continue
 		}
-		tags[len(tags)-1].Sources = append(tags[len(tags)-1].Sources, row.Source)
-		result[row.ProjectID] = tags
+		tags[len(tags)-1] = project.Tag{ //exhaustruct:enforce
+			Name:    tags[len(tags)-1].Name,
+			Color:   tags[len(tags)-1].Color,
+			Sources: append(tags[len(tags)-1].Sources, row.Source),
+		}
 	}
 	for projectID := range result {
-		sort.SliceStable(result[projectID], func(i, j int) bool { return result[projectID][i].Name < result[projectID][j].Name })
+		slices.SortStableFunc(result[projectID], func(a, b project.Tag) int {
+			return strings.Compare(a.Name, b.Name)
+		})
 		for index := range result[projectID] {
-			sort.SliceStable(result[projectID][index].Sources, func(i, j int) bool {
-				return result[projectID][index].Sources[i] == project.TagSourceUI && result[projectID][index].Sources[j] != project.TagSourceUI
+			slices.SortStableFunc(result[projectID][index].Sources, func(a, b project.TagSource) int {
+				return cmp.Compare(kit.Ternary(a == project.TagSourceUI, 0, 1), kit.Ternary(b == project.TagSourceUI, 0, 1))
 			})
 		}
 	}

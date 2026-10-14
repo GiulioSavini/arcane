@@ -1,8 +1,10 @@
-// Package sync manages the project env files a git sync writes: the git
-// source, the Arcane override and the merged effective .env.
+// Package sync manages the project env files a git sync writes (the git
+// source, the Arcane override and the merged effective .env) and persists
+// submitted project file updates.
 package sync
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -23,13 +25,12 @@ func PersistEffectiveEnvContent(ctx context.Context, projectPath, projectsDirect
 		return fmt.Errorf("read project env state: %w", err)
 	}
 
-	// WriteManagedEnvFile skips unreadable paths so git sync keeps working; an
-	// explicit env save would then be dropped without any feedback.
-	targets := []string{projects.EffectiveEnvFileName}
-	if state.HasGitSource {
-		targets = append(targets, projects.OverrideEnvFileName)
-	}
-	for _, name := range targets {
+	// WriteManagedEnvFile skips unreadable paths for git sync; an explicit env save would be dropped silently.
+	for _, name := range kit.Ternary(
+		state.HasGitSource,
+		[]string{projects.EffectiveEnvFileName, projects.OverrideEnvFileName},
+		[]string{projects.EffectiveEnvFileName},
+	) {
 		if info, statErr := os.Stat(filepath.Join(projectPath, name)); statErr == nil && info.IsDir() {
 			return fmt.Errorf("cannot save environment: %s is a directory", name)
 		}
@@ -89,9 +90,9 @@ func ResolveStoredEffectiveEnvContent(state projects.ProjectEnvState) (string, e
 	return state.DirectContent, nil
 }
 
-// EffectiveEnvContentForUpdate returns the env content a project update keeps
+// effectiveEnvContentForUpdate returns the env content a project update keeps
 // when the caller supplied none.
-func EffectiveEnvContentForUpdate(projectPath string, envContent *string) (*string, error) {
+func effectiveEnvContentForUpdate(projectPath string, envContent *string) (*string, error) {
 	if envContent != nil {
 		return envContent, nil
 	}
@@ -104,8 +105,8 @@ func EffectiveEnvContentForUpdate(projectPath string, envContent *string) (*stri
 	return update.EffectiveContent, nil
 }
 
-// EnsureEffectiveEnvFile rebuilds .env from the managed env sources.
-func EnsureEffectiveEnvFile(ctx context.Context, projectPath, projectsDirectory string) error {
+// ensureEffectiveEnvFile rebuilds .env from the managed env sources.
+func ensureEffectiveEnvFile(ctx context.Context, projectPath, projectsDirectory string) error {
 	state, err := projects.ReadProjectEnvState(projectPath)
 	if err != nil {
 		return fmt.Errorf("read project env state: %w", err)
@@ -133,6 +134,60 @@ func EnsureEffectiveEnvFile(ctx context.Context, projectPath, projectsDirectory 
 	return projects.WriteManagedEnvFile(ctx, projectsDirectory, projectPath, projects.EffectiveEnvFileName, state.EffectiveUnreadable, effectiveContent)
 }
 
+// PersistUpdatedProjectFiles validates and writes submitted compose, override,
+// and env content. An override-only save validates the on-disk base merged with
+// the requested override, so a base only valid with its override still passes
+// and a delete that would break the base fails before touching disk.
+func PersistUpdatedProjectFiles(ctx context.Context, projectPath, projectName, projectsDirectory string, composeContent, envContent, overrideContent *string) error {
+	if composeContent == nil && overrideContent == nil {
+		if envContent != nil {
+			return PersistEffectiveEnvContent(ctx, projectPath, projectsDirectory, *envContent)
+		}
+		return nil
+	}
+
+	baseContent, _, err := kit.Ternary(composeContent != nil, func() (string, string, error) {
+		return *composeContent, "", nil
+	}, func() (string, string, error) {
+		return projects.ReadProjectFiles(ctx, projectPath, "")
+	})()
+	if err != nil {
+		return fmt.Errorf("failed to read project files: %w", err)
+	}
+	effectiveEnvContent, err := effectiveEnvContentForUpdate(projectPath, envContent)
+	if err != nil {
+		return fmt.Errorf("invalid compose file: %w", err)
+	}
+	valOverride, valOverrideName := projects.ResolveEffectiveOverrideForValidation(projectPath, overrideContent)
+	if validateErr := projects.ValidateComposeContentForUpdate(
+		ctx, projectsDirectory, projectPath, projectName, baseContent, effectiveEnvContent, valOverride, valOverrideName, false,
+	); validateErr != nil {
+		return fmt.Errorf("invalid compose file: %w", validateErr)
+	}
+
+	// The env is persisted first so WriteComposeFile targets the COMPOSE_FILE
+	// base the updated .env selects. A non-nil composeContent is an explicit
+	// submission and is always written.
+	if envContent != nil {
+		if persistErr := PersistEffectiveEnvContent(ctx, projectPath, projectsDirectory, *envContent); persistErr != nil {
+			return fmt.Errorf("failed to save project files: %w", persistErr)
+		}
+	} else if composeContent != nil {
+		if ensureErr := ensureEffectiveEnvFile(ctx, projectPath, projectsDirectory); ensureErr != nil {
+			return fmt.Errorf("failed to save project files: %w", ensureErr)
+		}
+	}
+	if composeContent != nil {
+		if writeErr := projects.WriteComposeFile(ctx, projectsDirectory, projectPath, *composeContent); writeErr != nil {
+			return fmt.Errorf("failed to save project files: %w", writeErr)
+		}
+	}
+	if overrideErr := projects.ApplyOverrideFileChange(ctx, projectsDirectory, projectPath, overrideContent); overrideErr != nil {
+		return fmt.Errorf("failed to save project files: %w", overrideErr)
+	}
+	return nil
+}
+
 // PrepareGitSyncEnvUpdate resolves the env merge for incoming git env content.
 func PrepareGitSyncEnvUpdate(projectPath string, gitEnvContent *string) (GitSyncEnvUpdate, error) {
 	state, err := projects.ReadProjectEnvState(projectPath)
@@ -140,53 +195,57 @@ func PrepareGitSyncEnvUpdate(projectPath string, gitEnvContent *string) (GitSync
 		return GitSyncEnvUpdate{}, fmt.Errorf("read project env state: %w", err)
 	}
 
-	update := GitSyncEnvUpdate{
-		State:         state,
-		gitEnvContent: gitEnvContent,
-	}
-
 	if gitEnvContent == nil {
 		effectiveContent, resolveStoredEffectiveEnvContentErr := ResolveStoredEffectiveEnvContent(state)
 		if resolveStoredEffectiveEnvContentErr != nil {
 			return GitSyncEnvUpdate{}, resolveStoredEffectiveEnvContentErr
 		}
-		if effectiveContent == "" && !state.HasEffective && !state.HasGitSource && !state.HasOverride {
-			return update, nil
-		}
-		update.EffectiveContent = &effectiveContent
-		return update, nil
+		return GitSyncEnvUpdate{
+			State:            state,
+			EffectiveContent: kit.Ternary(effectiveContent == "" && !state.HasEffective && !state.HasGitSource && !state.HasOverride, nil, &effectiveContent),
+		}, nil
 	}
 
-	switch {
-	case state.HasGitSource:
-		update.overrideContent, err = projects.BuildOverrideEnvContent(state.GitContent, state.OverrideContent)
-	case state.HasOverride:
-		storedContent, resolveErr := ResolveStoredEffectiveEnvContent(state)
-		if resolveErr != nil {
-			return GitSyncEnvUpdate{}, resolveErr
+	overrideContent, err := func() (string, error) {
+		switch {
+		case state.HasGitSource:
+			content, buildErr := projects.BuildOverrideEnvContent(state.GitContent, state.OverrideContent)
+			return content, kit.Ternary(buildErr == nil, nil, fmt.Errorf("build override env content: %w", buildErr))
+		case state.HasOverride:
+			storedContent, resolveErr := ResolveStoredEffectiveEnvContent(state)
+			if resolveErr != nil {
+				return "", resolveErr
+			}
+			content, buildErr := projects.BuildOverrideEnvContent(*gitEnvContent, storedContent)
+			return content, kit.Ternary(buildErr == nil, nil, fmt.Errorf("build override env content: %w", buildErr))
+		case strings.TrimSpace(state.DirectContent) != "":
+			content, buildErr := projects.BuildAdditiveOverrideEnvContent(*gitEnvContent, state.DirectContent)
+			return content, kit.Ternary(buildErr == nil, nil, fmt.Errorf("build override env content: %w", buildErr))
 		}
-		update.overrideContent, err = projects.BuildOverrideEnvContent(*gitEnvContent, storedContent)
-	case strings.TrimSpace(state.DirectContent) != "":
-		update.overrideContent, err = projects.BuildAdditiveOverrideEnvContent(*gitEnvContent, state.DirectContent)
-	}
+		return "", nil
+	}()
 	if err != nil {
-		return GitSyncEnvUpdate{}, fmt.Errorf("build override env content: %w", err)
+		return GitSyncEnvUpdate{}, err
 	}
 
-	effectiveContent, err := projects.BuildEffectiveEnvContent(*gitEnvContent, update.overrideContent)
+	effectiveContent, err := projects.BuildEffectiveEnvContent(*gitEnvContent, overrideContent)
 	if err != nil {
 		return GitSyncEnvUpdate{}, fmt.Errorf("build effective env content: %w", err)
 	}
-	update.EffectiveContent = &effectiveContent
-
-	return update, nil
+	return GitSyncEnvUpdate{
+		State:            state,
+		gitEnvContent:    gitEnvContent,
+		overrideContent:  overrideContent,
+		EffectiveContent: &effectiveContent,
+	}, nil
 }
 
 // GitSyncEnvUpdate is the resolved three-file env change for one git sync.
 type GitSyncEnvUpdate struct {
-	State            projects.ProjectEnvState
-	gitEnvContent    *string
-	overrideContent  string
+	State           projects.ProjectEnvState
+	gitEnvContent   *string
+	overrideContent string
+	// EffectiveContent is the merged .env content, or nil when none is kept.
 	EffectiveContent *string
 }
 
@@ -226,10 +285,6 @@ func PersistGitSyncEnvFiles(ctx context.Context, projectPath, projectsDirectory 
 	return projects.WriteManagedEnvFile(ctx, projectsDirectory, projectPath, projects.OverrideEnvFileName, update.State.OverrideUnreadable, update.overrideContent)
 }
 
-// EffectiveContent is the merged .env content, or nil when none is kept.
-
-// HadGitSource reports whether the project tracked a git env source before.
-
 // ApplyGitSyncEnv applies the managed three-file environment merge and returns
 // the effective content before and after the update.
 func ApplyGitSyncEnv(ctx context.Context, projectPath, projectsDirectory string, gitEnvContent *string) (before, after string, err error) {
@@ -243,9 +298,8 @@ func ApplyGitSyncEnv(ctx context.Context, projectPath, projectsDirectory string,
 	return update.State.DirectContent, kit.FromPtr(update.EffectiveContent), nil
 }
 
-// LoadComposeMetadata returns a discovered project's service count plus
-// compose-go's effective project name. Results are cached by dirPath until a
-// compose, include or env file changes.
+// LoadComposeMetadata returns a discovered project's service count and effective project name.
+// Results are cached by dirPath until a compose, include or env file changes.
 func LoadComposeMetadata(
 	ctx context.Context,
 	cache project.ComposeCache[project.ComposeIdentity],
@@ -254,13 +308,9 @@ func LoadComposeMetadata(
 	pathMapper *projects.PathMapper,
 ) (project.ComposeIdentity, error) {
 	normName := projects.NormalizeProjectName(dirName)
-	meta := project.ComposeIdentity{
-		ResolvedProjectName: normName,
-	}
-
 	composeFile, err := projects.DetectComposeFile(ctx, projectsDirectory, dirPath)
 	if err != nil {
-		return meta, err
+		return project.ComposeIdentity{ResolvedProjectName: normName}, err
 	}
 	fingerprint := fmt.Sprintf("%q|%q|%q|%t|%#v", composeFile, normName, projectsDirectory, autoInjectEnv, pathMapper)
 	if cached, ok := cache.Get(dirPath, fingerprint); ok {
@@ -270,25 +320,20 @@ func LoadComposeMetadata(
 	// Load unnamed first so COMPOSE_PROJECT_NAME from .env wins; fall back to
 	// the normalized directory name when that fails.
 	dependencies := project.ComposeDependencies{}
-	proj, err := projects.LoadComposeProject(ctx, composeFile, "", projectsDirectory, autoInjectEnv, pathMapper, nil, nil, false, &dependencies, nil, nil)
-	if err != nil {
+	proj, loadErr := projects.LoadComposeProject(ctx, composeFile, "", projectsDirectory, autoInjectEnv, pathMapper, nil, nil, false, &dependencies, nil, nil)
+	if loadErr != nil {
 		dependencies = project.ComposeDependencies{}
 		proj, err = projects.LoadComposeProject(ctx, composeFile, normName, projectsDirectory, autoInjectEnv, pathMapper, nil, nil, false, &dependencies, nil, nil)
 		if err != nil {
-			return meta, err
+			return project.ComposeIdentity{ResolvedProjectName: normName}, err
 		}
-	} else if proj.Name != "" && proj.Name != normName {
-		meta.ExplicitProjectName = true
 	}
-
-	meta.ServiceCount = len(proj.Services)
-	if proj.Name != "" {
-		meta.ResolvedProjectName = proj.Name
-	}
-
-	// Keep a COMPOSE_PROJECT_NAME override so containers match.
-	if proj.Name != "" && proj.Name != normName {
-		meta.ComposeProjectName = new(proj.Name)
+	meta := project.ComposeIdentity{
+		ServiceCount:        len(proj.Services),
+		ResolvedProjectName: cmp.Or(proj.Name, normName),
+		// Keep a COMPOSE_PROJECT_NAME override so containers match.
+		ComposeProjectName:  kit.Ternary(proj.Name != "" && proj.Name != normName, new(proj.Name), nil),
+		ExplicitProjectName: loadErr == nil && proj.Name != "" && proj.Name != normName,
 	}
 
 	if composeFiles, envFiles, ok := projects.ComposeCacheDependencies(ctx, proj, dependencies, composeFile, projectsDirectory, autoInjectEnv); ok {

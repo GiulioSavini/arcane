@@ -52,11 +52,26 @@ func (s *Service) Read(ctx context.Context, projectPath, composeFileName string,
 	}
 	for i := range files {
 		if _, ok := owned[files[i].RelativePath]; ok {
-			files[i].Editable = false
-			files[i].ReadOnlyReason = workspacetypes.FileReadOnlyGitOpsManaged
+			files[i] = workspacetypes.FileEntry{ //exhaustruct:enforce
+				ModTime:        files[i].ModTime,
+				Name:           files[i].Name,
+				Path:           files[i].Path,
+				RelativePath:   files[i].RelativePath,
+				Mode:           files[i].Mode,
+				LinkTarget:     files[i].LinkTarget,
+				Size:           files[i].Size,
+				IsDirectory:    files[i].IsDirectory,
+				IsSymlink:      files[i].IsSymlink,
+				Editable:       false,
+				ReadOnlyReason: workspacetypes.FileReadOnlyGitOpsManaged,
+			}
 		}
 	}
-	return &workspacetypes.Workspace{Files: files, FileTreeRevision: revision, FileTreeTruncated: truncated}, nil
+	return &workspacetypes.Workspace{
+		Files:             files,
+		FileTreeRevision:  revision,
+		FileTreeTruncated: truncated,
+	}, nil
 }
 
 // File returns one workspace file's content and whether it may be edited.
@@ -65,29 +80,31 @@ func (s *Service) File(ctx context.Context, projectPath, composeFileName, relati
 	if err != nil {
 		return nil, err
 	}
-	response := &workspacetypes.FileContent{
-		Path:         fullPath,
-		RelativePath: rel,
-		Name:         entry.Name,
-		Size:         entry.Size,
+	response := func(readOnlyReason, mimeType, content string) *workspacetypes.FileContent {
+		return &workspacetypes.FileContent{
+			Path:           fullPath,
+			RelativePath:   rel,
+			Name:           entry.Name,
+			Content:        content,
+			MimeType:       mimeType,
+			Size:           entry.Size,
+			Editable:       readOnlyReason == "",
+			ReadOnlyReason: readOnlyReason,
+		}
 	}
 	if entry.IsDirectory {
 		return nil, common.Classify(common.ErrProjectWorkspaceBadRequest, errors.New("workspace path is a directory"))
 	}
 	if entry.IsSymlink {
-		response.ReadOnlyReason = workspacetypes.FileReadOnlySymlink
-		return response, nil
+		return response(workspacetypes.FileReadOnlySymlink, "", ""), nil
 	}
 	if !acfsutils.IsRegular(entry) {
-		response.ReadOnlyReason = workspacetypes.FileReadOnlySpecial
-		return response, nil
+		return response(workspacetypes.FileReadOnlySpecial, "", ""), nil
 	}
-	maxBytes := workspacepkg.MaxFileSizeBytes(s.config.ProjectWorkspaceMaxFileSizeMB)
-	if entry.Size > maxBytes {
-		response.ReadOnlyReason = workspacetypes.FileReadOnlyTooLarge
-		return response, nil
+	if entry.Size > workspacepkg.MaxFileSizeBytes(s.config.ProjectWorkspaceMaxFileSizeMB) {
+		return response(workspacetypes.FileReadOnlyTooLarge, "", ""), nil
 	}
-	reader, _, err := acfs.OpenRead(ctx, projectPath, "/"+rel, maxBytes)
+	reader, _, err := acfs.OpenRead(ctx, projectPath, "/"+rel, workspacepkg.MaxFileSizeBytes(s.config.ProjectWorkspaceMaxFileSizeMB))
 	if err != nil {
 		return nil, classifyACFSError(err, "read project workspace file")
 	}
@@ -96,20 +113,14 @@ func (s *Service) File(ctx context.Context, projectPath, composeFileName, relati
 	if err != nil {
 		return nil, fmt.Errorf("read project workspace file: %w", err)
 	}
-	response.MimeType = http.DetectContentType(content)
 	if !workspacepkg.IsTextContent(content) {
-		response.ReadOnlyReason = workspacetypes.FileReadOnlyBinary
-		return response, nil
+		return response(workspacetypes.FileReadOnlyBinary, http.DetectContentType(content), ""), nil
 	}
-	response.Content = string(content)
 	if _, ok := owned[rel]; ok {
-		// Sync-owned files stay viewable but read-only: git is their
-		// source of truth (#3634).
-		response.ReadOnlyReason = workspacetypes.FileReadOnlyGitOpsManaged
-		return response, nil
+		// Sync-owned files stay viewable but read-only: git is their source of truth (#3634).
+		return response(workspacetypes.FileReadOnlyGitOpsManaged, http.DetectContentType(content), string(content)), nil
 	}
-	response.Editable = true
-	return response, nil
+	return response("", http.DetectContentType(content), string(content)), nil
 }
 
 // Download opens one workspace file for streaming.
@@ -136,25 +147,24 @@ func (s *Service) Apply(
 	manifest project.WorkspaceUpdateManifest,
 	uploads map[int][]byte,
 ) error {
-	scope := projects.ProjectUpdateBackupScope{}
+	var paths []string
 	for _, change := range manifest.FileChanges {
-		scope.Paths = append(scope.Paths, ChangeTargetPaths(change)...)
+		paths = append(paths, ChangeTargetPaths(change)...)
 	}
-	backup, cleanup, err := projects.BackupProjectDirectory(ctx, projectsDirectory, projectPath, ".project-update-backup-*", scope)
+	backup, cleanup, err := projects.BackupProjectDirectory(ctx, projectsDirectory, projectPath, ".project-update-backup-*", projects.ProjectUpdateBackupScope{Paths: paths})
 	if err != nil {
 		return err
 	}
 	defer cleanup()
 
-	opts := projects.ProjectWorkspaceApplyOptions{
+	if applyErr := projects.ApplyProjectWorkspaceChanges(ctx, projectPath, manifest.FileChanges, uploads, projects.ProjectWorkspaceApplyOptions{
 		ExpectedRevision: strings.TrimSpace(manifest.FileTreeRevision),
 		MaxDepth:         s.config.ProjectWorkspaceMaxDepth,
 		MaxEntries:       s.config.ProjectWorkspaceMaxEntries,
 		MaxFileSizeBytes: workspacepkg.MaxFileSizeBytes(s.config.ProjectWorkspaceMaxFileSizeMB),
 		SkipDirectories:  s.config.ProjectScanSkipDirs,
 		ComposeFileName:  composeFileName,
-	}
-	if applyErr := projects.ApplyProjectWorkspaceChanges(ctx, projectPath, manifest.FileChanges, uploads, opts); applyErr != nil {
+	}); applyErr != nil {
 		if restoreErr := projects.RestoreProjectUpdateBackup(ctx, projectPath, backup); restoreErr != nil {
 			return errors.Join(WrapProjectWorkspaceError(applyErr), fmt.Errorf("rollback project workspace: %w", restoreErr))
 		}
@@ -164,8 +174,7 @@ func (s *Service) Apply(
 }
 
 // OwnedPaths returns the workspace paths a GitOps sync writes on every sync.
-// It fails closed: an incomplete ownership set would expose synced files as
-// editable, and the next sync would silently overwrite the edits.
+// It fails closed: an incomplete set would expose synced files the next sync silently overwrites.
 func OwnedPaths(syncedFiles *string, composePath string) (map[string]struct{}, error) {
 	owned := make(map[string]struct{})
 	add := func(p string) {
@@ -173,7 +182,7 @@ func OwnedPaths(syncedFiles *string, composePath string) (map[string]struct{}, e
 			owned[rel] = struct{}{}
 		}
 	}
-	if syncedFiles != nil && *syncedFiles != "" {
+	if kit.FromPtr(syncedFiles) != "" {
 		var files []string
 		if unmarshalErr := json.Unmarshal([]byte(*syncedFiles), &files); unmarshalErr != nil {
 			return nil, fmt.Errorf("parse gitops synced files for workspace: %w", unmarshalErr)
@@ -262,8 +271,8 @@ func ValidateWorkspaceChangesAgainstGitOps(changes []project.WorkspaceFileChange
 	return nil
 }
 
-// ChangeTargetPaths lists every normalized path a change can create, overwrite or
-// delete; backup scope and GitOps ownership share it so they cannot diverge.
+// ChangeTargetPaths lists every normalized path a change can create, overwrite or delete.
+// Backup scope and GitOps ownership share it so they cannot diverge.
 func ChangeTargetPaths(change project.WorkspaceFileChange) []string {
 	rel, err := kit.NormalizeRelativePath(change.RelativePath)
 	if err != nil {

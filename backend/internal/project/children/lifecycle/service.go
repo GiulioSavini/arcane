@@ -26,6 +26,7 @@ import (
 	"github.com/moby/moby/client"
 	"go.getarcane.app/acfs"
 	"go.getarcane.app/docker"
+	"go.getarcane.app/kit/pkg"
 	"go.getarcane.app/kit/pkg/capture"
 
 	dockerInternal "github.com/getarcaneapp/arcane/backend/v2/internal/docker"
@@ -61,11 +62,14 @@ const (
 var lifecycleEnvKeyRegex = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
 func New(settingsService *settings.SettingsService, dockerService *dockerInternal.DockerClientService, imageService *image.ImageService) *Service {
-	return &Service{settingsService: settingsService, dockerService: dockerService, imageService: imageService}
+	return &Service{
+		settingsService: settingsService,
+		dockerService:   dockerService,
+		imageService:    imageService,
+	}
 }
 
-// markTruncated returns the captured output with a marker when the cap was hit,
-// matching what the GitOps UI shows.
+// markTruncated returns the captured output with a marker when the cap was hit, matching the GitOps UI.
 func markTruncated(c *capture.Capture) string {
 	out := c.String()
 	if c.Truncated() {
@@ -74,8 +78,7 @@ func markTruncated(c *capture.Capture) string {
 	return out
 }
 
-// drainLifecycleLogs waits a bounded time for the log copy to finish, then
-// force-closes the stream for Docker variants that don't EOF on exit.
+// drainLifecycleLogs waits a bounded time for the log copy, then force-closes streams that don't EOF on exit.
 func drainLifecycleLogs(ctx context.Context, logsCancel context.CancelFunc, logs io.ReadCloser, logDone <-chan error) {
 	timer := time.NewTimer(lifecycleStreamDrainTimeout)
 	defer timer.Stop()
@@ -103,8 +106,8 @@ func CombineLifecycleOutput(stdout, stderr string) string {
 	}
 }
 
-// ParseKeyValueEnv parses stdout as strict KEY=VALUE lines, skipping blanks and
-// '#' comments; anything else fails the deploy rather than polluting the env.
+// ParseKeyValueEnv parses stdout as strict KEY=VALUE lines, skipping blanks and '#' comments.
+// Anything else fails the deploy rather than polluting the env.
 func ParseKeyValueEnv(stdout string) (map[string]string, error) {
 	env := map[string]string{}
 	scanner := bufio.NewScanner(strings.NewReader(stdout))
@@ -118,12 +121,10 @@ func ParseKeyValueEnv(stdout string) (map[string]string, error) {
 		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
 			continue
 		}
-		idx := strings.IndexByte(line, '=')
-		if idx <= 0 {
+		key, value, found := strings.Cut(line, "=")
+		if !found || key == "" {
 			return nil, fmt.Errorf("line %d: expected KEY=VALUE, got %q", lineNum, line)
 		}
-		key := line[:idx]
-		value := line[idx+1:]
 		if !lifecycleEnvKeyRegex.MatchString(key) {
 			return nil, fmt.Errorf("line %d: invalid env key %q", lineNum, key)
 		}
@@ -153,12 +154,8 @@ func (s *Service) RunScript(
 		return "", "", 0, fmt.Errorf("failed to connect to Docker: %w", dErr)
 	}
 
-	// Pull a missing runner image through the image service so registry
-	// credentials and the dockerImagePullTimeout setting apply.
+	// Pull a missing runner image through the image service so credentials and the pull timeout apply.
 	if _, inspectErr := dockerClient.ImageInspect(ctx, runnerImage); inspectErr != nil {
-		if s.imageService == nil {
-			return "", "", 0, fmt.Errorf("failed to ensure runner image %s: image service is unavailable", runnerImage)
-		}
 		pullCtx, pullCancel := context.WithTimeout(ctx, timeouts.GetDuration(s.settingsService.GetSettingsConfig().DockerImagePullTimeout.AsInt(), timeouts.DefaultDockerImagePull))
 		pullErr := s.imageService.PullImage(pullCtx, runnerImage, io.Discard, actor, nil)
 		pullTimedOut := errors.Is(pullCtx.Err(), context.DeadlineExceeded)
@@ -171,82 +168,78 @@ func (s *Service) RunScript(
 		}
 	}
 
-	// MountForSubpath mounts a volume-backed /app/data via VolumeOptions.Subpath
-	// (translated host binds fail on e.g. WSL2); on the host, bind projectPath as-is.
-	var workspaceMount *mount.Mount
-	if inspect, inspectErr := libarcane.InspectCurrentArcaneContainer(ctx, dockerClient); inspectErr != nil {
+	// MountForSubpath mounts a volume-backed /app/data via VolumeOptions.Subpath (host binds fail on e.g. WSL2).
+	// On the host, or when the mount cannot be derived, projectPath is bound as-is.
+	inspect, inspectErr := libarcane.InspectCurrentArcaneContainer(ctx, dockerClient)
+	if inspectErr != nil {
 		slog.WarnContext(ctx, "failed to derive workspace mount; falling back to bind on project path", "projectPath", projectPath, "error", inspectErr)
-	} else {
-		workspaceMount = docker.MountForSubpath(inspect.Mounts, projectPath, lifecycleWorkspaceMount)
-	}
-	if workspaceMount == nil {
-		workspaceMount = &mount.Mount{Type: mount.TypeBind, Source: projectPath, Target: lifecycleWorkspaceMount}
 	}
 	// The workspace is read-write so scripts can write artifacts the deploy consumes.
-	mounts := make([]mount.Mount, 0, 1+len(extraMounts))
-	mounts = append(mounts, *workspaceMount)
+	mounts := []mount.Mount{*cmp.Or(
+		docker.MountForSubpath(kit.FromPtr(inspect).Mounts, projectPath, lifecycleWorkspaceMount),
+		&mount.Mount{Type: mount.TypeBind, Source: projectPath, Target: lifecycleWorkspaceMount},
+	)}
 	for _, m := range extraMounts {
-		mounts = append(mounts, mount.Mount{Type: mount.TypeBind, Source: m.Source, Target: m.Target, ReadOnly: m.Readonly})
+		mounts = append(mounts, mount.Mount{
+			Type:     mount.TypeBind,
+			Source:   m.Source,
+			Target:   m.Target,
+			ReadOnly: m.Readonly,
+		})
 	}
 	var env []string
 	for k, v := range hookEnv {
 		env = append(env, k+"="+v)
 	}
 
-	// Cmd is the executable script alone so its shebang picks the interpreter;
-	// Entrypoint is cleared so images like getsops/sops don't treat it as an argument.
-	config := &container.Config{
-		Image:        runnerImage,
-		Entrypoint:   []string{},
-		Cmd:          []string{filepath.ToSlash(filepath.Join(lifecycleWorkspaceMount, scriptPath))},
-		WorkingDir:   lifecycleWorkspaceMount,
-		Env:          env,
-		AttachStdout: true,
-		AttachStderr: true,
-		Tty:          false,
-		Labels: map[string]string{
-			libarcane.InternalResourceLabel: "true",
-		},
-	}
-	// no-new-privileges and CapDrop ALL take setuid and default root
-	// capabilities away from the script and anything it spawns.
-	hostConfig := &container.HostConfig{
-		Mounts:      mounts,
-		NetworkMode: container.NetworkMode(cmp.Or(strings.TrimSpace(networkMode), "none")),
-		SecurityOpt: []string{"no-new-privileges:true"},
-		CapDrop:     []string{"ALL"},
-		AutoRemove:  false,
-	}
-
-	apiTimeoutSec := s.settingsService.GetSettingsConfig().DockerAPITimeout.AsInt()
-	createCtx, createCancel := context.WithTimeout(ctx, timeouts.GetDuration(apiTimeoutSec, timeouts.DefaultDockerAPI))
+	createCtx, createCancel := context.WithTimeout(ctx, timeouts.GetDuration(s.settingsService.GetSettingsConfig().DockerAPITimeout.AsInt(), timeouts.DefaultDockerAPI))
 	defer createCancel()
 	resp, err := dockerClient.ContainerCreate(createCtx, client.ContainerCreateOptions{
-		Config:     config,
-		HostConfig: hostConfig,
+		// Cmd is the script alone so its shebang picks the interpreter; Entrypoint is cleared for images like getsops/sops.
+		Config: &container.Config{
+			Image:        runnerImage,
+			Entrypoint:   []string{},
+			Cmd:          []string{filepath.ToSlash(filepath.Join(lifecycleWorkspaceMount, scriptPath))},
+			WorkingDir:   lifecycleWorkspaceMount,
+			Env:          env,
+			AttachStdout: true,
+			AttachStderr: true,
+			Labels: map[string]string{
+				libarcane.InternalResourceLabel: "true",
+			},
+		},
+		// no-new-privileges and CapDrop ALL strip setuid and root capabilities from the script and its children.
+		HostConfig: &container.HostConfig{
+			Mounts:      mounts,
+			NetworkMode: container.NetworkMode(cmp.Or(strings.TrimSpace(networkMode), "none")),
+			SecurityOpt: []string{"no-new-privileges:true"},
+			CapDrop:     []string{"ALL"},
+		},
 	})
 	if err != nil {
 		return "", "", 0, fmt.Errorf("create lifecycle container: %w", err)
 	}
-	containerID := resp.ID
 	defer func() {
 		// Cleanup outlives cancellation so a cancelled run never leaks its container.
-		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), timeouts.GetDuration(apiTimeoutSec, timeouts.DefaultDockerAPI))
+		cleanupCtx, cleanupCancel := context.WithTimeout(
+			context.WithoutCancel(ctx),
+			timeouts.GetDuration(s.settingsService.GetSettingsConfig().DockerAPITimeout.AsInt(), timeouts.DefaultDockerAPI),
+		)
 		defer cleanupCancel()
-		if _, removeErr := dockerClient.ContainerRemove(cleanupCtx, containerID, client.ContainerRemoveOptions{Force: true}); removeErr != nil && !errdefs.IsNotFound(removeErr) {
-			slog.WarnContext(cleanupCtx, "failed to remove lifecycle container", "containerId", containerID, "error", removeErr)
+		if _, removeErr := dockerClient.ContainerRemove(cleanupCtx, resp.ID, client.ContainerRemoveOptions{Force: true}); removeErr != nil && !errdefs.IsNotFound(removeErr) {
+			slog.WarnContext(cleanupCtx, "failed to remove lifecycle container", "containerId", resp.ID, "error", removeErr)
 		}
 	}()
 
-	startCtx, startCancel := context.WithTimeout(ctx, timeouts.GetDuration(apiTimeoutSec, timeouts.DefaultDockerAPI))
+	startCtx, startCancel := context.WithTimeout(ctx, timeouts.GetDuration(s.settingsService.GetSettingsConfig().DockerAPITimeout.AsInt(), timeouts.DefaultDockerAPI))
 	defer startCancel()
-	if _, containerStartErr := dockerClient.ContainerStart(startCtx, containerID, client.ContainerStartOptions{}); containerStartErr != nil {
+	if _, containerStartErr := dockerClient.ContainerStart(startCtx, resp.ID, client.ContainerStartOptions{}); containerStartErr != nil {
 		return "", "", 0, fmt.Errorf("start lifecycle container: %w", containerStartErr)
 	}
 
 	logsCtx, logsCancel := context.WithCancel(ctx)
 	defer logsCancel()
-	logs, err := dockerClient.ContainerLogs(logsCtx, containerID, client.ContainerLogsOptions{
+	logs, err := dockerClient.ContainerLogs(logsCtx, resp.ID, client.ContainerLogsOptions{
 		ShowStdout: true,
 		ShowStderr: true,
 		Follow:     true,
@@ -265,14 +258,14 @@ func (s *Service) RunScript(
 
 	waitCtx, waitCancel := context.WithTimeout(ctx, timeout)
 	defer waitCancel()
-	waitResp := dockerClient.ContainerWait(waitCtx, containerID, client.ContainerWaitOptions{
+	waitResp := dockerClient.ContainerWait(waitCtx, resp.ID, client.ContainerWaitOptions{
 		Condition: container.WaitConditionNotRunning,
 	})
 
 	select {
 	case result := <-waitResp.Result:
 		exitCode = result.StatusCode
-		if result.Error != nil && result.Error.Message != "" {
+		if kit.FromPtr(result.Error).Message != "" {
 			drainLifecycleLogs(ctx, logsCancel, logs, logDone)
 			return markTruncated(stdoutBuf), markTruncated(stderrBuf), exitCode, fmt.Errorf("lifecycle container reported error: %s", result.Error.Message)
 		}
@@ -295,15 +288,12 @@ func (s *Service) RunScript(
 	return markTruncated(stdoutBuf), markTruncated(stderrBuf), exitCode, nil
 }
 
-// ValidateScriptPath rejects paths that escape the project directory
-// or refer to symlinks/binaries. Reuses the same safety helper that gates
-// the existing project include-file editor.
+// ValidateScriptPath rejects paths that escape the project directory or refer to symlinks or directories.
 func ValidateScriptPath(ctx context.Context, projectPath, scriptPath string) error {
 	if scriptPath == "" {
 		return errors.New("script path is empty")
 	}
-	// scriptPath is a POSIX repo path, not a host path; use path.IsAbs so the
-	// check behaves the same on Windows-based contributor machines.
+	// scriptPath is a POSIX repo path; path.IsAbs behaves the same on Windows.
 	if path.IsAbs(filepath.ToSlash(scriptPath)) {
 		return fmt.Errorf("script path %q must be relative to the project directory", scriptPath)
 	}
@@ -323,10 +313,7 @@ func ValidateScriptPath(ctx context.Context, projectPath, scriptPath string) err
 	entry, err := acfs.Stat(ctx, absProject, "/"+filepath.ToSlash(scriptPath), false)
 	if err != nil {
 		if errors.Is(err, os.ErrPermission) {
-			// The stat runs as Arcane's own uid, but the script executes in the
-			// runner container as that image's user — which may well be able to
-			// read a path Arcane cannot traverse (#3373). Proceed and let the
-			// container run surface any real problem.
+			// The runner image's user may read a path Arcane's uid cannot traverse (#3373); let the run surface real problems.
 			slog.WarnContext(ctx, "cannot inspect pre-deploy script as the Arcane user; proceeding, the runner container may still be able to read it",
 				"scriptPath", scriptPath,
 				"detail", describeLifecyclePathAccess(projectPath, absScript),

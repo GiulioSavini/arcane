@@ -36,7 +36,6 @@ import (
 	"go.getarcane.app/docker"
 	dockertypes "go.getarcane.app/docker/types"
 	kit "go.getarcane.app/kit/pkg"
-	"go.getarcane.app/kit/pkg/mapping"
 	"go.getarcane.app/sys/cgroup"
 	"go.getarcane.app/updater"
 	"go.getarcane.app/updater/labels"
@@ -134,50 +133,91 @@ func (s *ProjectService) EnsureGitOpsProjectLinked(ctx context.Context, gitOpsSy
 	if gitOpsSync == nil || project == nil {
 		return nil
 	}
-	if project.GitOpsManagedBy != nil && *project.GitOpsManagedBy != "" && *project.GitOpsManagedBy != gitOpsSync.ID {
+	if kit.FromPtr(project.GitOpsManagedBy) != "" && kit.FromPtr(project.GitOpsManagedBy) != gitOpsSync.ID {
 		return fmt.Errorf("project %s is already managed by a different GitOps sync", project.ID)
 	}
 
-	cacheBinding := func() {
-		s.composeNames.put(projects.NormalizeProjectName(project.Name), project.ID)
-	}
-	if gitOpsSync.ProjectID != nil && *gitOpsSync.ProjectID == project.ID && project.GitOpsManagedBy != nil && *project.GitOpsManagedBy == gitOpsSync.ID {
-		cacheBinding()
-		return nil
-	}
-
-	updatesSync := map[string]any{}
-	updatesProject := map[string]any{}
-	if gitOpsSync.ProjectID == nil || *gitOpsSync.ProjectID != project.ID {
-		updatesSync["project_id"] = project.ID
-	}
-	if project.GitOpsManagedBy == nil || *project.GitOpsManagedBy != gitOpsSync.ID {
-		updatesProject["gitops_managed_by"] = gitOpsSync.ID
-	}
-	if len(updatesSync) == 0 && len(updatesProject) == 0 {
-		cacheBinding()
-		return nil
-	}
-
-	if err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		if len(updatesSync) > 0 {
-			if err := tx.Model(&GitOpsSync{}).Where("id = ?", gitOpsSync.ID).Updates(updatesSync).Error; err != nil {
-				return fmt.Errorf("failed to relink GitOps sync %s: %w", gitOpsSync.ID, err)
+	if kit.FromPtr(gitOpsSync.ProjectID) != project.ID || kit.FromPtr(project.GitOpsManagedBy) != gitOpsSync.ID {
+		if err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+			if kit.FromPtr(gitOpsSync.ProjectID) != project.ID {
+				if err := tx.Model(&GitOpsSync{}).Where("id = ?", gitOpsSync.ID).Update("project_id", project.ID).Error; err != nil {
+					return fmt.Errorf("failed to relink GitOps sync %s: %w", gitOpsSync.ID, err)
+				}
 			}
-		}
-		if len(updatesProject) > 0 {
-			if err := tx.Model(&Project{}).Where("id = ?", project.ID).Updates(updatesProject).Error; err != nil {
-				return fmt.Errorf("failed to relink project %s to GitOps sync %s: %w", project.ID, gitOpsSync.ID, err)
+			if kit.FromPtr(project.GitOpsManagedBy) != gitOpsSync.ID {
+				if err := tx.Model(&Project{}).Where("id = ?", project.ID).Update("gitops_managed_by", gitOpsSync.ID).Error; err != nil {
+					return fmt.Errorf("failed to relink project %s to GitOps sync %s: %w", project.ID, gitOpsSync.ID, err)
+				}
 			}
+			return nil
+		}); err != nil {
+			return err
 		}
-		return nil
-	}); err != nil {
-		return err
 	}
 
-	gitOpsSync.ProjectID = &project.ID
-	project.GitOpsManagedBy = &gitOpsSync.ID
-	cacheBinding()
+	*gitOpsSync = GitOpsSync{ //exhaustruct:enforce
+		BaseModel:              gitOpsSync.BaseModel,
+		Environment:            gitOpsSync.Environment,
+		Repository:             gitOpsSync.Repository,
+		ProjectID:              &project.ID,
+		Project:                gitOpsSync.Project,
+		SyncedFiles:            gitOpsSync.SyncedFiles,
+		LastSyncAt:             gitOpsSync.LastSyncAt,
+		LastSyncStatus:         gitOpsSync.LastSyncStatus,
+		LastSyncError:          gitOpsSync.LastSyncError,
+		LastSyncCommit:         gitOpsSync.LastSyncCommit,
+		PreDeployScriptPath:    gitOpsSync.PreDeployScriptPath,
+		PreDeployRunnerImage:   gitOpsSync.PreDeployRunnerImage,
+		PreDeployEnv:           gitOpsSync.PreDeployEnv,
+		PreDeployExtraMounts:   gitOpsSync.PreDeployExtraMounts,
+		PreDeployLastRunAt:     gitOpsSync.PreDeployLastRunAt,
+		PreDeployLastRunStatus: gitOpsSync.PreDeployLastRunStatus,
+		PreDeployLastRunOutput: gitOpsSync.PreDeployLastRunOutput,
+		Name:                   gitOpsSync.Name,
+		EnvironmentID:          gitOpsSync.EnvironmentID,
+		RepositoryID:           gitOpsSync.RepositoryID,
+		Branch:                 gitOpsSync.Branch,
+		ComposePath:            gitOpsSync.ComposePath,
+		TargetType:             gitOpsSync.TargetType,
+		ProjectName:            gitOpsSync.ProjectName,
+		PreDeployNetworkMode:   gitOpsSync.PreDeployNetworkMode,
+		SyncInterval:           gitOpsSync.SyncInterval,
+		MaxSyncFiles:           gitOpsSync.MaxSyncFiles,
+		MaxSyncTotalSize:       gitOpsSync.MaxSyncTotalSize,
+		MaxSyncBinarySize:      gitOpsSync.MaxSyncBinarySize,
+		PreDeployTimeoutSec:    gitOpsSync.PreDeployTimeoutSec,
+		AutoSync:               gitOpsSync.AutoSync,
+		SyncDirectory:          gitOpsSync.SyncDirectory,
+		PullImageAfterSync:     gitOpsSync.PullImageAfterSync,
+		RedeployAfterSync:      gitOpsSync.RedeployAfterSync,
+		Mode:                   gitOpsSync.Mode,
+		BackupDirectory:        gitOpsSync.BackupDirectory,
+		BackupPaths:            gitOpsSync.BackupPaths,
+		BackupOnSave:           gitOpsSync.BackupOnSave,
+		BackupPending:          gitOpsSync.BackupPending,
+		BackupPendingSince:     gitOpsSync.BackupPendingSince,
+		BackupConflict:         gitOpsSync.BackupConflict,
+		BackupFailureReason:    gitOpsSync.BackupFailureReason,
+		LastBackupAt:           gitOpsSync.LastBackupAt,
+		LastBackupSnapshot:     gitOpsSync.LastBackupSnapshot,
+	}
+	*project = Project{ //exhaustruct:enforce
+		BaseModel:          project.BaseModel,
+		Name:               project.Name,
+		DirName:            project.DirName,
+		Path:               project.Path,
+		Status:             project.Status,
+		StatusReason:       project.StatusReason,
+		ServiceCount:       project.ServiceCount,
+		RunningCount:       project.RunningCount,
+		GitOpsManagedBy:    &gitOpsSync.ID,
+		ComposeProjectName: project.ComposeProjectName,
+		ImageRefsJSON:      project.ImageRefsJSON,
+		BuildImageRefsJSON: project.BuildImageRefsJSON,
+		IsArchived:         project.IsArchived,
+		ArchivedAt:         project.ArchivedAt,
+	}
+	s.composeNames.put(projects.NormalizeProjectName(project.Name), project.ID)
 	return nil
 }
 
@@ -188,14 +228,13 @@ func (s *ProjectService) ValidateComposeDirectory(ctx context.Context, projectNa
 	if err != nil {
 		return 0, err
 	}
-	pathMapper := s.projectPathMapper(ctx)
 	composeProject, err := projects.LoadComposeProject(
 		ctx,
 		filepath.Join(projectPath, composeFileName),
 		projects.NormalizeProjectName(projectName),
 		projectsDirectory,
 		s.settingsService.GetBoolSetting(ctx, "autoInjectEnv", false),
-		pathMapper,
+		s.projectPathMapper(ctx),
 		nil,
 		nil,
 		true, nil, nil, nil,
@@ -227,21 +266,18 @@ func (s *ProjectService) CreateGitOpsManagedProject(ctx context.Context, gitOpsS
 		return err
 	}
 
-	gitOpsSync.ProjectID = &project.ID
-	project.GitOpsManagedBy = &gitOpsSync.ID
-	s.composeNames.put(projects.NormalizeProjectName(project.Name), project.ID)
+	if err := s.EnsureGitOpsProjectLinked(ctx, gitOpsSync, project); err != nil {
+		return err
+	}
 	if err := s.reconcileComposeTagsForProject(ctx, project); err != nil {
 		slog.WarnContext(ctx, "failed to reconcile Compose project tags during GitOps project creation", "projectId", project.ID, "error", err)
 	}
-	logEvent := true
-	if len(logEventOptions) > 0 {
-		logEvent = logEventOptions[0]
-	}
-	if logEvent && s.eventService != nil {
-		metadata := database.JSON{"action": "create", "projectID": project.ID, "projectName": project.Name, "path": project.Path}
-		if err := s.eventService.LogProjectEvent(ctx, event.EventTypeProjectCreate, project.ID, project.Name, actor.ID, actor.Username, "0", metadata); err != nil {
-			slog.ErrorContext(ctx, "could not log project creation", "error", err)
-		}
+	if len(logEventOptions) == 0 || logEventOptions[0] {
+		s.logProjectEvent(
+			ctx, event.EventTypeProjectCreate, project.ID, project.Name, actor,
+			database.JSON{"action": "create", "projectID": project.ID, "projectName": project.Name, "path": project.Path},
+			"could not log project creation",
+		)
 	}
 	return nil
 }
@@ -254,10 +290,11 @@ func (s *ProjectService) newProjectMetadataEnv(ctx context.Context, projectsList
 		slog.WarnContext(ctx, "failed to resolve projects directory for compose selection", "error", err)
 	}
 	env := &projectMetadataEnv{
-		projectsDirectory: projectsDirectory,
-		autoInjectEnv:     s.settingsService.GetBoolSetting(ctx, "autoInjectEnv", false),
-		settings:          s.settingsService.GetSettingsOrDefaults(ctx),
-		composeFiles:      make(map[string]string, len(projectsList)),
+		projectsDirectory:  projectsDirectory,
+		autoInjectEnv:      s.settingsService.GetBoolSetting(ctx, "autoInjectEnv", false),
+		settings:           s.settingsService.GetSettingsOrDefaults(ctx),
+		gitOpsComposePaths: make(map[string]string),
+		composeFiles:       make(map[string]string, len(projectsList)),
 	}
 	s.preloadGitOpsComposePaths(ctx, env, projectsList)
 	return env
@@ -278,13 +315,9 @@ func (s *ProjectService) preloadGitOpsComposePaths(ctx context.Context, env *pro
 	}
 	var syncRecords []GitOpsSync
 	if err := s.db.WithContext(ctx).Select("id", "compose_path").Where("id IN ?", syncIDs).Find(&syncRecords).Error; err != nil {
-		// Leave these IDs unloaded so each project falls back to its own lookup
-		// and surfaces the failure the same way it did before batching.
+		// Unloaded IDs fall back to a per-project lookup that surfaces the failure.
 		slog.WarnContext(ctx, "failed to batch resolve GitOps compose paths", "error", err)
 		return
-	}
-	if env.gitOpsComposePaths == nil {
-		env.gitOpsComposePaths = make(map[string]string, len(syncIDs))
 	}
 	for _, id := range syncIDs {
 		env.gitOpsComposePaths[id] = ""
@@ -307,54 +340,55 @@ func NewProjectService(
 	kvService *kv.KVService,
 	registryCredentialsProvider func(context.Context) ([]containerregistry.Credential, error),
 ) *ProjectService {
-	s := &ProjectService{
-		RegistryCredentialsProvider: registryCredentialsProvider,
-		composeCoordinator:          projects.NewCoordinator(projecttypes.ComposeCommands{Stop: composeStopProjectServices, Up: composeUpProjectServices, Create: projects.ComposeCreate}),
-		db:                          db,
-		settingsService:             settingsService,
-		eventService:                eventService,
-		imageService:                imageService,
-		dockerService:               dockerService,
-		lifecycleService:            lifecycleService,
+	var s *ProjectService
+	s = &ProjectService{
+		composeCoordinator: projects.NewCoordinator(projecttypes.ComposeCommands{Stop: composeStopProjectServices, Up: composeUpProjectServices, Create: projects.ComposeCreate}),
+		db:                 db,
+		settingsService:    settingsService,
+		eventService:       eventService,
+		imageService:       imageService,
+		dockerService:      dockerService,
+		lifecycleService:   lifecycleService,
+		workspace:          workspace.New(cfg),
+		details:            projectdetails.New(db, dockerService, imageService, settingsService),
+		listing: listing.New(
+			func(ctx context.Context) ([]container.Summary, error) { return s.details.ComposeContainers(ctx) },
+			imageService,
+			func(imageRefs []string, services []projecttypes.RuntimeService, scoped map[string]*imagetypes.UpdateInfo) *projecttypes.UpdateInfo {
+				return buildUpdateInfoSummary(imageRefs, projectdetails.MergeProjectContainerUpdateInfo(nil, services, scoped), nil)
+			},
+		),
+		deployment: deployment.New(settingsService, imageService, dockerService, buildService),
+		// Rename recovery compares the stored name and path against its journal and rolls the row back.
+		updates: update.New(
+			kvService,
+			dockerService,
+			containerRegistryService,
+			func(ctx context.Context) ([]containerregistry.Credential, error) {
+				return s.ResolveRegistryCredentials(ctx)
+			},
+			func(ctx context.Context, projectID string) (string, string, bool, error) {
+				proj, found, err := s.FindProjectByID(ctx, projectID)
+				if err != nil || !found {
+					return "", "", found, err
+				}
+				return proj.Name, proj.Path, true, nil
+			},
+			func(ctx context.Context, journal *projecttypes.RenameJournal) error {
+				return db.WithContext(ctx).Model(&Project{}).Where("id = ?", journal.ProjectID).Updates(map[string]any{
+					"name": journal.OldName, "path": journal.OldPath, "dir_name": journal.OldDirName,
+				}).Error
+			},
+		),
 		containerRegistryService:    containerRegistryService,
 		config:                      cfg,
+		RegistryCredentialsProvider: registryCredentialsProvider,
 		parsedCompose:               projects.NewParsedComposeCache(),
 		metaCache:                   projects.NewComposeCache[projects.ArcaneComposeMetadata](1024, nil),
 		composeIdentities:           projects.NewComposeCache[projecttypes.ComposeIdentity](2048, nil),
 		FilesChanged:                concurrency.NewSignal[string](),
 	}
-	s.initChildren(kvService, buildService)
 	return s
-}
-
-// initChildren builds the feature services from the parent's
-// dependencies and callbacks.
-func (s *ProjectService) initChildren(kvService *kv.KVService, buildService builder) {
-	s.workspace = workspace.New(s.config)
-	s.details = projectdetails.New(s.db, s.dockerService, s.imageService, s.settingsService)
-	s.listing = listing.New(
-		s.details.ComposeContainers,
-		s.imageService,
-		func(imageRefs []string, services []projecttypes.RuntimeService, scoped map[string]*imagetypes.UpdateInfo) *projecttypes.UpdateInfo {
-			return buildUpdateInfoSummary(imageRefs, projectdetails.MergeProjectContainerUpdateInfo(nil, services, scoped))
-		},
-	)
-	s.deployment = deployment.New(s.settingsService, s.imageService, s.dockerService, buildService)
-	// Rename recovery compares the stored name and path against its journal and
-	// rolls the row back to its pre-rename identity.
-	renameState := func(ctx context.Context, projectID string) (string, string, bool, error) {
-		proj, found, err := s.FindProjectByID(ctx, projectID)
-		if err != nil || !found {
-			return "", "", found, err
-		}
-		return proj.Name, proj.Path, true, nil
-	}
-	restoreRenamed := func(ctx context.Context, journal *projecttypes.RenameJournal) error {
-		return s.db.WithContext(ctx).Model(&Project{}).Where("id = ?", journal.ProjectID).Updates(map[string]any{
-			"name": journal.OldName, "path": journal.OldPath, "dir_name": journal.OldDirName,
-		}).Error
-	}
-	s.updates = update.New(kvService, s.dockerService, s.containerRegistryService, s.ResolveRegistryCredentials, renameState, restoreRenamed)
 }
 
 // RecoverProjectRenameJournals replays renames interrupted by a restart.
@@ -363,10 +397,6 @@ func (s *ProjectService) RecoverProjectRenameJournals(ctx context.Context) error
 }
 
 func (s *ProjectService) ResolveRegistryCredentials(ctx context.Context) ([]containerregistry.Credential, error) {
-	if s == nil || s.RegistryCredentialsProvider == nil {
-		return nil, nil
-	}
-
 	credentials, err := s.RegistryCredentialsProvider(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("get enabled registry credentials: %w", err)
@@ -389,16 +419,13 @@ func (s *ProjectService) getMutableProject(ctx context.Context, projectID string
 	if err != nil {
 		return nil, err
 	}
-	if proj != nil && proj.IsArchived {
+	if proj.IsArchived {
 		return nil, common.Classify(common.ErrProjectArchived, errors.New("project is archived and must be unarchived before this action"))
 	}
 	return proj, nil
 }
 
 func (s *ProjectService) logProjectEvent(ctx context.Context, eventType event.EventType, projectID, projectName string, user usertypes.Actor, metadata database.JSON, action string) {
-	if s.eventService == nil {
-		return
-	}
 	if logErr := s.eventService.LogProjectEvent(ctx, eventType, projectID, projectName, user.ID, user.Username, "0", metadata); logErr != nil {
 		slog.ErrorContext(ctx, "could not log project event", "action", action, "error", logErr)
 	}
@@ -443,8 +470,8 @@ func (s *ProjectService) GetProjectByComposeName(ctx context.Context, name strin
 	if name == "" {
 		return nil, errors.New("project name is empty")
 	}
-	normalized := projects.NormalizeProjectName(name)
 
+	normalized := projects.NormalizeProjectName(name)
 	var proj Project
 	err := s.db.WithContext(ctx).Where("name = ? OR name = ?", name, normalized).First(&proj).Error
 	if err == nil {
@@ -455,30 +482,34 @@ func (s *ProjectService) GetProjectByComposeName(ctx context.Context, name strin
 		return nil, fmt.Errorf("failed to get project by name: %w", err)
 	}
 
-	if cachedProject, found, cacheErr := s.lookupProjectByCachedComposeName(ctx, normalized); cacheErr != nil {
-		return nil, cacheErr
-	} else if found {
-		return cachedProject, nil
-	}
-
-	var projectModels []Project
-	if listErr := s.db.WithContext(ctx).Select("id", "name").Find(&projectModels).Error; listErr != nil {
-		return nil, fmt.Errorf("failed to list projects by compose name: %w", listErr)
-	}
-	byName := make(map[string]string, len(projectModels))
-	for _, projectModel := range projectModels {
-		if normalizedName := projects.NormalizeProjectName(projectModel.Name); normalizedName != "" {
-			if _, exists := byName[normalizedName]; !exists {
+	for attempt := range 2 {
+		if projectID, ok := s.composeNames.projectID(normalized).Get(); ok {
+			var projectModel Project
+			switch lookupErr := s.db.WithContext(ctx).Where("id = ?", projectID).First(&projectModel).Error; {
+			case errors.Is(lookupErr, gorm.ErrRecordNotFound), lookupErr == nil && projects.NormalizeProjectName(projectModel.Name) != normalized:
+				s.composeNames.invalidate(normalized)
+			case errors.Is(lookupErr, context.Canceled), errors.Is(lookupErr, context.DeadlineExceeded):
+				return nil, fmt.Errorf("request canceled or timed out: %w", lookupErr)
+			case lookupErr != nil:
+				return nil, fmt.Errorf("failed to get project by cached compose name: %w", lookupErr)
+			default:
+				return &projectModel, nil
+			}
+		}
+		if attempt > 0 {
+			break
+		}
+		var projectModels []Project
+		if listErr := s.db.WithContext(ctx).Select("id", "name").Find(&projectModels).Error; listErr != nil {
+			return nil, fmt.Errorf("failed to list projects by compose name: %w", listErr)
+		}
+		byName := make(map[string]string, len(projectModels))
+		for _, projectModel := range projectModels {
+			if normalizedName := projects.NormalizeProjectName(projectModel.Name); normalizedName != "" && byName[normalizedName] == "" {
 				byName[normalizedName] = projectModel.ID
 			}
 		}
-	}
-	s.composeNames.replace(byName)
-
-	if cachedProject, found, cacheErr := s.lookupProjectByCachedComposeName(ctx, normalized); cacheErr != nil {
-		return nil, cacheErr
-	} else if found {
-		return cachedProject, nil
+		s.composeNames.replace(byName)
 	}
 
 	return nil, common.Classify(common.ErrNotFound, fmt.Errorf("project not found: %s", name))
@@ -502,9 +533,8 @@ func (s *ProjectService) ComposeServiceImage(ctx context.Context, composeName, s
 	return proj.ID, service.Image, nil
 }
 
-// EnsureProjectPathUnderRoot validates that the project's path is a safe subdirectory of the configured projects root.
-// If not, it normalizes the path to `<projectsRoot>/<dirName or sanitized project name>`. When persist=true, it saves
-// the updated project path to the database.
+// EnsureProjectPathUnderRoot normalizes a path outside the projects root to `<projectsRoot>/<dirName or sanitized name>`.
+// When persist=true, it saves the updated project path to the database.
 func (s *ProjectService) EnsureProjectPathUnderRoot(ctx context.Context, proj *Project, persist bool) error {
 	projectsDirectory, err := s.GetProjectsDirectory(ctx)
 	if err != nil {
@@ -512,26 +542,29 @@ func (s *ProjectService) EnsureProjectPathUnderRoot(ctx context.Context, proj *P
 	}
 
 	rootAbs, _ := filepath.Abs(projectsDirectory)
-	rootAbs = filepath.Clean(rootAbs)
-
-	projPathAbs := proj.Path
-	if abs, aerr := filepath.Abs(proj.Path); aerr == nil {
-		projPathAbs = filepath.Clean(abs)
-	}
-
-	if projects.IsSafeSubdirectory(rootAbs, projPathAbs) {
+	projPathAbs, absErr := filepath.Abs(proj.Path)
+	if projects.IsSafeSubdirectory(rootAbs, kit.Ternary(absErr == nil, projPathAbs, proj.Path)) {
 		return nil
 	}
 
-	// Attempt to repair using known directory name or sanitized project name
-	dirName := mo.PointerToOption(proj.DirName).OrEmpty()
-	if strings.TrimSpace(dirName) == "" {
-		dirName = projects.SanitizeProjectName(proj.Name)
-	}
-	candidate := filepath.Join(projectsDirectory, dirName)
-
+	candidate := filepath.Join(projectsDirectory, kit.Ternary(strings.TrimSpace(kit.FromPtr(proj.DirName)) == "", projects.SanitizeProjectName(proj.Name), kit.FromPtr(proj.DirName)))
 	slog.WarnContext(ctx, "Normalizing project path to projects root", "projectId", proj.ID, "oldPath", proj.Path, "newPath", candidate, "root", projectsDirectory)
-	proj.Path = filepath.Clean(candidate)
+	*proj = Project{ //exhaustruct:enforce
+		BaseModel:          proj.BaseModel,
+		Name:               proj.Name,
+		DirName:            proj.DirName,
+		Path:               candidate,
+		Status:             proj.Status,
+		StatusReason:       proj.StatusReason,
+		ServiceCount:       proj.ServiceCount,
+		RunningCount:       proj.RunningCount,
+		GitOpsManagedBy:    proj.GitOpsManagedBy,
+		ComposeProjectName: proj.ComposeProjectName,
+		ImageRefsJSON:      proj.ImageRefsJSON,
+		BuildImageRefsJSON: proj.BuildImageRefsJSON,
+		IsArchived:         proj.IsArchived,
+		ArchivedAt:         proj.ArchivedAt,
+	}
 
 	if persist {
 		if saveErr := s.db.WithContext(ctx).Save(proj).Error; saveErr != nil {
@@ -542,56 +575,24 @@ func (s *ProjectService) EnsureProjectPathUnderRoot(ctx context.Context, proj *P
 }
 
 func (s *ProjectService) projectPathMapper(ctx context.Context) *projects.PathMapper {
-	var dockerClient *client.Client
-	if s.dockerService != nil {
-		dockerClient, _ = s.dockerService.GetClient(ctx)
-	}
 	return projects.NewPathMapperForConfiguredDirectory(
 		ctx,
 		s.settingsService.GetStringSetting(ctx, "projectsDirectory", "/app/data/projects"),
 		"/app/data/projects",
-		dockerClient,
+		func() *client.Client {
+			dockerClient, _ := s.dockerService.GetClient(ctx)
+			return dockerClient
+		}(),
 	)
 }
 
 func (s *ProjectService) invalidateProjectCaches(projectID string) {
-	if s.parsedCompose != nil {
-		s.parsedCompose.Invalidate(projectID)
-	}
-	if s.metaCache != nil {
-		s.metaCache.Invalidate(projectID)
-	}
+	s.parsedCompose.Invalidate(projectID)
+	s.metaCache.Invalidate(projectID)
 }
 
-func (s *ProjectService) lookupProjectByCachedComposeName(ctx context.Context, normalizedName string) (*Project, bool, error) {
-	projectID, ok := s.composeNames.projectID(normalizedName).Get()
-	if !ok {
-		return nil, false, nil
-	}
-
-	var projectModel Project
-	if err := s.db.WithContext(ctx).Where("id = ?", projectID).First(&projectModel).Error; err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			s.composeNames.invalidate(normalizedName)
-			return nil, false, nil
-		}
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			return nil, false, fmt.Errorf("request canceled or timed out: %w", err)
-		}
-		return nil, false, fmt.Errorf("failed to get project by cached compose name: %w", err)
-	}
-	if projects.NormalizeProjectName(projectModel.Name) != normalizedName {
-		s.composeNames.invalidate(normalizedName)
-		return nil, false, nil
-	}
-
-	return &projectModel, true, nil
-}
-
-// ResolveProjectComposeFile returns the base compose file for a project. The
-// precedence mirrors `docker compose`: COMPOSE_FILE in the merged environment
-// (.env.global first, the project's .env on top) wins, then a GitOps sync's
-// configured compose path, then standard detection.
+// ResolveProjectComposeFile returns the base compose file for a project, mirroring `docker compose`: COMPOSE_FILE
+// in the merged environment wins, then a GitOps sync's configured compose path, then standard detection.
 func (s *ProjectService) ResolveProjectComposeFile(ctx context.Context, proj *Project) (string, error) {
 	return s.resolveProjectComposeFile(ctx, proj, nil)
 }
@@ -603,53 +604,48 @@ func (s *ProjectService) resolveProjectComposeFile(ctx context.Context, proj *Pr
 		return "", errors.New("project is nil")
 	}
 	return env.composeFile(proj.ID, func() (string, error) {
-		projectsDirectory := ""
-		switch {
-		case env != nil:
-			projectsDirectory = env.projectsDirectory
-		case s.settingsService != nil:
-			var dirErr error
-			projectsDirectory, dirErr = s.GetProjectsDirectory(ctx)
+		projectsDirectory, preloadedComposePaths := func() (string, map[string]string) {
+			if env != nil {
+				return env.projectsDirectory, env.gitOpsComposePaths
+			}
+			dir, dirErr := s.GetProjectsDirectory(ctx)
 			if dirErr != nil {
-				// The .env.global layer is skipped for an empty projects directory;
-				// keep resolution working but surface the misconfiguration.
+				// The .env.global layer is skipped for an empty projects directory; surface the misconfiguration.
 				slog.WarnContext(ctx, "failed to resolve projects directory for compose selection", "projectId", proj.ID, "error", dirErr)
 			}
-		}
+			return dir, nil
+		}()
 		if files, selErr := projects.ComposeFileEnvSelection(ctx, projectsDirectory, proj.Path); selErr != nil {
 			return "", selErr
 		} else if len(files) > 0 {
 			return files[0], nil
 		}
 
-		// A GitOps sync's configured compose path comes from the preloaded request
-		// map when available; a sync without a row resolves like a missing one.
-		composePath := ""
-		if syncID := gitOpsSyncID(proj); syncID != "" {
-			preloaded := false
-			if env != nil {
-				composePath, preloaded = env.gitOpsComposePaths[syncID]
+		// A GitOps sync's compose path comes from the preloaded request map when available; a missing row resolves to "".
+		composePath, err := func() (string, error) {
+			if gitOpsSyncID(proj) == "" {
+				return "", nil
 			}
-			if !preloaded {
-				var syncRecord GitOpsSync
-				if err := s.db.WithContext(ctx).Select("compose_path").Where("id = ?", syncID).First(&syncRecord).Error; err == nil {
-					composePath = syncRecord.ComposePath
-				} else if !errors.Is(err, gorm.ErrRecordNotFound) {
-					return "", fmt.Errorf("failed to resolve GitOps compose path for project %s: %w", proj.ID, err)
-				}
+			if preloaded, ok := preloadedComposePaths[gitOpsSyncID(proj)]; ok {
+				return preloaded, nil
 			}
+			var syncRecord GitOpsSync
+			if err := s.db.WithContext(ctx).Select("compose_path").Where("id = ?", gitOpsSyncID(proj)).First(&syncRecord).Error; err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+				return "", fmt.Errorf("failed to resolve GitOps compose path for project %s: %w", proj.ID, err)
+			}
+			return syncRecord.ComposePath, nil
+		}()
+		if err != nil {
+			return "", err
 		}
 		if composeFileName := strings.TrimSpace(filepath.Base(composePath)); composeFileName != "" && composeFileName != "." {
-			candidate := filepath.Join(proj.Path, composeFileName)
-			// os.Stat rather than acfs: proj.Path may be an imported project
-			// outside the projects directory, and the compose file may be a
-			// symlink resolving outside it.
-			info, statErr := os.Stat(candidate)
+			// os.Stat rather than acfs: an imported project or a symlinked compose file may resolve outside the projects directory.
+			info, statErr := os.Stat(filepath.Join(proj.Path, composeFileName))
 			if statErr == nil && !info.IsDir() {
-				return candidate, nil
+				return filepath.Join(proj.Path, composeFileName), nil
 			}
 			if statErr != nil && !os.IsNotExist(statErr) {
-				return "", fmt.Errorf("failed to inspect GitOps compose file %s: %w", candidate, statErr)
+				return "", fmt.Errorf("failed to inspect GitOps compose file %s: %w", filepath.Join(proj.Path, composeFileName), statErr)
 			}
 		}
 
@@ -664,9 +660,8 @@ func (s *ProjectService) resolveProjectComposeFile(ctx context.Context, proj *Pr
 	})
 }
 
-// loadComposeProjectForProject loads the executable compose model for
-// proj. prepare is optional and runs before host path translation; deployment
-// paths use it to create missing bind directories, read paths pass nil.
+// loadComposeProjectForProject loads the executable compose model for proj. prepare is optional and runs before
+// host path translation; deployment paths use it to create missing bind directories, read paths pass nil.
 func (s *ProjectService) loadComposeProjectForProject(ctx context.Context, proj *Project, prepare projects.PrepareProjectFunc, services ...string) (*types.Project, string, error) {
 	composeFileFullPath, err := s.ResolveProjectComposeFile(ctx, proj)
 	if err != nil {
@@ -677,18 +672,19 @@ func (s *ProjectService) loadComposeProjectForProject(ctx context.Context, proj 
 	projectsDirectory, dirErr := projects.GetProjectsDirectory(ctx, cfg.ProjectsDirectory.Value)
 	if dirErr != nil {
 		slog.WarnContext(ctx, "unable to determine projects directory; using default", "error", dirErr)
-		projectsDirectory = "/app/data/projects"
 	}
-
-	pathMapper := s.projectPathMapper(ctx)
-
-	autoInjectEnv := kit.ParseOrDefault(cfg.AutoInjectEnv.Value, false, strconv.ParseBool)
-	projectName := projects.NormalizeProjectName(proj.Name)
-	composeProject, loadErr := projects.LoadComposeProject(ctx, composeFileFullPath, projectName, projectsDirectory, autoInjectEnv, pathMapper, nil, nil, false, nil, services, prepare)
+	composeProject, loadErr := projects.LoadComposeProject(
+		ctx,
+		composeFileFullPath,
+		projects.NormalizeProjectName(proj.Name),
+		kit.Ternary(dirErr == nil, projectsDirectory, "/app/data/projects"),
+		kit.ParseOrDefault(cfg.AutoInjectEnv.Value, false, strconv.ParseBool),
+		s.projectPathMapper(ctx),
+		nil, nil, false, nil, services, prepare,
+	)
 	if loadErr != nil {
 		return nil, "", loadErr
 	}
-
 	return composeProject, composeFileFullPath, nil
 }
 
@@ -696,39 +692,43 @@ func (s *ProjectService) getCachedComposeProject(ctx context.Context, proj *Proj
 	if proj == nil {
 		return nil, errors.New("project is nil")
 	}
-	var cfg *settings.Settings
-	if env != nil {
-		cfg = env.settings
-	}
-	if cfg == nil {
-		cfg = s.settingsService.GetSettingsOrDefaults(ctx)
-	}
+	cfg := func() *settings.Settings {
+		if env == nil {
+			return s.settingsService.GetSettingsOrDefaults(ctx)
+		}
+		return env.settings
+	}()
 	composePath, err := s.resolveProjectComposeFile(ctx, proj, env)
 	if err != nil {
 		return nil, err
 	}
-	autoInjectEnv := kit.ParseOrDefault(cfg.AutoInjectEnv.Value, false, strconv.ParseBool)
 	projectsDirectory, dirErr := projects.GetProjectsDirectory(ctx, cfg.ProjectsDirectory.Value)
 	if dirErr != nil {
 		slog.WarnContext(ctx, "unable to determine projects directory; using default", "error", dirErr)
-		projectsDirectory = "/app/data/projects"
 	}
-	return projects.LoadCachedComposeProject(ctx, s.parsedCompose, proj.ID, proj.Path, composePath, projects.NormalizeProjectName(proj.Name), projectsDirectory, autoInjectEnv, s.projectPathMapper(ctx))
+	return projects.LoadCachedComposeProject(
+		ctx,
+		s.parsedCompose,
+		proj.ID,
+		proj.Path,
+		composePath,
+		projects.NormalizeProjectName(proj.Name),
+		kit.Ternary(dirErr == nil, projectsDirectory, "/app/data/projects"),
+		kit.ParseOrDefault(cfg.AutoInjectEnv.Value, false, strconv.ParseBool),
+		s.projectPathMapper(ctx),
+	)
 }
 
 func (s *ProjectService) refreshComposeProjectName(ctx context.Context, proj *Project) {
-	if proj == nil {
-		return
-	}
-
-	cfg := s.settingsService.GetSettingsOrDefaults(ctx)
-	projectsDirectory, err := projects.GetProjectsDirectory(ctx, cfg.ProjectsDirectory.Value)
-	var meta projecttypes.ComposeIdentity
-	if err == nil {
-		dirName := cmp.Or(mo.PointerToOption(proj.DirName).OrEmpty(), proj.Name)
+	meta, err := func() (projecttypes.ComposeIdentity, error) {
+		cfg := s.settingsService.GetSettingsOrDefaults(ctx)
+		projectsDirectory, dirErr := projects.GetProjectsDirectory(ctx, cfg.ProjectsDirectory.Value)
+		if dirErr != nil {
+			return projecttypes.ComposeIdentity{}, dirErr
+		}
 		autoInjectEnv := kit.ParseOrDefault(cfg.AutoInjectEnv.Value, false, strconv.ParseBool)
-		meta, err = projectsync.LoadComposeMetadata(ctx, s.composeIdentities, proj.Path, dirName, projectsDirectory, autoInjectEnv, s.projectPathMapper(ctx))
-	}
+		return projectsync.LoadComposeMetadata(ctx, s.composeIdentities, proj.Path, cmp.Or(kit.FromPtr(proj.DirName), proj.Name), projectsDirectory, autoInjectEnv, s.projectPathMapper(ctx))
+	}()
 	if err != nil {
 		if errors.Is(err, common.ErrProjectEnvUnreadable) {
 			slog.DebugContext(ctx, "skipped compose project name refresh; project env is unreadable", "projectId", proj.ID, "path", proj.Path, "error", err)
@@ -738,32 +738,38 @@ func (s *ProjectService) refreshComposeProjectName(ctx context.Context, proj *Pr
 		return
 	}
 
-	updates := map[string]any{}
-	shouldUpdateName := meta.ExplicitProjectName || projects.NormalizeProjectName(proj.Name) != proj.Name
-	if shouldUpdateName && meta.ResolvedProjectName != "" && proj.Name != meta.ResolvedProjectName {
-		updates["name"] = meta.ResolvedProjectName
-	}
-	if mo.PointerToOption(proj.ComposeProjectName) != mo.PointerToOption(meta.ComposeProjectName) {
-		updates["compose_project_name"] = meta.ComposeProjectName
-	}
-	if len(updates) == 0 {
+	name := kit.Ternary(
+		(meta.ExplicitProjectName || projects.NormalizeProjectName(proj.Name) != proj.Name) && meta.ResolvedProjectName != "",
+		meta.ResolvedProjectName,
+		proj.Name,
+	)
+	if name == proj.Name && mo.PointerToOption(proj.ComposeProjectName) == mo.PointerToOption(meta.ComposeProjectName) {
 		return
 	}
-
-	updates["updated_at"] = time.Now()
-	if persistComposeNameErr := s.db.WithContext(ctx).
-		Model(&Project{}).
-		Where("id = ?", proj.ID).
-		Updates(updates).Error; persistComposeNameErr != nil {
+	if persistComposeNameErr := s.db.WithContext(ctx).Model(&Project{}).Where("id = ?", proj.ID).Updates(map[string]any{
+		"name":                 name,
+		"compose_project_name": meta.ComposeProjectName,
+		"updated_at":           time.Now(),
+	}).Error; persistComposeNameErr != nil {
 		slog.WarnContext(ctx, "failed to persist refreshed compose project name", "projectId", proj.ID, "error", persistComposeNameErr)
 		return
 	}
 
-	if name, ok := updates["name"].(string); ok {
-		proj.Name = name
-	}
-	if _, ok := updates["compose_project_name"]; ok {
-		proj.ComposeProjectName = meta.ComposeProjectName
+	*proj = Project{ //exhaustruct:enforce
+		BaseModel:          proj.BaseModel,
+		Name:               name,
+		DirName:            proj.DirName,
+		Path:               proj.Path,
+		Status:             proj.Status,
+		StatusReason:       proj.StatusReason,
+		ServiceCount:       proj.ServiceCount,
+		RunningCount:       proj.RunningCount,
+		GitOpsManagedBy:    proj.GitOpsManagedBy,
+		ComposeProjectName: meta.ComposeProjectName,
+		ImageRefsJSON:      proj.ImageRefsJSON,
+		BuildImageRefsJSON: proj.BuildImageRefsJSON,
+		IsArchived:         proj.IsArchived,
+		ArchivedAt:         proj.ArchivedAt,
 	}
 }
 
@@ -809,12 +815,12 @@ func (s *LifecycleService) runPreDeploy(ctx context.Context, project *Project, a
 	case err != nil:
 		return fmt.Errorf("failed to load gitops sync for lifecycle hook: %w", err)
 	}
-	if syncRecord.PreDeployScriptPath == nil || strings.TrimSpace(*syncRecord.PreDeployScriptPath) == "" {
+	if strings.TrimSpace(kit.FromPtr(syncRecord.PreDeployScriptPath)) == "" {
 		return nil
 	}
 
 	runnerImage := cmp.Or(
-		strings.TrimSpace(mo.PointerToOption(syncRecord.PreDeployRunnerImage).OrEmpty()),
+		strings.TrimSpace(kit.FromPtr(syncRecord.PreDeployRunnerImage)),
 		strings.TrimSpace(s.settingsService.GetStringSetting(ctx, "lifecycleDefaultRunnerImage", "alpine:latest")),
 	)
 	if runnerImage == "" {
@@ -835,11 +841,12 @@ func (s *LifecycleService) runPreDeploy(ctx context.Context, project *Project, a
 		return fmt.Errorf("invalid lifecycle extra mounts config: %w", err)
 	}
 
-	timeoutSec := kit.Ternary(syncRecord.PreDeployTimeoutSec > 0, syncRecord.PreDeployTimeoutSec, lifecycletype.DefaultTimeoutSec)
-	if maxTimeoutSec := s.settingsService.GetIntSetting(ctx, "lifecycleMaxTimeoutSec", lifecycletype.DefaultMaxTimeoutSec); maxTimeoutSec > 0 {
-		timeoutSec = min(timeoutSec, maxTimeoutSec)
-	}
-	timeout := time.Duration(timeoutSec) * time.Second
+	maxTimeoutSec := s.settingsService.GetIntSetting(ctx, "lifecycleMaxTimeoutSec", lifecycletype.DefaultMaxTimeoutSec)
+	timeout := time.Duration(kit.Ternary(
+		maxTimeoutSec > 0,
+		min(kit.Ternary(syncRecord.PreDeployTimeoutSec > 0, syncRecord.PreDeployTimeoutSec, lifecycletype.DefaultTimeoutSec), maxTimeoutSec),
+		kit.Ternary(syncRecord.PreDeployTimeoutSec > 0, syncRecord.PreDeployTimeoutSec, lifecycletype.DefaultTimeoutSec),
+	)) * time.Second
 	slog.InfoContext(ctx, "running pre-deploy lifecycle hook",
 		"projectId", project.ID,
 		"syncId", syncRecord.ID,
@@ -851,16 +858,18 @@ func (s *LifecycleService) runPreDeploy(ctx context.Context, project *Project, a
 	start := time.Now()
 	stdoutContent, stderrContent, exitCode, runErr := s.hooks.RunScript(ctx, runnerImage, project.Path, scriptPath, hookEnv, extraMounts, syncRecord.PreDeployNetworkMode, timeout, actor)
 	durationMs := time.Since(start).Milliseconds()
-	status := lifecycle.LifecycleStatusSuccess
-	switch {
-	case errors.Is(runErr, context.DeadlineExceeded):
-		status = lifecycle.LifecycleStatusTimeout
-	case runErr != nil || exitCode != 0:
-		status = lifecycle.LifecycleStatusFailed
-	}
+	status := func() string {
+		switch {
+		case errors.Is(runErr, context.DeadlineExceeded):
+			return lifecycle.LifecycleStatusTimeout
+		case runErr != nil || exitCode != 0:
+			return lifecycle.LifecycleStatusFailed
+		default:
+			return lifecycle.LifecycleStatusSuccess
+		}
+	}()
 
-	// Each stream is already bounded with a truncation marker; cutting the
-	// combined output again could split a UTF-8 codepoint.
+	// Each stream is already bounded; cutting the combined output again could split a UTF-8 codepoint.
 	if persistErr := s.db.WithContext(context.WithoutCancel(ctx)).Model(&GitOpsSync{}).Where("id = ?", syncRecord.ID).Updates(map[string]any{
 		"pre_deploy_last_run_at":     start,
 		"pre_deploy_last_run_status": status,
@@ -869,22 +878,19 @@ func (s *LifecycleService) runPreDeploy(ctx context.Context, project *Project, a
 		slog.WarnContext(ctx, "failed to persist lifecycle last-run state", "syncId", syncRecord.ID, "error", persistErr)
 	}
 
-	scriptPathValue := mo.PointerToOption(syncRecord.PreDeployScriptPath).OrEmpty()
-	severity := event.EventSeveritySuccess
-	title := "Pre-deploy lifecycle hook succeeded: " + project.Name
-	description := fmt.Sprintf("Script %s exited with code %d in %dms", scriptPathValue, exitCode, durationMs)
-	if status != lifecycle.LifecycleStatusSuccess {
-		severity = event.EventSeverityWarning
-		title = fmt.Sprintf("Pre-deploy lifecycle hook %s: %s", status, project.Name)
-		if runErr != nil {
-			description = runErr.Error()
-		}
-	}
 	if _, eventErr := s.eventService.CreateEvent(ctx, event.CreateEventRequest{
-		Type:          event.EventTypeLifecycleExecute,
-		Severity:      severity,
-		Title:         title,
-		Description:   description,
+		Type:     event.EventTypeLifecycleExecute,
+		Severity: kit.Ternary(status == lifecycle.LifecycleStatusSuccess, event.EventSeveritySuccess, event.EventSeverityWarning),
+		Title: kit.Ternary(
+			status == lifecycle.LifecycleStatusSuccess,
+			"Pre-deploy lifecycle hook succeeded: "+project.Name,
+			fmt.Sprintf("Pre-deploy lifecycle hook %s: %s", status, project.Name),
+		),
+		Description: kit.Ternary(
+			status != lifecycle.LifecycleStatusSuccess && runErr != nil,
+			fmt.Sprint(runErr),
+			fmt.Sprintf("Script %s exited with code %d in %dms", *syncRecord.PreDeployScriptPath, exitCode, durationMs),
+		),
 		ResourceType:  new("project"),
 		ResourceID:    new(project.ID),
 		ResourceName:  new(project.Name),
@@ -892,7 +898,7 @@ func (s *LifecycleService) runPreDeploy(ctx context.Context, project *Project, a
 		UserID:        new(actor.ID),
 		Username:      new(actor.Username),
 		Metadata: database.JSON{
-			"scriptPath":   scriptPathValue,
+			"scriptPath":   *syncRecord.PreDeployScriptPath,
 			"runnerImage":  runnerImage,
 			"exitCode":     exitCode,
 			"durationMs":   durationMs,
@@ -917,7 +923,7 @@ func (s *LifecycleService) runPreDeploy(ctx context.Context, project *Project, a
 // and "#"-prefixed lines ignored, keys must match POSIX identifier syntax.
 // Reuses the strict parser also used for stdout-capture.
 func ParseEnvText(raw *string) (map[string]string, error) {
-	if raw == nil || strings.TrimSpace(*raw) == "" {
+	if strings.TrimSpace(kit.FromPtr(raw)) == "" {
 		return map[string]string{}, nil
 	}
 	env, err := lifecycle.ParseKeyValueEnv(*raw)
@@ -932,7 +938,7 @@ func ParseEnvText(raw *string) (map[string]string, error) {
 // "#"-prefixed lines are ignored. Both source and target must be absolute
 // paths; mode defaults to read-write.
 func ParseExtraMountsText(raw *string) ([]lifecycletype.ExtraMount, error) {
-	if raw == nil || strings.TrimSpace(*raw) == "" {
+	if strings.TrimSpace(kit.FromPtr(raw)) == "" {
 		return nil, nil
 	}
 
@@ -953,17 +959,10 @@ func ParseExtraMountsText(raw *string) ([]lifecycletype.ExtraMount, error) {
 			return nil, fmt.Errorf("line %d: expected src:tgt[:ro|:rw], got %q", lineNum, line)
 		}
 
-		mount := lifecycletype.ExtraMount{Source: parts[0], Target: parts[1]}
-		if len(parts) == 3 {
-			switch parts[2] {
-			case "ro":
-				mount.Readonly = true
-			case "rw":
-				mount.Readonly = false
-			default:
-				return nil, fmt.Errorf("line %d: invalid mode %q (expected \"ro\" or \"rw\")", lineNum, parts[2])
-			}
+		if len(parts) == 3 && parts[2] != "ro" && parts[2] != "rw" {
+			return nil, fmt.Errorf("line %d: invalid mode %q (expected \"ro\" or \"rw\")", lineNum, parts[2])
 		}
+		mount := lifecycletype.ExtraMount{Source: parts[0], Target: parts[1], Readonly: len(parts) == 3 && parts[2] == "ro"}
 
 		// Mount sources/targets are interpreted by the Docker daemon as POSIX
 		// host/container paths, so use path.IsAbs to avoid host-OS quirks
@@ -1118,16 +1117,18 @@ func (s *ProjectService) ArchiveProject(ctx context.Context, projectID string, u
 		}
 	}
 
-	now := time.Now()
 	if archiveProjectErr := s.db.WithContext(ctx).Model(&Project{}).Where("id = ?", projectID).Updates(map[string]any{
 		"is_archived": true,
-		"archived_at": now,
+		"archived_at": time.Now(),
 	}).Error; archiveProjectErr != nil {
 		return fmt.Errorf("failed to archive project: %w", archiveProjectErr)
 	}
 
-	metadata := database.JSON{"action": "archived", "projectID": projectID, "projectName": proj.Name}
-	s.logProjectEvent(ctx, event.EventTypeProjectUpdate, projectID, proj.Name, user, metadata, "could not log project archive action")
+	s.logProjectEvent(
+		ctx, event.EventTypeProjectUpdate, projectID, proj.Name, user,
+		database.JSON{"action": "archived", "projectID": projectID, "projectName": proj.Name},
+		"could not log project archive action",
+	)
 
 	return nil
 }
@@ -1148,8 +1149,11 @@ func (s *ProjectService) UnarchiveProject(ctx context.Context, projectID string,
 		return fmt.Errorf("failed to unarchive project: %w", unarchiveProjectErr)
 	}
 
-	metadata := database.JSON{"action": "unarchived", "projectID": projectID, "projectName": proj.Name}
-	s.logProjectEvent(ctx, event.EventTypeProjectUpdate, projectID, proj.Name, user, metadata, "could not log project unarchive action")
+	s.logProjectEvent(
+		ctx, event.EventTypeProjectUpdate, projectID, proj.Name, user,
+		database.JSON{"action": "unarchived", "projectID": projectID, "projectName": proj.Name},
+		"could not log project unarchive action",
+	)
 
 	return nil
 }
@@ -1189,9 +1193,6 @@ func (s *ProjectService) DeployProject(ctx context.Context, projectID string, us
 		AuthConfigs:       authConfigs,
 		Progress:          progressWriter,
 		PreDeploy: func(ctx context.Context) error {
-			if s.lifecycleService == nil {
-				return nil
-			}
 			return s.lifecycleService.runPreDeploy(ctx, projectFromDb, user)
 		},
 		Load: func(ctx context.Context) (*types.Project, error) {
@@ -1204,9 +1205,14 @@ func (s *ProjectService) DeployProject(ctx context.Context, projectID string, us
 		ResolveImages: func(ctx context.Context) (projecttypes.ComposeImageOperations, error) {
 			credentials, resolveRegistryCredentialsErr := s.ResolveRegistryCredentials(ctx)
 			operations := s.deployment.ImageOperations(&user, credentials)
-			// Deployment pulls are recorded as system actions; builds retain the requesting actor.
-			operations.Pull = s.deployment.ImageOperations(nil, credentials).Pull
-			return operations, resolveRegistryCredentialsErr
+			return projecttypes.ComposeImageOperations{
+				Exists:     operations.Exists,
+				LastTagged: operations.LastTagged,
+				// Deployment pulls are recorded as system actions; builds retain the requesting actor.
+				Pull:          s.deployment.ImageOperations(nil, credentials).Pull,
+				Build:         operations.Build,
+				BuildProvider: operations.BuildProvider,
+			}, resolveRegistryCredentialsErr
 		},
 		Recover: func(ctx context.Context) {
 			services, servicesErr := s.projectServices(ctx, projectID)
@@ -1234,8 +1240,11 @@ func (s *ProjectService) DeployProject(ctx context.Context, projectID string, us
 		return err
 	}
 
-	metadata := database.JSON{"action": "deploy", "projectID": projectID, "projectName": projectModel.Name}
-	s.logProjectEvent(ctx, event.EventTypeProjectDeploy, projectID, projectModel.Name, user, metadata, "could not log project deployment action")
+	s.logProjectEvent(
+		ctx, event.EventTypeProjectDeploy, projectID, projectModel.Name, user,
+		database.JSON{"action": "deploy", "projectID": projectID, "projectName": projectModel.Name},
+		"could not log project deployment action",
+	)
 
 	err = s.updateProjectStatusAndCounts(ctx, projectID, ProjectStatusRunning)
 	if err != nil {
@@ -1267,12 +1276,11 @@ func (s *ProjectService) DownProject(ctx context.Context, projectID string, user
 		return fmt.Errorf("failed to bring down project: %w", composeDownErr)
 	}
 
-	metadata := database.JSON{
+	s.logProjectEvent(ctx, event.EventTypeProjectStop, projectID, projectFromDb.Name, user, database.JSON{
 		"action":      "down",
 		"projectID":   projectID,
 		"projectName": projectFromDb.Name,
-	}
-	s.logProjectEvent(ctx, event.EventTypeProjectStop, projectID, projectFromDb.Name, user, metadata, "could not log project down action")
+	}, "could not log project down action")
 
 	return s.updateProjectStatusAndCounts(ctx, projectID, ProjectStatusStopped)
 }
@@ -1298,16 +1306,9 @@ func (s *ProjectService) CreateProject(
 	if err != nil {
 		return nil, fmt.Errorf("invalid project tag colors: %w", err)
 	}
-	allowNameSuffix := true
-	if len(allowNameSuffixOptions) > 0 {
-		allowNameSuffix = allowNameSuffixOptions[0]
-	}
-	// A top-level `name:` in the compose file is authoritative over the
-	// submitted project name.
-	if yamlName := projects.ComposeContentProjectName(composeContent); yamlName != "" {
-		name = yamlName
-	}
-	sanitized := projects.SanitizeProjectName(name)
+	allowNameSuffix := len(allowNameSuffixOptions) == 0 || allowNameSuffixOptions[0]
+	// A top-level `name:` in the compose file is authoritative over the submitted project name.
+	name = cmp.Or(projects.ComposeContentProjectName(composeContent), name)
 
 	projectsDirectory, err := s.GetProjectsDirectory(ctx)
 	if err != nil {
@@ -1319,20 +1320,19 @@ func (s *ProjectService) CreateProject(
 	s.syncMu.Lock()
 	defer s.syncMu.Unlock()
 
-	basePath := filepath.Join(projectsDirectory, sanitized)
-	var projectPath, folderName string
-	var reused bool
-	if allowNameSuffix {
+	basePath := filepath.Join(projectsDirectory, projects.SanitizeProjectName(name))
+	projectPath, folderName, reused, err := kit.Ternary(allowNameSuffix, func() (string, string, bool, error) {
 		// Projects at or nested beneath an existing directory claim it.
-		projectPath, folderName, reused, err = projects.CreateUniqueDir(ctx, projectsDirectory, basePath, name, utils.DirPerm, func(dir string) (bool, error) {
+		return projects.CreateUniqueDir(ctx, projectsDirectory, basePath, name, utils.DirPerm, func(dir string) (bool, error) {
 			nestedPattern := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(dir+string(filepath.Separator)) + "%"
 			var claims int64
 			countErr := s.db.WithContext(ctx).Model(&Project{}).Where("path = ? OR path LIKE ? ESCAPE '\\'", dir, nestedPattern).Count(&claims).Error
 			return claims > 0, countErr
 		})
-	} else {
-		projectPath, folderName, err = projects.CreateExactDir(ctx, projectsDirectory, basePath, name, utils.DirPerm)
-	}
+	}, func() (string, string, bool, error) {
+		exactPath, exactFolder, exactErr := projects.CreateExactDir(ctx, projectsDirectory, basePath, name, utils.DirPerm)
+		return exactPath, exactFolder, false, exactErr
+	})()
 	if err != nil {
 		return nil, fmt.Errorf("failed to create project directory: %w", err)
 	}
@@ -1353,12 +1353,12 @@ func (s *ProjectService) CreateProject(
 		for _, change := range manifest.FileChanges {
 			targets = append(targets, workspace.ChangeTargetPaths(change)...)
 		}
-		scope := projects.ProjectUpdateBackupScope{}
+		var absentPaths []string
 		for _, target := range targets {
 			entry, statErr := acfs.Stat(ctx, projectPath, "/"+target, false)
 			switch {
 			case errors.Is(statErr, os.ErrNotExist):
-				scope.Paths = append(scope.Paths, target)
+				absentPaths = append(absentPaths, target)
 			case statErr != nil:
 				return nil, workspace.WrapProjectWorkspaceError(statErr)
 			case target != projects.EffectiveEnvFileName || entry.IsDirectory:
@@ -1372,7 +1372,9 @@ func (s *ProjectService) CreateProject(
 				return nil, common.Classify(common.ErrProjectWorkspaceConflict, fmt.Errorf(".env already exists in %q with different content; clear the environment content to keep it", folderName))
 			}
 		}
-		backup, cleanupBackup, backupProjectDirectoryErr := projects.BackupProjectDirectory(ctx, projectsDirectory, projectPath, ".project-update-backup-*", scope)
+		backup, cleanupBackup, backupProjectDirectoryErr := projects.BackupProjectDirectory(
+			ctx, projectsDirectory, projectPath, ".project-update-backup-*", projects.ProjectUpdateBackupScope{Paths: absentPaths},
+		)
 		if backupProjectDirectoryErr != nil {
 			return nil, backupProjectDirectoryErr
 		}
@@ -1386,15 +1388,6 @@ func (s *ProjectService) CreateProject(
 			return errors.Join(cause, fmt.Errorf("roll back project directory: %w", undoErr))
 		}
 		return cause
-	}
-
-	proj := &Project{
-		Name:         name,
-		DirName:      &folderName,
-		Path:         projectPath,
-		Status:       ProjectStatusStopped,
-		ServiceCount: 0,
-		RunningCount: 0,
 	}
 
 	if applyProjectWorkspaceChangesErr := projects.ApplyProjectWorkspaceChanges(ctx, projectPath, manifest.FileChanges, uploads, projects.ProjectWorkspaceApplyOptions{
@@ -1435,12 +1428,18 @@ func (s *ProjectService) CreateProject(
 	)
 	if err != nil {
 		slog.WarnContext(ctx, "failed to read Compose project tags during creation", "projectName", name, "error", err)
-		composeMeta = projects.ArcaneComposeMetadata{}
 	}
 	// Compose owns the tags it declares, so they are not attached as UI tags.
 	normalizedUITags = slices.DeleteFunc(normalizedUITags, func(tag string) bool {
-		return slices.ContainsFunc(composeMeta.ProjectTags, func(composeTag projecttypes.TagOption) bool { return composeTag.Name == tag })
+		return slices.ContainsFunc(kit.Ternary(err == nil, composeMeta.ProjectTags, nil), func(composeTag projecttypes.TagOption) bool { return composeTag.Name == tag })
 	})
+
+	proj := &Project{
+		Name:    name,
+		DirName: &folderName,
+		Path:    projectPath,
+		Status:  ProjectStatusStopped,
+	}
 
 	if transactionErr := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if createProjectErr := tx.Create(proj).Error; createProjectErr != nil {
@@ -1452,18 +1451,21 @@ func (s *ProjectService) CreateProject(
 	}
 	s.refreshComposeProjectName(ctx, proj)
 	s.refreshProjectImageRefs(ctx, proj)
-	if reconcileComposeProjectTagsErr := s.reconcileComposeProjectTags(ctx, proj.ID, composeMeta.ProjectTags); reconcileComposeProjectTagsErr != nil {
+	if reconcileComposeProjectTagsErr := s.reconcileComposeProjectTags(ctx, proj.ID, kit.Ternary(err == nil, composeMeta.ProjectTags, nil)); reconcileComposeProjectTagsErr != nil {
 		databaseCleanupErr := s.db.WithContext(context.WithoutCancel(ctx)).Transaction(func(tx *gorm.DB) error {
 			return deleteProjectWithTags(tx, proj.ID)
 		})
-		if databaseCleanupErr != nil {
-			databaseCleanupErr = fmt.Errorf("rollback project database state after tag reconciliation failure: %w", databaseCleanupErr)
-		}
-		return nil, rollback(errors.Join(fmt.Errorf("reconcile Compose project tags: %w", reconcileComposeProjectTagsErr), databaseCleanupErr))
+		return nil, rollback(errors.Join(
+			fmt.Errorf("reconcile Compose project tags: %w", reconcileComposeProjectTagsErr),
+			kit.Ternary(databaseCleanupErr == nil, nil, fmt.Errorf("rollback project database state after tag reconciliation failure: %w", databaseCleanupErr)),
+		))
 	}
 
-	metadata := database.JSON{"action": "create", "projectID": proj.ID, "projectName": proj.Name, "path": projectPath, "reusedDirectory": reused}
-	s.logProjectEvent(ctx, event.EventTypeProjectCreate, proj.ID, proj.Name, user, metadata, "could not log project creation")
+	s.logProjectEvent(
+		ctx, event.EventTypeProjectCreate, proj.ID, proj.Name, user,
+		database.JSON{"action": "create", "projectID": proj.ID, "projectName": proj.Name, "path": projectPath, "reusedDirectory": reused},
+		"could not log project creation",
+	)
 
 	return proj, nil
 }
@@ -1532,8 +1534,13 @@ func (s *ProjectService) DestroyProject(ctx context.Context, projectID string, r
 	}
 	s.invalidateProjectCaches(projectID)
 
-	metadata := database.JSON{"action": "destroy", "projectID": projectID, "projectName": proj.Name, "removeFiles": removeFiles, "removeVolumes": removeVolumes}
-	s.logProjectEvent(ctx, event.EventTypeProjectDelete, projectID, proj.Name, user, metadata, "could not log project destroy action")
+	s.logProjectEvent(ctx, event.EventTypeProjectDelete, projectID, proj.Name, user, database.JSON{
+		"action":        "destroy",
+		"projectID":     projectID,
+		"projectName":   proj.Name,
+		"removeFiles":   removeFiles,
+		"removeVolumes": removeVolumes,
+	}, "could not log project destroy action")
 
 	return nil
 }
@@ -1563,15 +1570,11 @@ func (s *ProjectService) RedeployProject(ctx context.Context, projectID string, 
 	}
 
 	progressWriter, _ := ctx.Value(dockertypes.ProgressWriterKey{}).(io.Writer)
-	if progressWriter == nil {
-		progressWriter = io.Discard
-	}
-
 	credentials, cerr := s.ResolveRegistryCredentials(ctx)
 	if cerr != nil {
 		slog.WarnContext(ctx, "failed to resolve registry credentials for redeploy pull", "error", cerr)
 	}
-	if pullProjectImagesErr := s.PullProjectImages(ctx, projectID, progressWriter, user, credentials); pullProjectImagesErr != nil {
+	if pullProjectImagesErr := s.PullProjectImages(ctx, projectID, kit.Ternary(progressWriter == nil, io.Discard, progressWriter), user, credentials); pullProjectImagesErr != nil {
 		slog.WarnContext(ctx, "failed to pull project images", "error", pullProjectImagesErr)
 	}
 
@@ -1674,16 +1677,12 @@ func (s *ProjectService) updateProjectStatusAndCounts(ctx context.Context, proje
 }
 
 func (s *ProjectService) updateProjectStatus(ctx context.Context, id string, status ProjectStatus) error {
-	now := time.Now()
-	res := s.db.WithContext(ctx).Model(&Project{}).Where("id = ?", id).Updates(map[string]any{
+	if err := s.db.WithContext(ctx).Model(&Project{}).Where("id = ?", id).Updates(map[string]any{
 		"status":     status,
-		"updated_at": now,
-	})
-
-	if res.Error != nil {
-		return fmt.Errorf("failed to update project status: %w", res.Error)
+		"updated_at": time.Now(),
+	}).Error; err != nil {
+		return fmt.Errorf("failed to update project status: %w", err)
 	}
-
 	return nil
 }
 
@@ -1724,136 +1723,146 @@ func (s *ProjectService) GetProjectDetails(ctx context.Context, projectID string
 	}
 	projectsDir, projectsDirErr := s.GetProjectsDirectory(ctx)
 	if projectsDirErr != nil {
-		// Relative paths and the .env.global selection layer degrade without a
-		// projects directory; keep the details response intact but log it.
+		// Relative paths and the .env.global selection layer degrade without a projects directory.
 		slog.WarnContext(ctx, "failed to resolve projects directory for project details", "projectId", projectID, "error", projectsDirErr)
 	}
-
-	var resp projecttypes.Details
-	if mapStructErr := mapping.MapStruct(proj, &resp); mapStructErr != nil {
-		return projecttypes.Details{}, fmt.Errorf("failed to map project: %w", mapStructErr)
-	}
-
-	resp.CreatedAt = proj.CreatedAt.Format(time.RFC3339)
-	resp.UpdatedAt = proj.UpdatedAt.Format(time.RFC3339)
-	resp.IsArchived = proj.IsArchived
-	resp.ArchivedAt = proj.ArchivedAt
-	resp.HasBuildDirective = proj.BuildImageRefsJSON != nil && len(projects.ParseImageRefsJSON(*proj.BuildImageRefsJSON)) > 0
-	resp.DirName = mo.PointerToOption(proj.DirName).OrEmpty()
-	resp.RelativePath = listing.RelativePath(projectsDir, proj.Path)
-	resp.GitOpsManagedBy = proj.GitOpsManagedBy
-	meta := s.ProjectMetadata(ctx, *proj, nil)
-	icon := iconcatalog.Resolve(IconCatalogForContext(ctx), meta.ProjectIcon)
-	resp.IconLightURL, resp.IconDarkURL = icon.IconLightURL, icon.IconDarkURL
-	resp.URLs = meta.ProjectURLS
-	resp.Tags, err = s.GetProjectTags(ctx, projectID)
+	projectTags, err := s.GetProjectTags(ctx, projectID)
 	if err != nil {
 		return projecttypes.Details{}, err
 	}
 
-	// Default counts/status from DB (will be overridden if runtime check succeeds)
-	resp.ServiceCount = proj.ServiceCount
-	resp.RunningCount = proj.RunningCount
-	resp.Status = string(proj.Status)
-
-	// COMPOSE_FILE selects the deployed file set (no auto-overrides). A broken
-	// selection is logged but keeps the details response intact.
+	// COMPOSE_FILE selects the deployed file set (no auto-overrides); a broken selection is logged only.
 	composeSelection, selErr := projects.ComposeFileEnvSelection(ctx, projectsDir, proj.Path)
 	if selErr != nil {
-		selLogLevel := kit.Ternary(errors.Is(selErr, common.ErrProjectEnvUnreadable), slog.LevelDebug, slog.LevelWarn)
-		slog.Log(ctx, selLogLevel, "failed to resolve COMPOSE_FILE selection for project details", "projectId", proj.ID, "path", proj.Path, "error", selErr)
-		composeSelection = nil
+		slog.Log(ctx, kit.Ternary(errors.Is(selErr, common.ErrProjectEnvUnreadable), slog.LevelDebug, slog.LevelWarn),
+			"failed to resolve COMPOSE_FILE selection for project details", "projectId", proj.ID, "path", proj.Path, "error", selErr)
 	}
-	resp.ComposeFiles = projectdetails.ComposeSelectionRelativePaths(proj.Path, composeSelection)
-	resp.ConfigurationError = projects.CheckProjectEnvAccess(ctx, projectsDir, proj.Path)
-
-	if opts.IncludeComposeContent {
-		composeContent, _, overrideContent, contentErr := s.projectContent(ctx, proj.ID)
-		if contentErr != nil {
-			return projecttypes.Details{}, fmt.Errorf("failed to read project compose content: %w", contentErr)
-		}
-		resp.ComposeContent = composeContent
-		resp.OverrideFileName, resp.OverrideContent = projectdetails.ResolveDetailsOverride(proj.Path, overrideContent, composeSelection)
+	composeContent, _, overrideContent, err := kit.Ternary(opts.IncludeComposeContent, s.projectContent, func(context.Context, string) (string, string, string, error) {
+		return "", "", "", nil
+	})(ctx, proj.ID)
+	if err != nil {
+		return projecttypes.Details{}, fmt.Errorf("failed to read project compose content: %w", err)
 	}
-	if opts.IncludeEnvState {
-		envState, readProjectEnvStateErr := projects.ReadProjectEnvState(proj.Path)
-		if readProjectEnvStateErr != nil {
-			return projecttypes.Details{}, fmt.Errorf("failed to read project env state: %w", readProjectEnvStateErr)
+	overrideFileName, overrideContent := func() (string, string) {
+		if !opts.IncludeComposeContent {
+			return "", ""
 		}
-		effectiveEnvContent, readProjectEnvStateErr := projectsync.ResolveStoredEffectiveEnvContent(envState)
-		if readProjectEnvStateErr != nil {
-			return projecttypes.Details{}, readProjectEnvStateErr
+		return projectdetails.ResolveDetailsOverride(proj.Path, overrideContent, kit.Ternary(selErr == nil, composeSelection, nil))
+	}()
+	envContent, err := func() (string, error) {
+		if !opts.IncludeEnvState {
+			return "", nil
 		}
-		resp.EnvContent = effectiveEnvContent
-	}
-
-	s.enrichComposeDetails(ctx, proj, opts, &resp)
-	if syncID := gitOpsSyncID(proj); syncID != "" {
-		var syncRecord GitOpsSync
-		if syncErr := s.db.WithContext(ctx).Preload("Repository").Where("id = ?", syncID).First(&syncRecord).Error; syncErr == nil {
-			resp.LastSyncCommit = syncRecord.LastSyncCommit
-			if syncRecord.Repository != nil {
-				resp.GitRepositoryURL = syncRecord.Repository.URL
-			}
+		envState, readErr := projects.ReadProjectEnvState(proj.Path)
+		if readErr != nil {
+			return "", fmt.Errorf("failed to read project env state: %w", readErr)
 		}
+		return projectsync.ResolveStoredEffectiveEnvContent(envState)
+	}()
+	if err != nil {
+		return projecttypes.Details{}, err
 	}
 
-	// Refresh runtime status/counts even when callers do not request the full
-	// runtime service array. DB values are only a fallback when Docker lookup
-	// or compose loading fails.
+	composeFile, composeErr := s.ResolveProjectComposeFile(ctx, proj)
+	if errors.Is(composeErr, common.ErrProjectEnvUnreadable) {
+		// The env is unreadable, so only the compose file's identity is known; interpolation-backed enrichment is skipped.
+		projectsDirectory, dirErr := s.GetProjectsDirectory(ctx)
+		if dirErr != nil {
+			slog.DebugContext(ctx, "failed to resolve projects directory for compose identification", "projectId", proj.ID, "error", dirErr)
+		}
+		identified, detectErr := projects.DetectComposeFile(ctx, projectsDirectory, proj.Path)
+		if detectErr != nil && (!errors.Is(detectErr, common.ErrProjectEnvUnreadable) || identified == "") {
+			slog.WarnContext(ctx, "failed to identify project compose file", "projectId", proj.ID, "error", detectErr)
+		}
+		composeFile = kit.Ternary(detectErr != nil && (!errors.Is(detectErr, common.ErrProjectEnvUnreadable) || identified == ""), "", identified)
+	}
+	composeServices := func() []types.ServiceConfig {
+		if composeErr != nil || (!opts.IncludeServiceConfigs && !opts.IncludeUpdateInfo) {
+			return nil
+		}
+		composeProj, loadErr := s.getCachedComposeProject(ctx, proj, nil)
+		if loadErr != nil {
+			slog.WarnContext(ctx, "failed to load compose service configs", "path", composeFile, "error", loadErr)
+			return nil
+		}
+		return slices.Collect(maps.Values(composeProj.Services))
+	}()
+
+	var syncRecord GitOpsSync
+	if gitOpsSyncID(proj) != "" {
+		_ = s.db.WithContext(ctx).Preload("Repository").Where("id = ?", gitOpsSyncID(proj)).First(&syncRecord).Error
+	}
+
+	// Runtime status/counts refresh even without the full runtime service array; DB values are only a fallback.
 	services, serr := s.projectServices(ctx, projectID)
-	if serr == nil && services != nil {
-		resp.ServiceCount = len(services)
-		_, runningCount := listing.ServiceCounts(services)
-		resp.RunningCount = runningCount
-		resp.Status = listing.ProjectStatus(services)
-
-		if opts.IncludeRuntimeServices || opts.IncludeUpdateInfo {
-			resp.RuntimeServices = services
-			resp.RedeployDisabled = slices.ContainsFunc(services, func(svc projecttypes.RuntimeService) bool { return svc.RedeployDisabled })
-		}
-	}
-
-	if opts.IncludeUpdateInfo {
-		s.enrichProjectUpdateInfo(ctx, &resp)
-	}
-	if !opts.IncludeRuntimeServices {
-		resp.RuntimeServices = nil
-	}
-	if !opts.IncludeServiceConfigs {
-		resp.Services = nil
-	}
-
-	return resp, nil
-}
-
-func (s *ProjectService) enrichProjectUpdateInfo(ctx context.Context, resp *projecttypes.Details) {
-	if resp == nil {
-		return
-	}
-
-	imageRefs := projects.ImageRefsFromComposeConfigs(resp.Services)
-	if len(imageRefs) == 0 {
-		imageRefs = projects.ImageRefsFromRuntimeServices(resp.RuntimeServices)
-	}
-
-	var updateInfoByRef map[string]*imagetypes.UpdateInfo
-	if len(imageRefs) > 0 && s.imageService != nil {
-		lookupResult, err := s.imageService.GetUpdateInfoByImageRefs(ctx, imageRefs)
-		if err != nil {
-			slog.WarnContext(ctx, "failed to fetch project update info", "projectId", resp.ID, "projectName", resp.Name, "error", err)
-		} else {
-			updateInfoByRef = lookupResult
-		}
-	}
-
-	scoped := s.details.ContainerUpdateInfo(ctx, []projecttypes.Details{*resp})
-	if len(resp.Services) > 0 {
-		records := s.details.ServiceUpdateRecords(ctx, []string{resp.ID})
-		resp.UpdateInfo = BuildConfiguredUpdateInfo(resp.ID, resp.Services, updateInfoByRef, records, projectdetails.ConfiguredRuntimeServiceUpdateInfo(resp.Services, resp.RuntimeServices, scoped))
-		return
-	}
-	resp.UpdateInfo = buildUpdateInfoSummary(imageRefs, projectdetails.MergeProjectContainerUpdateInfo(updateInfoByRef, resp.RuntimeServices, scoped))
+	_, runningCount := listing.ServiceCounts(services)
+	runtimeServices := kit.Ternary(serr == nil && services != nil && (opts.IncludeRuntimeServices || opts.IncludeUpdateInfo), services, nil)
+	meta := s.ProjectMetadata(ctx, *proj, nil)
+	icon := iconcatalog.Resolve(IconCatalogForContext(ctx), meta.ProjectIcon)
+	return projecttypes.Details{
+		Tags:            projectTags,
+		StatusReason:    proj.StatusReason,
+		LastSyncCommit:  syncRecord.LastSyncCommit,
+		GitOpsManagedBy: proj.GitOpsManagedBy,
+		UpdateInfo: func() *projecttypes.UpdateInfo {
+			if !opts.IncludeUpdateInfo {
+				return nil
+			}
+			imageRefs := projects.ImageRefsFromComposeConfigs(composeServices)
+			if len(imageRefs) == 0 {
+				imageRefs = projects.ImageRefsFromRuntimeServices(runtimeServices)
+			}
+			updateInfoByRef, updateInfoErr := s.imageService.GetUpdateInfoByImageRefs(ctx, imageRefs)
+			if updateInfoErr != nil {
+				slog.WarnContext(ctx, "failed to fetch project update info", "projectId", proj.ID, "projectName", proj.Name, "error", updateInfoErr)
+			}
+			scoped := s.details.ContainerUpdateInfo(ctx, runtimeServices)
+			if len(composeServices) > 0 {
+				return BuildConfiguredUpdateInfo(
+					proj.ID,
+					composeServices,
+					updateInfoByRef,
+					s.details.ServiceUpdateRecords(ctx, []string{proj.ID}),
+					projectdetails.ConfiguredRuntimeServiceUpdateInfo(composeServices, runtimeServices, scoped),
+				)
+			}
+			return buildUpdateInfoSummary(imageRefs, projectdetails.MergeProjectContainerUpdateInfo(updateInfoByRef, runtimeServices, scoped), nil)
+		}(),
+		ArchivedAt:       proj.ArchivedAt,
+		Status:           kit.Ternary(serr == nil && services != nil, listing.ProjectStatus(services), string(proj.Status)),
+		DirName:          kit.FromPtr(proj.DirName),
+		ComposeContent:   composeContent,
+		ComposeFileName:  kit.Ternary(composeFile != "", filepath.Base(composeFile), ""),
+		ComposeFiles:     projectdetails.ComposeSelectionRelativePaths(proj.Path, kit.Ternary(selErr == nil, composeSelection, nil)),
+		EnvContent:       envContent,
+		OverrideContent:  overrideContent,
+		OverrideFileName: overrideFileName,
+		Name:             proj.Name,
+		GitRepositoryURL: kit.FromPtr(syncRecord.Repository).URL,
+		IconLightURL:     icon.IconLightURL,
+		RelativePath:     listing.RelativePath(projectsDir, proj.Path),
+		ID:               proj.ID,
+		IconDarkURL:      icon.IconDarkURL,
+		Path:             proj.Path,
+		UpdatedAt:        proj.UpdatedAt.Format(time.RFC3339),
+		CreatedAt:        proj.CreatedAt.Format(time.RFC3339),
+		RuntimeServices:  kit.Ternary(opts.IncludeRuntimeServices, runtimeServices, nil),
+		Services:         kit.Ternary(opts.IncludeServiceConfigs, composeServices, nil),
+		URLs:             meta.ProjectURLS,
+		IncludeFiles: func() []projecttypes.IncludeFile {
+			if composeErr != nil || !opts.IncludeIncludeFiles {
+				return nil
+			}
+			return s.details.IncludeFiles(ctx, composeFile)
+		}(),
+		RunningCount: kit.Ternary(serr == nil && services != nil, runningCount, proj.RunningCount),
+		ServiceCount: kit.Ternary(serr == nil && services != nil, len(services), proj.ServiceCount),
+		IsArchived:   proj.IsArchived,
+		HasBuildDirective: len(projects.ParseImageRefsJSON(kit.FromPtr(proj.BuildImageRefsJSON))) > 0 ||
+			slices.ContainsFunc(composeServices, func(svc types.ServiceConfig) bool { return svc.Build != nil }),
+		RedeployDisabled:   slices.ContainsFunc(runtimeServices, func(svc projecttypes.RuntimeService) bool { return svc.RedeployDisabled }),
+		ConfigurationError: projects.CheckProjectEnvAccess(ctx, projectsDir, proj.Path),
+	}, nil
 }
 
 func (s *ProjectService) enrichProjectsWithUpdateInfo(
@@ -1862,18 +1871,24 @@ func (s *ProjectService) enrichProjectsWithUpdateInfo(
 	details []projecttypes.Details,
 	includeHidden bool,
 	env *projectMetadataEnv,
-) {
+) []projecttypes.Details {
 	if len(projectsList) == 0 || len(details) == 0 {
-		return
+		return details
 	}
 	if env == nil {
 		env = s.newProjectMetadataEnv(ctx, projectsList)
 	}
 
-	var hiddenServicesByProjectID, hiddenRefsByProjectID map[string]map[string]bool
-	if !includeHidden {
-		hiddenServicesByProjectID, hiddenRefsByProjectID = projectdetails.ExcludeHiddenRuntimeServices(details)
-	}
+	runtimeByIndex, hiddenServicesByProjectID, hiddenRefsByProjectID := func() ([][]projecttypes.RuntimeService, map[string]map[string]bool, map[string]map[string]bool) {
+		if includeHidden {
+			runtime := make([][]projecttypes.RuntimeService, len(details))
+			for i, d := range details {
+				runtime[i] = d.RuntimeServices
+			}
+			return runtime, nil, nil
+		}
+		return projectdetails.ExcludeHiddenRuntimeServices(details)
+	}()
 
 	// Bounded fan-out over compose loads; a cancelled request leaves the
 	// remaining projects without configured services.
@@ -1912,44 +1927,74 @@ func (s *ProjectService) enrichProjectsWithUpdateInfo(
 		projectIDs[i] = proj.ID
 		imageRefsByProjectID[proj.ID], servicesByProjectID[proj.ID] = refsByIndex[i], servicesByIndex[i]
 	}
-	allImageRefs := slices.Concat(refsByIndex...)
 
-	var updateInfoByRef map[string]*imagetypes.UpdateInfo
-	if len(allImageRefs) > 0 && s.imageService != nil {
-		lookupResult, err := s.imageService.GetUpdateInfoByImageRefs(ctx, allImageRefs)
-		if err != nil {
-			slog.WarnContext(ctx, "failed to fetch project list update info", "error", err)
-		} else {
-			updateInfoByRef = lookupResult
-		}
+	updateInfoByRef, err := s.imageService.GetUpdateInfoByImageRefs(ctx, slices.Concat(refsByIndex...))
+	if err != nil {
+		slog.WarnContext(ctx, "failed to fetch project list update info", "error", err)
 	}
 
 	recordsByProjectID := make(map[string][]imageupdate.ImageUpdateRecord)
 	for _, record := range s.details.ServiceUpdateRecords(ctx, projectIDs) {
 		recordsByProjectID[record.ProjectID] = append(recordsByProjectID[record.ProjectID], record)
 	}
-	scoped := s.details.ContainerUpdateInfo(ctx, details)
-	for i := range details {
-		if services := servicesByProjectID[details[i].ID]; services != nil {
-			details[i].UpdateInfo = BuildConfiguredUpdateInfo(
-				details[i].ID,
-				services,
-				updateInfoByRef,
-				recordsByProjectID[details[i].ID],
-				projectdetails.ConfiguredRuntimeServiceUpdateInfo(
-					services,
-					details[i].RuntimeServices,
-					scoped,
-				),
-			)
-			continue
-		}
-		refs := imageRefsByProjectID[details[i].ID]
-		if len(refs) == 0 {
-			refs = projects.ImageRefsFromRuntimeServices(details[i].RuntimeServices)
-		}
-		details[i].UpdateInfo = buildUpdateInfoSummary(refs, projectdetails.MergeProjectContainerUpdateInfo(updateInfoByRef, details[i].RuntimeServices, scoped))
+	scoped := s.details.ContainerUpdateInfo(ctx, slices.Concat(runtimeByIndex...))
+	out := make([]projecttypes.Details, 0, len(details))
+	for i, d := range details {
+		out = append(out, projecttypes.Details{ //exhaustruct:enforce
+			EnvironmentTag:  d.EnvironmentTag,
+			Tags:            d.Tags,
+			StatusReason:    d.StatusReason,
+			ActivityID:      d.ActivityID,
+			LastSyncCommit:  d.LastSyncCommit,
+			GitOpsManagedBy: d.GitOpsManagedBy,
+			UpdateInfo: func() *projecttypes.UpdateInfo {
+				if services := servicesByProjectID[d.ID]; services != nil {
+					return BuildConfiguredUpdateInfo(
+						d.ID,
+						services,
+						updateInfoByRef,
+						recordsByProjectID[d.ID],
+						projectdetails.ConfiguredRuntimeServiceUpdateInfo(services, runtimeByIndex[i], scoped),
+					)
+				}
+				refs := imageRefsByProjectID[d.ID]
+				if len(refs) == 0 {
+					refs = projects.ImageRefsFromRuntimeServices(runtimeByIndex[i])
+				}
+				return buildUpdateInfoSummary(refs, projectdetails.MergeProjectContainerUpdateInfo(updateInfoByRef, runtimeByIndex[i], scoped), nil)
+			}(),
+			ArchivedAt:         d.ArchivedAt,
+			Status:             d.Status,
+			DirName:            d.DirName,
+			ComposeContent:     d.ComposeContent,
+			ComposeFileName:    d.ComposeFileName,
+			ComposeFiles:       d.ComposeFiles,
+			EnvContent:         d.EnvContent,
+			OverrideContent:    d.OverrideContent,
+			OverrideFileName:   d.OverrideFileName,
+			Name:               d.Name,
+			GitRepositoryURL:   d.GitRepositoryURL,
+			IconLightURL:       d.IconLightURL,
+			RelativePath:       d.RelativePath,
+			ID:                 d.ID,
+			IconDarkURL:        d.IconDarkURL,
+			Path:               d.Path,
+			UpdatedAt:          d.UpdatedAt,
+			CreatedAt:          d.CreatedAt,
+			RuntimeServices:    runtimeByIndex[i],
+			Services:           d.Services,
+			URLs:               d.URLs,
+			IncludeFiles:       d.IncludeFiles,
+			RunningCount:       d.RunningCount,
+			ServiceCount:       d.ServiceCount,
+			IsDiscovered:       d.IsDiscovered,
+			IsArchived:         d.IsArchived,
+			HasBuildDirective:  d.HasBuildDirective,
+			RedeployDisabled:   d.RedeployDisabled,
+			ConfigurationError: d.ConfigurationError,
+		})
 	}
+	return out
 }
 
 // BuildConfiguredUpdateInfo matches checks to current services and aggregates their results.
@@ -1975,26 +2020,26 @@ func BuildConfiguredUpdateInfo(
 		if imageRef == "" {
 			continue
 		}
-		var info *imagetypes.UpdateInfo
 		record := checks[service.Name]
 		policy, policyErr := tagpolicy.Resolve(imageRef, updater.DefaultLabelPolicy().TagPolicy(service.Labels))
-		if record != nil && record.PolicyKey == imageref.UpdatePolicyKey(imageRef, service.Labels) {
-			info = record.UpdateInfo()
-		} else if policyErr == nil && policy.Strategy == "digest" && !imageref.IsUpdateCheckDisabled(service.Labels) {
-			info = byRef[imageRef]
-		}
+		info := func() *imagetypes.UpdateInfo {
+			switch {
+			case record != nil && record.PolicyKey == imageref.UpdatePolicyKey(imageRef, service.Labels):
+				return record.UpdateInfo()
+			case policyErr == nil && policy.Strategy == "digest" && !imageref.IsUpdateCheckDisabled(service.Labels):
+				return byRef[imageRef]
+			default:
+				return nil
+			}
+		}()
 
 		if len(runtimeUpdates) > 0 && runtimeUpdates[0][service.Name] != nil {
 			// A newer clean runtime check clears a stale update preview (#4306);
 			// digest checks must match the configured reference to count.
 			runtime := runtimeUpdates[0][service.Name]
-			attributed := policyErr == nil && policy.Strategy != "digest"
-			if stored := byRef[imageRef]; policyErr == nil && !attributed && stored != nil && !stored.HasUpdate && stored.Error == "" && stored.CheckTime.Equal(runtime.CheckTime) {
-				attributed = stored.CurrentDigest == runtime.CurrentDigest && stored.LatestDigest == runtime.LatestDigest
-			}
-			if attributed && info != nil && info.HasUpdate && !runtime.HasUpdate && runtime.Error == "" && !runtime.CheckTime.Before(info.CheckTime) {
-				info = nil
-			}
+			stored := byRef[imageRef]
+			attributed := policyErr == nil && (policy.Strategy != "digest" || (stored != nil && !stored.HasUpdate && stored.Error == "" &&
+				stored.CheckTime.Equal(runtime.CheckTime) && stored.CurrentDigest == runtime.CurrentDigest && stored.LatestDigest == runtime.LatestDigest))
 			info = projectdetails.MergeProjectContainerUpdateInfo(
 				nil,
 				[]projecttypes.RuntimeService{
@@ -2008,8 +2053,8 @@ func BuildConfiguredUpdateInfo(
 					},
 				},
 				map[string]*imagetypes.UpdateInfo{
-					"preview": info,
-					"runtime": runtimeUpdates[0][service.Name],
+					"preview": kit.Ternary(attributed && info != nil && info.HasUpdate && !runtime.HasUpdate && runtime.Error == "" && !runtime.CheckTime.Before(info.CheckTime), nil, info),
+					"runtime": runtime,
 				},
 			)[imageRef]
 		}
@@ -2026,130 +2071,75 @@ func BuildConfiguredUpdateInfo(
 			delete(merged, imageRef)
 		}
 	}
-	summary := buildUpdateInfoSummary(projects.ImageRefsFromComposeConfigs(services), merged)
-	summary.ServiceUpdates = serviceUpdates
-	return summary
+	return buildUpdateInfoSummary(projects.ImageRefsFromComposeConfigs(services), merged, serviceUpdates)
 }
 
 // buildUpdateInfoSummary aggregates image checks into a project update summary.
 func buildUpdateInfoSummary(
 	imageRefs []string,
 	updateInfoByRef map[string]*imagetypes.UpdateInfo,
+	serviceUpdates map[string]projecttypes.ServiceUpdateInfo,
 ) *projecttypes.UpdateInfo {
-	imageCount := len(imageRefs)
-	summary := &projecttypes.UpdateInfo{
-		Status:     "unknown",
-		HasUpdate:  false,
-		ImageCount: imageCount,
-		ImageRefs:  append([]string(nil), imageRefs...),
-	}
-
-	if imageCount == 0 {
-		return summary
-	}
-
+	checkedByRef := make(map[string]imagetypes.UpdateInfo)
+	var updatedRefs, notPulledRefs []string
+	var errorMessages []string
 	var latestCheckTime *time.Time
-
 	for _, imageRef := range imageRefs {
 		info := updateInfoByRef[imageRef]
 		if info == nil {
 			continue
 		}
-
-		summary.CheckedImageCount++
-		if summary.UpdateInfoByRef == nil {
-			summary.UpdateInfoByRef = make(map[string]imagetypes.UpdateInfo)
-		}
-		summary.UpdateInfoByRef[imageRef] = *info
+		checkedByRef[imageRef] = *info
 		if info.HasUpdate {
-			summary.HasUpdate = true
-			summary.ImagesWithUpdates++
-			summary.UpdatedImageRefs = append(summary.UpdatedImageRefs, imageRef)
+			updatedRefs = append(updatedRefs, imageRef)
 		}
 		if info.UpdateType == imageupdate.UpdateTypeNotPulled {
-			summary.ImagesNotPulled++
-			summary.NotPulledImageRefs = append(summary.NotPulledImageRefs, imageRef)
+			notPulledRefs = append(notPulledRefs, imageRef)
 		}
 		if strings.TrimSpace(info.Error) != "" {
-			summary.ErrorCount++
-			if summary.ErrorMessage == nil {
-				summary.ErrorMessage = new(strings.TrimSpace(info.Error))
-			}
+			errorMessages = append(errorMessages, strings.TrimSpace(info.Error))
 		}
 		if !info.CheckTime.IsZero() && (latestCheckTime == nil || info.CheckTime.After(*latestCheckTime)) {
 			latestCheckTime = new(info.CheckTime)
 		}
 	}
 
-	summary.LastCheckedAt = latestCheckTime
-
-	switch {
-	case summary.ImagesWithUpdates > 0:
-		summary.Status = "has_update"
-	case summary.ErrorCount > 0:
-		summary.Status = "error"
-	case summary.ImagesNotPulled > 0:
-		summary.Status = "not_pulled"
-	case summary.CheckedImageCount == imageCount:
-		summary.Status = "up_to_date"
-	default:
-		summary.Status = "unknown"
+	return &projecttypes.UpdateInfo{
+		ServiceUpdates: serviceUpdates,
+		Status: func() string {
+			switch {
+			case len(imageRefs) == 0:
+				return "unknown"
+			case len(updatedRefs) > 0:
+				return "has_update"
+			case len(errorMessages) > 0:
+				return "error"
+			case len(notPulledRefs) > 0:
+				return "not_pulled"
+			case len(checkedByRef) == len(imageRefs):
+				return "up_to_date"
+			default:
+				return "unknown"
+			}
+		}(),
+		HasUpdate:         len(updatedRefs) > 0,
+		ImageCount:        len(imageRefs),
+		CheckedImageCount: len(checkedByRef),
+		ImagesWithUpdates: len(updatedRefs),
+		ImagesNotPulled:   len(notPulledRefs),
+		ErrorCount:        len(errorMessages),
+		ErrorMessage: func() *string {
+			if len(errorMessages) == 0 {
+				return nil
+			}
+			return new(errorMessages[0])
+		}(),
+		ImageRefs:          append([]string(nil), imageRefs...),
+		UpdatedImageRefs:   updatedRefs,
+		NotPulledImageRefs: notPulledRefs,
+		UpdateInfoByRef:    kit.Ternary(len(checkedByRef) > 0, checkedByRef, nil),
+		LastCheckedAt:      latestCheckTime,
 	}
-
-	return summary
-}
-
-func (s *ProjectService) enrichComposeDetails(ctx context.Context, proj *Project, opts projecttypes.DetailsOptions, resp *projecttypes.Details) {
-	composeFile, err := s.ResolveProjectComposeFile(ctx, proj)
-	if err != nil {
-		if !errors.Is(err, common.ErrProjectEnvUnreadable) {
-			return
-		}
-		// The env is unreadable, so only the compose file's identity is known:
-		// name it for the UI and skip every enrichment that needs interpolation.
-		projectsDirectory, dirErr := s.GetProjectsDirectory(ctx)
-		if dirErr != nil {
-			slog.DebugContext(ctx, "failed to resolve projects directory for compose identification", "projectId", proj.ID, "error", dirErr)
-		}
-		identified, detectErr := projects.DetectComposeFile(ctx, projectsDirectory, proj.Path)
-		if detectErr != nil && (!errors.Is(detectErr, common.ErrProjectEnvUnreadable) || identified == "") {
-			slog.WarnContext(ctx, "failed to identify project compose file", "projectId", proj.ID, "error", detectErr)
-			return
-		}
-		if identified != "" {
-			resp.ComposeFileName = filepath.Base(identified)
-		}
-		return
-	}
-	resp.ComposeFileName = filepath.Base(composeFile)
-	if opts.IncludeIncludeFiles {
-		resp.IncludeFiles = s.details.IncludeFiles(ctx, composeFile)
-	}
-	if !opts.IncludeServiceConfigs && !opts.IncludeUpdateInfo {
-		return
-	}
-
-	composeProj, loadErr := s.getCachedComposeProject(ctx, proj, nil)
-	if loadErr != nil {
-		slog.WarnContext(ctx, "failed to load compose service configs", "path", composeFile, "error", loadErr)
-		return
-	}
-
-	if composeProj == nil {
-		return
-	}
-
-	// Convert map to slice
-	svcList := make([]types.ServiceConfig, 0, len(composeProj.Services))
-	hasBuildDirective := false
-	for _, svc := range composeProj.Services {
-		svcList = append(svcList, svc)
-		if svc.Build != nil {
-			hasBuildDirective = true
-		}
-	}
-	resp.Services = svcList
-	resp.HasBuildDirective = resp.HasBuildDirective || hasBuildDirective
 }
 
 func (s *ProjectService) CountServicesFromCompose(ctx context.Context, p Project) (int, error) {
@@ -2170,9 +2160,7 @@ func (s *ProjectService) ListAllProjects(ctx context.Context) ([]Project, error)
 }
 
 func (s *ProjectService) ListProjects(ctx context.Context, params pagination.QueryParams) ([]projecttypes.Details, pagination.Response, error) {
-	statusFilter := strings.TrimSpace(params.Filters["status"])
 	updatesFilter := strings.TrimSpace(params.Filters["updates"])
-	labelFilter := strings.TrimSpace(params.Filters["label"])
 	query := s.db.WithContext(ctx).Model(&Project{})
 	if archivedFilter := strings.TrimSpace(params.Filters["archived"]); !strings.EqualFold(archivedFilter, "all") {
 		archived, _ := kit.ParseBool(archivedFilter)
@@ -2188,63 +2176,31 @@ func (s *ProjectService) ListProjects(ctx context.Context, params pagination.Que
 		)
 	}
 
-	if statusFilter == "" && updatesFilter == "" && labelFilter == "" && !strings.EqualFold(strings.TrimSpace(params.Sort), "status") {
-		query = pagination.ApplyFilter(query, "status", params.Filters["status"])
-		var projectsArray []Project
-		paginationResp, err := pagination.PaginateAndSortDB(params, query, &projectsArray)
-		if err != nil {
-			return nil, pagination.Response{}, fmt.Errorf("failed to paginate projects: %w", err)
-		}
-		slog.DebugContext(ctx, "Retrieved projects from database", "count", len(projectsArray))
-
-		// The paginated page gets live status from one Docker snapshot plus the
-		// compose-backed presentation fields, sharing one metadata env.
-		env := s.newProjectMetadataEnv(ctx, projectsArray)
-		result := s.projectListRows(ctx, env.projectsDirectory, projectsArray, s.listing.Snapshot(ctx))
-		metas := make([]projects.ArcaneComposeMetadata, len(projectsArray))
-		var metaGroup errgroup.Group
-		metaGroup.SetLimit(maxConcurrentComposeReads)
-		for i := range projectsArray {
-			metaGroup.Go(func() (workerErr error) {
-				defer utils.RecoverToError(&workerErr, "project metadata worker", "projectID", projectsArray[i].ID)
-				metas[i] = s.ProjectMetadata(ctx, projectsArray[i], env)
-				return nil
-			})
-		}
-		if metaErr := metaGroup.Wait(); metaErr != nil {
-			slog.WarnContext(ctx, "project metadata resolution failed", "error", metaErr)
-		}
-		listing.ApplyPresentation(ctx, env.projectsDirectory, IconCatalogForContext(ctx), projectRecords(projectsArray), result, metas)
-		pageIDs := make([]string, len(projectsArray))
-		for i, proj := range projectsArray {
-			pageIDs[i] = proj.ID
-		}
-		var tagRows []projecttypes.TagAssignment
-		if tagsErr := s.db.WithContext(ctx).Model(&ProjectTag{}).Where("project_id IN ?", pageIDs).Order("project_id, name, source, color").Find(&tagRows).Error; tagsErr != nil {
-			return nil, pagination.Response{}, fmt.Errorf("load project tags: %w", tagsErr)
-		}
-		tagsByProject := tags.Group(tagRows)
-		for i := range result {
-			result[i].Tags = tagsByProject[result[i].ID]
-		}
-		s.enrichProjectsWithUpdateInfo(ctx, projectsArray, result, true, env)
-		slog.DebugContext(ctx, "Completed ListProjects request", "resultCount", len(result))
-		return result, paginationResp, nil
-	}
-
-	// Derived filters and status sorting read the container snapshot, so every
-	// candidate gets a lean row and the compose-backed presentation fields are
-	// resolved for the page alone.
-	if params.Limit != -1 {
+	// Derived filters and status sorting read the container snapshot, so they page in memory over every candidate;
+	// otherwise the database pages and only the page gets live status and compose-backed presentation fields.
+	paginateInDB := strings.TrimSpace(params.Filters["status"]) == "" && updatesFilter == "" && strings.TrimSpace(params.Filters["label"]) == "" &&
+		!strings.EqualFold(strings.TrimSpace(params.Sort), "status")
+	if !paginateInDB && params.Limit != -1 {
 		params.Limit = kit.Ternary(params.Limit <= 0, 20, min(params.Limit, 100))
 	}
 	var projectsArray []Project
-	if err := query.Find(&projectsArray).Error; err != nil {
-		return nil, pagination.Response{}, fmt.Errorf("failed to list projects: %w", err)
+	paginationResp, err := func() (pagination.Response, error) {
+		if !paginateInDB {
+			if findErr := query.Find(&projectsArray).Error; findErr != nil {
+				return pagination.Response{}, fmt.Errorf("failed to list projects: %w", findErr)
+			}
+			return pagination.Response{}, nil
+		}
+		resp, paginateErr := pagination.PaginateAndSortDB(params, pagination.ApplyFilter(query, "status", params.Filters["status"]), &projectsArray)
+		if paginateErr != nil {
+			return pagination.Response{}, fmt.Errorf("failed to paginate projects: %w", paginateErr)
+		}
+		return resp, nil
+	}()
+	if err != nil {
+		return nil, pagination.Response{}, err
 	}
-	env := s.newProjectMetadataEnv(ctx, nil)
-	snapshot := s.listing.Snapshot(ctx)
-	items := s.projectListRows(ctx, env.projectsDirectory, projectsArray, snapshot)
+
 	byID := make(map[string]Project, len(projectsArray))
 	for _, proj := range projectsArray {
 		byID[proj.ID] = proj
@@ -2253,13 +2209,29 @@ func (s *ProjectService) ListProjects(ctx context.Context, params pagination.Que
 	if tagsErr := s.db.WithContext(ctx).Model(&ProjectTag{}).Where("project_id IN ?", slices.Collect(maps.Keys(byID))).Order("project_id, name, source, color").Find(&tagRows).Error; tagsErr != nil {
 		return nil, pagination.Response{}, fmt.Errorf("load project tags: %w", tagsErr)
 	}
-	tagsByProject := tags.Group(tagRows)
-	for i := range items {
-		items[i].Tags = tagsByProject[items[i].ID]
+	env := s.newProjectMetadataEnv(ctx, nil)
+	snapshot := s.listing.Snapshot(ctx)
+	// Live-inferred service counts are persisted over stored zeros, since SQL sorts and paginates on service_count.
+	items, inferredCounts := listing.Rows(env.projectsDirectory, IconCatalogForContext(ctx), projectRecords(projectsArray), snapshot, tags.Group(tagRows))
+	for chunk := range slices.Chunk(slices.Collect(maps.Keys(inferredCounts)), inferredServiceCountBatchSize) {
+		var caseExpr strings.Builder
+		args := make([]any, 0, 2*len(chunk))
+		caseExpr.WriteString("CASE id")
+		for _, id := range chunk {
+			caseExpr.WriteString(" WHEN ? THEN ?")
+			args = append(args, id, inferredCounts[id])
+		}
+		caseExpr.WriteString(" ELSE service_count END")
+		if updateErr := s.db.WithContext(ctx).Model(&Project{}).
+			Where("id IN ? AND service_count = 0", chunk).
+			Update("service_count", gorm.Expr(caseExpr.String(), args...)).Error; updateErr != nil {
+			slog.WarnContext(ctx, "failed to persist inferred project service counts", "count", len(chunk), "error", updateErr)
+			break
+		}
 	}
 	if updatesFilter != "" {
 		s.preloadGitOpsComposePaths(ctx, env, projectsArray)
-		s.enrichProjectsWithUpdateInfo(ctx, projectsArray, items, true, env)
+		items = s.enrichProjectsWithUpdateInfo(ctx, projectsArray, items, true, env)
 		// Untracked compose projects only join an unfiltered-by-tag has_update view.
 		if strings.EqualFold(updatesFilter, "has_update") && strings.TrimSpace(params.Filters["tags"]) == "" {
 			if snapshot.Err != nil {
@@ -2271,16 +2243,24 @@ func (s *ProjectService) ListProjects(ctx context.Context, params pagination.Que
 					slog.WarnContext(ctx, "failed to load known project names for compose update discovery", "error", knownErr)
 					knownProjects = projectsArray
 				}
-				known := listing.KnownComposeProjectNames(projectRecords(knownProjects))
-				items = append(items, s.listing.DiscoveredUpdateRows(ctx, snapshot.Containers, known, IconCatalogForContext(ctx))...)
+				items = append(items, s.listing.DiscoveredUpdateRows(ctx, snapshot.Containers, listing.KnownComposeProjectNames(projectRecords(knownProjects)), IconCatalogForContext(ctx))...)
 			}
 		}
 	}
 
-	result, pageIndexes := listing.Page(items, params, func(id string) bool {
-		_, tracked := byID[id]
-		return tracked
-	})
+	result, pageIndexes := func() (pagination.FilterResult[projecttypes.Details], []int) {
+		if paginateInDB {
+			indexes := make([]int, len(items))
+			for i := range items {
+				indexes[i] = i
+			}
+			return pagination.FilterResult[projecttypes.Details]{Items: items}, indexes
+		}
+		return listing.Page(items, params, func(id string) bool {
+			_, tracked := byID[id]
+			return tracked
+		})
+	}()
 	pageProjects := make([]Project, 0, len(pageIndexes))
 	pageDetails := make([]projecttypes.Details, 0, len(pageIndexes))
 	for _, i := range pageIndexes {
@@ -2289,7 +2269,7 @@ func (s *ProjectService) ListProjects(ctx context.Context, params pagination.Que
 	}
 	if updatesFilter == "" {
 		s.preloadGitOpsComposePaths(ctx, env, pageProjects)
-		s.enrichProjectsWithUpdateInfo(ctx, pageProjects, pageDetails, true, env)
+		pageDetails = s.enrichProjectsWithUpdateInfo(ctx, pageProjects, pageDetails, true, env)
 	}
 	metas := make([]projects.ArcaneComposeMetadata, len(pageProjects))
 	var metaGroup errgroup.Group
@@ -2304,27 +2284,22 @@ func (s *ProjectService) ListProjects(ctx context.Context, params pagination.Que
 	if metaErr := metaGroup.Wait(); metaErr != nil {
 		slog.WarnContext(ctx, "project metadata resolution failed", "error", metaErr)
 	}
-	listing.ApplyPresentation(ctx, env.projectsDirectory, IconCatalogForContext(ctx), projectRecords(pageProjects), pageDetails, metas)
-	for k, i := range pageIndexes {
-		result.Items[i] = pageDetails[k]
+	for k, d := range listing.ApplyPresentation(ctx, env.projectsDirectory, IconCatalogForContext(ctx), projectRecords(pageProjects), pageDetails, metas) {
+		result.Items[pageIndexes[k]] = d
 	}
-	return result.Items, pagination.BuildResponse(result.TotalCount, result.TotalAvailable, params), nil
+	return result.Items, kit.Ternary(paginateInDB, paginationResp, pagination.BuildResponse(result.TotalCount, result.TotalAvailable, params)), nil
 }
 
 // CountProjectsWithPendingUpdates counts active projects and untracked compose
 // projects with a pending update, without the full list pipeline. A nil
 // allContainers is fetched here.
 func (s *ProjectService) CountProjectsWithPendingUpdates(ctx context.Context, allContainers []container.Summary) (int, error) {
-	if s.db == nil {
-		return 0, nil
-	}
-
 	if allContainers == nil {
-		var err error
-		allContainers, err = s.details.ComposeContainers(ctx)
+		listed, err := s.details.ComposeContainers(ctx)
 		if err != nil {
 			return 0, fmt.Errorf("failed to list containers for project update count: %w", err)
 		}
+		allContainers = listed
 	}
 
 	// One full scan: archived projects are excluded from the update count but
@@ -2343,30 +2318,24 @@ func (s *ProjectService) CountProjectsWithPendingUpdates(ctx context.Context, al
 	}
 
 	// Runtime container IDs keep tag-policy updates scoped to their project.
-	details := make([]projecttypes.Details, len(activeProjects))
+	details := make([]projecttypes.Details, 0, len(activeProjects))
 	containersByProject := listing.GroupComposeContainersByProject(allContainers)
-	for i, proj := range activeProjects {
-		details[i].ID = proj.ID
+	for _, proj := range activeProjects {
+		var runtimeServices []projecttypes.RuntimeService
 		for _, c := range listing.ProjectContainers(projectRecord(proj), containersByProject) {
-			details[i].RuntimeServices = append(
-				details[i].RuntimeServices,
-				projecttypes.RuntimeService{
-					Name: docker.ComposeServiceLabel(
-						c.Labels,
-					),
-					ContainerID:     c.ID,
-					Image:           c.Image,
-					ImageID:         c.ImageID,
-					ContainerLabels: c.Labels,
-				},
-			)
+			runtimeServices = append(runtimeServices, projecttypes.RuntimeService{
+				Name:            docker.ComposeServiceLabel(c.Labels),
+				ContainerID:     c.ID,
+				Image:           c.Image,
+				ImageID:         c.ImageID,
+				ContainerLabels: c.Labels,
+			})
 		}
+		details = append(details, projecttypes.Details{ID: proj.ID, RuntimeServices: runtimeServices})
 	}
-	s.enrichProjectsWithUpdateInfo(ctx, activeProjects, details, false, nil)
-
 	count := 0
-	for i := range details {
-		if details[i].UpdateInfo != nil && details[i].UpdateInfo.HasUpdate {
+	for _, d := range s.enrichProjectsWithUpdateInfo(ctx, activeProjects, details, false, nil) {
+		if kit.FromPtr(d.UpdateInfo).HasUpdate {
 			count++
 		}
 	}
@@ -2398,10 +2367,8 @@ func (s *ProjectService) ProjectMetadata(ctx context.Context, p Project, env *pr
 	}
 
 	fingerprint := fmt.Sprintf("%q|%q|%t", composeFile, env.projectsDirectory, env.autoInjectEnv)
-	if s.metaCache != nil && p.ID != "" {
-		if cached, ok := s.metaCache.Get(p.ID, fingerprint); ok {
-			return cached
-		}
+	if cached, ok := s.metaCache.Get(p.ID, fingerprint); ok && p.ID != "" {
+		return cached
 	}
 
 	meta, err := projects.ParseArcaneComposeMetadata(ctx, composeFile, env.projectsDirectory, env.autoInjectEnv)
@@ -2410,7 +2377,7 @@ func (s *ProjectService) ProjectMetadata(ctx context.Context, p Project, env *pr
 		return empty
 	}
 
-	if s.metaCache == nil || p.ID == "" {
+	if p.ID == "" {
 		return meta
 	}
 	if setErr := s.metaCache.Set(p.ID, fingerprint, p.Path, env.projectsDirectory, composeFile, meta.ComposeFiles, meta.EnvFiles, meta); setErr != nil {
@@ -2425,48 +2392,69 @@ func (s *ProjectService) ProjectMetadata(ctx context.Context, p Project, env *pr
 // is populated from the X-Arcane-Icon-Catalog header the manager forwards.
 // Background jobs have no user attached and fall back to the default catalog.
 func IconCatalogForContext(ctx context.Context) string {
-	if u, ok := userctx.CurrentUserFromContext(ctx); ok && u != nil && u.Preferences.IconCatalog != nil && *u.Preferences.IconCatalog != "" {
-		return *u.Preferences.IconCatalog
-	}
-	return iconcatalog.DefaultCatalog
+	u, _ := userctx.CurrentUserFromContext(ctx)
+	return cmp.Or(kit.FromPtr(kit.FromPtr(u).Preferences.IconCatalog), iconcatalog.DefaultCatalog)
 }
 
 func (s *ProjectService) refreshProjectImageRefs(ctx context.Context, proj *Project) {
-	if proj == nil || proj.ID == "" {
+	if proj.ID == "" {
 		return
 	}
 
 	s.invalidateProjectCaches(proj.ID)
 	composeProject, err := s.getCachedComposeProject(ctx, proj, nil)
 	if err != nil {
-		if dbErr := s.db.WithContext(ctx).
-			Model(&Project{}).
-			Where("id = ?", proj.ID).
-			Update("image_refs_json", "").Error; dbErr != nil {
+		if dbErr := s.db.WithContext(ctx).Model(&Project{}).Where("id = ?", proj.ID).Update("image_refs_json", "").Error; dbErr != nil {
 			slog.WarnContext(ctx, "failed to clear stale project image refs", "projectId", proj.ID, "error", dbErr)
 		}
-		proj.ImageRefsJSON = ""
+		*proj = Project{ //exhaustruct:enforce
+			BaseModel:          proj.BaseModel,
+			Name:               proj.Name,
+			DirName:            proj.DirName,
+			Path:               proj.Path,
+			Status:             proj.Status,
+			StatusReason:       proj.StatusReason,
+			ServiceCount:       proj.ServiceCount,
+			RunningCount:       proj.RunningCount,
+			GitOpsManagedBy:    proj.GitOpsManagedBy,
+			ComposeProjectName: proj.ComposeProjectName,
+			ImageRefsJSON:      "",
+			BuildImageRefsJSON: proj.BuildImageRefsJSON,
+			IsArchived:         proj.IsArchived,
+			ArchivedAt:         proj.ArchivedAt,
+		}
 		slog.WarnContext(ctx, "failed to refresh project image refs", "projectId", proj.ID, "projectName", proj.Name, "error", fmt.Errorf("load compose project: %w", err))
 		return
 	}
 	imageRefsJSON := projects.MarshalImageRefsJSON(projects.ImageRefsFromComposeServices(composeProject.Services))
 	buildImageRefsJSON := cmp.Or(projects.MarshalImageRefsJSON(projects.BuildImageRefsFromComposeProject(composeProject)), "[]")
-	if persistImageRefsErr := s.db.WithContext(ctx).
-		Model(&Project{}).
-		Where("id = ?", proj.ID).
-		Updates(map[string]any{
-			"image_refs_json":       imageRefsJSON,
-			"build_image_refs_json": buildImageRefsJSON,
-		}).Error; persistImageRefsErr != nil {
+	if persistImageRefsErr := s.db.WithContext(ctx).Model(&Project{}).Where("id = ?", proj.ID).Updates(map[string]any{
+		"image_refs_json":       imageRefsJSON,
+		"build_image_refs_json": buildImageRefsJSON,
+	}).Error; persistImageRefsErr != nil {
 		slog.WarnContext(ctx, "failed to persist project image refs", "projectId", proj.ID, "error", persistImageRefsErr)
 		return
 	}
-	proj.ImageRefsJSON = imageRefsJSON
-	proj.BuildImageRefsJSON = new(buildImageRefsJSON)
+	*proj = Project{ //exhaustruct:enforce
+		BaseModel:          proj.BaseModel,
+		Name:               proj.Name,
+		DirName:            proj.DirName,
+		Path:               proj.Path,
+		Status:             proj.Status,
+		StatusReason:       proj.StatusReason,
+		ServiceCount:       proj.ServiceCount,
+		RunningCount:       proj.RunningCount,
+		GitOpsManagedBy:    proj.GitOpsManagedBy,
+		ComposeProjectName: proj.ComposeProjectName,
+		ImageRefsJSON:      imageRefsJSON,
+		BuildImageRefsJSON: new(buildImageRefsJSON),
+		IsArchived:         proj.IsArchived,
+		ArchivedAt:         proj.ArchivedAt,
+	}
 }
 
 func (s *ProjectService) HandleProjectFilesChanged(ctx context.Context, paths []string) {
-	if len(paths) == 0 || s.db == nil {
+	if len(paths) == 0 {
 		return
 	}
 
@@ -2476,11 +2464,7 @@ func (s *ProjectService) HandleProjectFilesChanged(ctx context.Context, paths []
 		return
 	}
 	for i := range projectsList {
-		projectPath := filepath.Clean(projectsList[i].Path)
-		if !slices.ContainsFunc(paths, func(changedPath string) bool {
-			changedPath = filepath.Clean(changedPath)
-			return changedPath == projectPath || strings.HasPrefix(changedPath, projectPath+string(os.PathSeparator))
-		}) {
+		if !slices.ContainsFunc(paths, func(changedPath string) bool { return projects.IsSafeSubdirectory(projectsList[i].Path, changedPath) }) {
 			continue
 		}
 		s.refreshProjectImageRefs(ctx, &projectsList[i])
@@ -2491,10 +2475,6 @@ func (s *ProjectService) HandleProjectFilesChanged(ctx context.Context, paths []
 }
 
 func (s *ProjectService) BackfillProjectImageRefs(ctx context.Context) (int, error) {
-	if s.db == nil {
-		return 0, nil
-	}
-
 	var projectsList []Project
 	if err := s.db.WithContext(ctx).
 		Where("build_image_refs_json IS NULL").
@@ -2568,7 +2548,7 @@ func (s *ProjectService) SyncProjectsFromFileSystem(ctx context.Context) error {
 		// Rows imported from Arcane's own scratch dirs (project-update preview/backup,
 		// GitOps stage/backup) or from filesystem snapshot/trash dirs are never real
 		// projects. The decision is name-based, so it bypasses the mass-wipe guard.
-		if projects.IsInternalScratchDirName(p.Name) || projects.IsInternalScratchDirName(filepath.Base(p.Path)) || (p.DirName != nil && projects.IsInternalScratchDirName(*p.DirName)) {
+		if projects.IsInternalScratchDirName(p.Name) || projects.IsInternalScratchDirName(filepath.Base(p.Path)) || projects.IsInternalScratchDirName(kit.FromPtr(p.DirName)) {
 			deletions = append(deletions, projectCleanupDecision{project: p, reason: "removed internal Arcane scratch record (project-update/gitops temp dir)"})
 			continue
 		}
@@ -2577,8 +2557,30 @@ func (s *ProjectService) SyncProjectsFromFileSystem(ctx context.Context) error {
 			continue
 		}
 		candidates++
-		if decision, remove := s.evaluateProjectCleanup(ctx, p, followProjectSymlinks, projectsDir, s.config.ProjectScanMaxDepth).Get(); remove {
-			pendingDeletions = append(pendingDeletions, decision)
+		// Projects beyond a lowered scan depth are no longer discovered; root-level and outside paths use the disk checks.
+		if rel := listing.RelativePath(projectsDir, p.Path); s.config.ProjectScanMaxDepth > 0 && rel != "" && strings.Count(rel, "/") >= s.config.ProjectScanMaxDepth {
+			pendingDeletions = append(pendingDeletions, projectCleanupDecision{project: p, reason: "removed project: directory is beyond the configured scan depth"})
+			continue
+		}
+		validDir, statErr := projects.IsProjectDirectoryPath(p.Path, followProjectSymlinks)
+		switch {
+		case os.IsNotExist(statErr):
+			pendingDeletions = append(pendingDeletions, projectCleanupDecision{project: p, reason: "removed project: directory no longer exists"})
+			continue
+		case statErr != nil:
+			slog.WarnContext(ctx, "stat error during cleanup; keeping DB record", "path", p.Path, "error", statErr)
+			continue
+		case !validDir:
+			pendingDeletions = append(pendingDeletions, projectCleanupDecision{project: p, reason: "removed project: path is no longer a valid project directory"})
+			continue
+		}
+		// Only a directory with no compose file is pruned; an ambiguous, unreadable, or unparsable one is kept.
+		_, resolveErr := s.ResolveProjectComposeFile(ctx, &p)
+		switch {
+		case errors.Is(resolveErr, common.ErrComposeFileNotFound):
+			pendingDeletions = append(pendingDeletions, projectCleanupDecision{project: p, reason: "removed orphaned project: directory present but contains no compose file"})
+		case resolveErr != nil:
+			slog.WarnContext(ctx, "project directory present but compose file unresolved during cleanup; keeping DB record", "projectId", p.ID, "path", p.Path, "error", resolveErr)
 		}
 	}
 	// Pruning more than one project and over half the candidates usually means an
@@ -2610,134 +2612,83 @@ func (s *ProjectService) SyncProjectsFromFileSystem(ctx context.Context) error {
 
 func (s *ProjectService) upsertProjectForDir(ctx context.Context, dirName, dirPath string) error {
 	var existing Project
-	err := s.db.WithContext(ctx).
-		Where("path = ?", dirPath).
-		First(&existing).Error
+	err := s.db.WithContext(ctx).Where("path = ?", dirPath).First(&existing).Error
+	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+		return fmt.Errorf("query existing project for %q failed: %w", dirPath, err)
+	}
 
 	cfg := s.settingsService.GetSettingsOrDefaults(ctx)
-	composeMetadata := projecttypes.ComposeIdentity{ResolvedProjectName: projects.NormalizeProjectName(dirName)}
-	projectsDirectory, serviceCountErr := projects.GetProjectsDirectory(ctx, cfg.ProjectsDirectory.Value)
-	if serviceCountErr == nil {
+	composeMetadata, serviceCountErr := func() (projecttypes.ComposeIdentity, error) {
+		projectsDirectory, dirErr := projects.GetProjectsDirectory(ctx, cfg.ProjectsDirectory.Value)
+		if dirErr != nil {
+			return projecttypes.ComposeIdentity{ResolvedProjectName: projects.NormalizeProjectName(dirName)}, dirErr
+		}
 		autoInjectEnv := kit.ParseOrDefault(cfg.AutoInjectEnv.Value, false, strconv.ParseBool)
-		composeMetadata, serviceCountErr = projectsync.LoadComposeMetadata(ctx, s.composeIdentities, dirPath, dirName, projectsDirectory, autoInjectEnv, s.projectPathMapper(ctx))
-	}
-	serviceCountLogLevel := kit.Ternary(errors.Is(serviceCountErr, common.ErrProjectEnvUnreadable), slog.LevelDebug, slog.LevelWarn)
+		return projectsync.LoadComposeMetadata(ctx, s.composeIdentities, dirPath, dirName, projectsDirectory, autoInjectEnv, s.projectPathMapper(ctx))
+	}()
 
 	if errors.Is(err, gorm.ErrRecordNotFound) {
-		// Create a minimal project entry
-		reason := "Project discovered from filesystem, status pending Docker service query"
-		proj := &Project{
+		existing = Project{
 			Name:               composeMetadata.ResolvedProjectName,
 			DirName:            new(dirName),
 			Path:               dirPath,
 			Status:             ProjectStatusUnknown,
-			StatusReason:       new(reason),
+			StatusReason:       new("Project discovered from filesystem, status pending Docker service query"),
 			ServiceCount:       composeMetadata.ServiceCount,
-			RunningCount:       0,
 			ComposeProjectName: composeMetadata.ComposeProjectName,
 		}
-		slog.InfoContext(ctx, "Discovered new project with unknown status",
-			"project", dirName,
-			"path", dirPath,
-			"reason", reason)
+		slog.InfoContext(ctx, "Discovered new project with unknown status", "project", dirName, "path", dirPath, "reason", *existing.StatusReason)
 		if serviceCountErr != nil {
-			slog.Log(ctx, serviceCountLogLevel, "failed to read compose service count during project discovery", "project", dirName, "path", dirPath, "error", serviceCountErr)
+			slog.Log(ctx, kit.Ternary(errors.Is(serviceCountErr, common.ErrProjectEnvUnreadable), slog.LevelDebug, slog.LevelWarn),
+				"failed to read compose service count during project discovery", "project", dirName, "path", dirPath, "error", serviceCountErr)
 		}
-		if cerr := s.db.WithContext(ctx).Create(proj).Error; cerr != nil {
+		if cerr := s.db.WithContext(ctx).Create(&existing).Error; cerr != nil {
 			return fmt.Errorf("create project for %q failed: %w", dirPath, cerr)
 		}
-		if composeName := composeMetadata.ResolvedProjectName; strings.TrimSpace(composeName) != "" {
-			var duplicates int64
-			if countErr := s.db.WithContext(ctx).Model(&Project{}).Where("name = ? AND path <> ? AND id <> ?", composeName, dirPath, proj.ID).Count(&duplicates).Error; countErr != nil {
-				slog.WarnContext(ctx, "failed to check duplicate compose project names during project sync", "composeProjectName", composeName, "path", dirPath, "error", countErr)
-			} else if duplicates > 0 {
-				slog.WarnContext(ctx, "multiple project directories resolve to the same compose project name", "composeProjectName", composeName, "path", dirPath, "duplicates", duplicates)
-			}
+	} else {
+		updates := map[string]any{}
+		if existing.Path != dirPath {
+			updates["path"] = dirPath
 		}
-		return s.reconcileComposeTagsForProject(ctx, proj)
-	}
-	if err != nil {
-		return fmt.Errorf("query existing project for %q failed: %w", dirPath, err)
-	}
-
-	updates := map[string]any{}
-	if existing.Path != dirPath {
-		updates["path"] = dirPath
-	}
-	if existing.DirName == nil || *existing.DirName != dirName {
-		updates["dir_name"] = dirName
-	}
-	if serviceCountErr == nil && existing.ServiceCount != composeMetadata.ServiceCount {
-		updates["service_count"] = composeMetadata.ServiceCount
-	} else if serviceCountErr != nil {
-		slog.Log(ctx, serviceCountLogLevel, "failed to refresh compose service count during project sync", "projectId", existing.ID, "path", dirPath, "error", serviceCountErr)
-	}
-	if serviceCountErr == nil && mo.PointerToOption(existing.ComposeProjectName) != mo.PointerToOption(composeMetadata.ComposeProjectName) {
-		updates["compose_project_name"] = composeMetadata.ComposeProjectName
-	}
-	if serviceCountErr == nil {
-		if composeMetadata.ExplicitProjectName {
-			if existing.Name != composeMetadata.ResolvedProjectName {
+		if mo.PointerToOption(existing.DirName) != mo.Some(dirName) {
+			updates["dir_name"] = dirName
+		}
+		if serviceCountErr != nil {
+			slog.Log(ctx, kit.Ternary(errors.Is(serviceCountErr, common.ErrProjectEnvUnreadable), slog.LevelDebug, slog.LevelWarn),
+				"failed to refresh compose service count during project sync", "projectId", existing.ID, "path", dirPath, "error", serviceCountErr)
+		} else {
+			if existing.ServiceCount != composeMetadata.ServiceCount {
+				updates["service_count"] = composeMetadata.ServiceCount
+			}
+			if mo.PointerToOption(existing.ComposeProjectName) != mo.PointerToOption(composeMetadata.ComposeProjectName) {
+				updates["compose_project_name"] = composeMetadata.ComposeProjectName
+			}
+			if composeMetadata.ExplicitProjectName && existing.Name != composeMetadata.ResolvedProjectName {
 				updates["name"] = composeMetadata.ResolvedProjectName
+			} else if !composeMetadata.ExplicitProjectName && projects.NormalizeProjectName(existing.Name) != existing.Name {
+				updates["name"] = projects.NormalizeProjectName(existing.Name)
 			}
-		} else if normalizedExistingName := projects.NormalizeProjectName(existing.Name); normalizedExistingName != existing.Name {
-			updates["name"] = normalizedExistingName
+		}
+		if len(updates) == 0 {
+			return s.reconcileComposeTagsForProject(ctx, &existing)
+		}
+		updates["updated_at"] = time.Now()
+		if uerr := s.db.WithContext(ctx).Model(&Project{}).Where("id = ?", existing.ID).Updates(updates).Error; uerr != nil {
+			return fmt.Errorf("update project %s failed: %w", existing.ID, uerr)
 		}
 	}
-	if len(updates) == 0 {
-		return s.reconcileComposeTagsForProject(ctx, &existing)
-	}
 
-	updates["updated_at"] = time.Now()
-	if uerr := s.db.WithContext(ctx).
-		Model(&Project{}).
-		Where("id = ?", existing.ID).
-		Updates(updates).Error; uerr != nil {
-		return fmt.Errorf("update project %s failed: %w", existing.ID, uerr)
-	}
-	if composeName := composeMetadata.ResolvedProjectName; serviceCountErr == nil && strings.TrimSpace(composeName) != "" {
+	if serviceCountErr == nil && strings.TrimSpace(composeMetadata.ResolvedProjectName) != "" {
 		var duplicates int64
-		if countErr := s.db.WithContext(ctx).Model(&Project{}).Where("name = ? AND path <> ? AND id <> ?", composeName, dirPath, existing.ID).Count(&duplicates).Error; countErr != nil {
-			slog.WarnContext(ctx, "failed to check duplicate compose project names during project sync", "composeProjectName", composeName, "path", dirPath, "error", countErr)
+		if countErr := s.db.WithContext(ctx).Model(&Project{}).
+			Where("name = ? AND path <> ? AND id <> ?", composeMetadata.ResolvedProjectName, dirPath, existing.ID).
+			Count(&duplicates).Error; countErr != nil {
+			slog.WarnContext(ctx, "failed to check duplicate compose project names during project sync", "composeProjectName", composeMetadata.ResolvedProjectName, "path", dirPath, "error", countErr)
 		} else if duplicates > 0 {
-			slog.WarnContext(ctx, "multiple project directories resolve to the same compose project name", "composeProjectName", composeName, "path", dirPath, "duplicates", duplicates)
+			slog.WarnContext(ctx, "multiple project directories resolve to the same compose project name", "composeProjectName", composeMetadata.ResolvedProjectName, "path", dirPath, "duplicates", duplicates)
 		}
 	}
 	return s.reconcileComposeTagsForProject(ctx, &existing)
-}
-
-// evaluateProjectCleanup decides whether a project missing from the current
-// filesystem pass should be pruned. It only reads; the caller defers deletion
-// so the mass-wipe guard can veto the whole pass.
-func (s *ProjectService) evaluateProjectCleanup(ctx context.Context, p Project, followProjectSymlinks bool, projectsDir string, maxDepth int) mo.Option[projectCleanupDecision] {
-	// Projects still on disk but beyond a lowered scan depth are no longer
-	// discovered; root-level and outside paths fall through to the disk checks.
-	if rel := listing.RelativePath(projectsDir, p.Path); maxDepth > 0 && rel != "" && strings.Count(rel, "/") >= maxDepth {
-		return mo.Some(projectCleanupDecision{project: p, reason: "removed project: directory is beyond the configured scan depth"})
-	}
-
-	validDir, err := projects.IsProjectDirectoryPath(p.Path, followProjectSymlinks)
-	switch {
-	case os.IsNotExist(err):
-		return mo.Some(projectCleanupDecision{project: p, reason: "removed project: directory no longer exists"})
-	case err != nil:
-		slog.WarnContext(ctx, "stat error during cleanup; keeping DB record", "path", p.Path, "error", err)
-		return mo.None[projectCleanupDecision]()
-	case !validDir:
-		return mo.Some(projectCleanupDecision{project: p, reason: "removed project: path is no longer a valid project directory"})
-	}
-
-	// Only a directory with no compose file is pruned. An ambiguous match, an
-	// unreadable directory, or a parse error keeps a possibly deployable project.
-	_, err = s.ResolveProjectComposeFile(ctx, &p)
-	switch {
-	case err == nil:
-		return mo.None[projectCleanupDecision]()
-	case !errors.Is(err, common.ErrComposeFileNotFound):
-		slog.WarnContext(ctx, "project directory present but compose file unresolved during cleanup; keeping DB record", "projectId", p.ID, "path", p.Path, "error", err)
-		return mo.None[projectCleanupDecision]()
-	}
-	return mo.Some(projectCleanupDecision{project: p, reason: "removed orphaned project: directory present but contains no compose file"})
 }
 
 // ApplyGitSyncEnvToDirectory applies the same managed three-file environment
@@ -2770,38 +2721,51 @@ func (s *ProjectService) reconcileComposeTagsForProject(ctx context.Context, pro
 }
 
 func (s *ProjectService) UpdateProject(ctx context.Context, projectID string, name, composeContent, envContent, overrideContent *string, user usertypes.Actor) (*Project, error) {
-	proj, projectsDirectory, err := s.getProjectForUpdate(ctx, projectID)
+	recoverErr := s.updates.RecoverProject(ctx, projectID)
+	proj, err := s.getMutableProject(ctx, projectID)
 	if err != nil {
 		return nil, err
 	}
+	projectsDirectory, err := s.GetProjectsDirectory(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get projects directory: %w", err)
+	}
+	if ensureErr := s.EnsureProjectPathUnderRoot(ctx, proj, false); ensureErr != nil {
+		return nil, ensureErr
+	}
 
-	name = resolveAuthoritativeProjectName(ctx, &proj, name, composeContent)
-	newName := strings.TrimSpace(mo.PointerToOption(name).OrEmpty())
-	if recoverErr := s.updates.RecoverProject(ctx, projectID); recoverErr != nil {
+	// A top-level `name:` in the compose file is authoritative; name-only renames check the on-disk compose so the API cannot bypass it.
+	name = func() *string {
+		switch {
+		case composeContent != nil:
+			yamlName := projects.ComposeContentProjectName(*composeContent)
+			return kit.Ternary(yamlName != "", &yamlName, name)
+		case name == nil:
+			return nil
+		}
+		onDiskCompose, _, readErr := projects.ReadProjectFiles(ctx, proj.Path, "")
+		if readErr != nil {
+			return name
+		}
+		yamlName := projects.ComposeContentProjectName(onDiskCompose)
+		return kit.Ternary(yamlName != "", &yamlName, name)
+	}()
+	newName := strings.TrimSpace(kit.FromPtr(name))
+	if recoverErr != nil {
 		if newName != "" && proj.Name != newName {
 			return nil, recoverErr
 		}
 		slog.WarnContext(ctx, "project rename journal recovery failed before non-rename update; continuing", "projectId", projectID, "error", recoverErr)
-	} else {
-		proj, projectsDirectory, recoverErr = s.getProjectForUpdate(ctx, projectID)
-		if recoverErr != nil {
-			return nil, recoverErr
-		}
-		name = resolveAuthoritativeProjectName(ctx, &proj, name, composeContent)
-		newName = strings.TrimSpace(mo.PointerToOption(name).OrEmpty())
-	}
-	renameRequested := newName != "" && proj.Name != newName
-
-	if proj.IsArchived {
-		return nil, common.Classify(common.ErrProjectArchived, errors.New("project is archived and must be unarchived before this action"))
 	}
 	if ensureProjectEnvReadableErr := update.EnsureProjectEnvReadable(ctx, projectsDirectory, proj.Path); ensureProjectEnvReadableErr != nil {
 		return nil, ensureProjectEnvReadableErr
 	}
 
 	// A rename requires the stored and the live status to both be stopped.
-	var volumeMigration volume.Migration
-	if renameRequested {
+	volumeMigration, err := func() (volume.Migration, error) {
+		if newName == "" || proj.Name == newName {
+			return nil, nil
+		}
 		if proj.Status != ProjectStatusStopped && proj.Status != ProjectStatusUnknown {
 			return nil, fmt.Errorf("project must be stopped before renaming (current status: %s)", proj.Status)
 		}
@@ -2813,47 +2777,61 @@ func (s *ProjectService) UpdateProject(ctx context.Context, projectID string, na
 		if status := ProjectStatus(listing.ProjectStatus(services)); status != ProjectStatusStopped {
 			return nil, fmt.Errorf("project must be stopped before renaming (current status: %s)", status)
 		}
-		proj.Status, proj.StatusReason = ProjectStatusStopped, nil
-		proj.ServiceCount, proj.RunningCount = listing.ServiceCounts(services)
-
-		if volumeMigration, err = s.prepareProjectRenameVolumeMigration(ctx, &proj, newName, projectsDirectory, composeContent, envContent, overrideContent); err != nil {
-			return nil, err
+		serviceCount, runningCount := listing.ServiceCounts(services)
+		*proj = Project{ //exhaustruct:enforce
+			BaseModel:          proj.BaseModel,
+			Name:               proj.Name,
+			DirName:            proj.DirName,
+			Path:               proj.Path,
+			Status:             ProjectStatusStopped,
+			StatusReason:       nil,
+			ServiceCount:       serviceCount,
+			RunningCount:       runningCount,
+			GitOpsManagedBy:    proj.GitOpsManagedBy,
+			ComposeProjectName: proj.ComposeProjectName,
+			ImageRefsJSON:      proj.ImageRefsJSON,
+			BuildImageRefsJSON: proj.BuildImageRefsJSON,
+			IsArchived:         proj.IsArchived,
+			ArchivedAt:         proj.ArchivedAt,
 		}
+		return s.prepareProjectRenameVolumeMigration(ctx, proj, newName, projectsDirectory, composeContent, envContent, overrideContent)
+	}()
+	if err != nil {
+		return nil, err
 	}
 
 	renameJournal := s.updates.Prepare(proj.ID, proj.Name, proj.Path, proj.DirName, name, projectsDirectory, volumeMigration)
-
-	contentChanged := composeContent != nil || envContent != nil || overrideContent != nil
-	var backup *projects.ProjectUpdateBackup
-	if contentChanged {
-		var cleanupBackup func()
-		backup, cleanupBackup, err = projects.BackupProjectDirectory(ctx, projectsDirectory, proj.Path, ".project-update-backup-*", projects.ProjectUpdateBackupScope{TopLevelFiles: true})
-		if err != nil {
-			return nil, err
+	backup, cleanupBackup, err := func() (*projects.ProjectUpdateBackup, func(), error) {
+		if composeContent == nil && envContent == nil && overrideContent == nil {
+			return nil, func() {}, nil
 		}
-		defer cleanupBackup()
+		return projects.BackupProjectDirectory(ctx, projectsDirectory, proj.Path, ".project-update-backup-*", projects.ProjectUpdateBackupScope{TopLevelFiles: true})
+	}()
+	if err != nil {
+		return nil, err
 	}
+	defer cleanupBackup()
 
-	journalActive := renameJournal != nil
-	if journalActive {
+	if renameJournal != nil {
 		if writeProjectRenameJournalErr := s.updates.WriteJournal(ctx, renameJournal, projecttypes.RenameJournalPhaseStarted); writeProjectRenameJournalErr != nil {
 			return nil, writeProjectRenameJournalErr
 		}
 	}
 
-	projectStateCommitted := false
-	if updateErr := withProjectRenameRollback(ctx, &proj, &projectStateCommitted, func() error {
-		return s.applyProjectUpdate(
-			ctx, &proj, renameRequested, newName, projectsDirectory,
-			composeContent, envContent, overrideContent,
-			volumeMigration, renameJournal, &journalActive, &projectStateCommitted,
-		)
-	}); updateErr != nil {
-		return nil, s.handleProjectUpdateFailure(ctx, projectID, projectsDirectory, &proj, backup, &journalActive, projectStateCommitted, updateErr)
+	original := *proj
+	if updateErr := s.applyProjectUpdate(ctx, proj, newName, projectsDirectory, composeContent, envContent, overrideContent, volumeMigration, renameJournal); updateErr != nil {
+		return nil, s.updates.RollbackFailedUpdate(ctx, projectID, projectsDirectory, original.Path, proj.Path, backup, renameJournal != nil, updateErr)
 	}
 
 	if composeContent != nil || overrideContent != nil {
-		s.refreshProjectAfterContentUpdate(ctx, &proj)
+		s.refreshComposeProjectName(ctx, proj)
+		s.refreshProjectImageRefs(ctx, proj)
+		if reconcileErr := s.reconcileComposeTagsForProject(ctx, proj); reconcileErr != nil {
+			slog.WarnContext(ctx, "failed to reconcile Compose project tags after project content update", "projectId", proj.ID, "error", reconcileErr)
+		}
+		if countsErr := s.updateProjectStatusAndCounts(ctx, proj.ID, proj.Status); countsErr != nil {
+			slog.WarnContext(ctx, "failed to update service counts after project content update", "projectId", proj.ID, "error", countsErr)
+		}
 	}
 	metadata := database.JSON{"action": "update", "projectID": proj.ID, "projectName": proj.Name}
 	if composeContent != nil {
@@ -2866,12 +2844,12 @@ func (s *ProjectService) UpdateProject(ctx context.Context, projectID string, na
 		metadata["overrideUpdated"] = true
 	}
 	s.logProjectEvent(ctx, event.EventTypeProjectUpdate, proj.ID, proj.Name, user, metadata, "could not log project update action")
-	if contentChanged {
+	if composeContent != nil || envContent != nil || overrideContent != nil {
 		s.FilesChanged.Publish(proj.ID)
 	}
 
 	slog.InfoContext(ctx, "project updated", "projectId", proj.ID, "name", proj.Name)
-	return &proj, nil
+	return proj, nil
 }
 
 // applyProjectUpdate renames, persists files, migrates volumes, and
@@ -2879,28 +2857,62 @@ func (s *ProjectService) UpdateProject(ctx context.Context, projectID string, na
 func (s *ProjectService) applyProjectUpdate(
 	ctx context.Context,
 	proj *Project,
-	renameRequested bool,
 	newName, projectsDirectory string,
 	composeContent, envContent, overrideContent *string,
 	volumeMigration volume.Migration,
 	renameJournal *projecttypes.RenameJournal,
-	journalActive, projectStateCommitted *bool,
 ) (err error) {
 	volumeMigrationApplied := false
 	defer func() {
-		if err != nil && volumeMigrationApplied && !*projectStateCommitted {
+		if err != nil && volumeMigrationApplied {
 			if rollbackErr := volumeMigration.Rollback(ctx); rollbackErr != nil {
 				err = errors.Join(err, fmt.Errorf("failed to rollback project volume rename: %w", rollbackErr))
 			}
 		}
 	}()
 
-	if renameRequested {
-		if renameErr := s.applyProjectRename(ctx, proj, newName, projectsDirectory); renameErr != nil {
-			return renameErr
+	// A rename moves a stopped project's directory to its sanitized new name under the projects directory.
+	if newName != "" && proj.Name != newName {
+		newDirName := projects.SanitizeProjectName(newName)
+		targetPath := filepath.Clean(filepath.Join(projectsDirectory, newDirName))
+		if filepath.Clean(proj.Path) != targetPath {
+			targetLogical, logicalErr := acfs.LogicalPath(projectsDirectory, targetPath)
+			if logicalErr != nil {
+				return fmt.Errorf("failed to resolve project directory rename target: %w", logicalErr)
+			}
+			// An imported project outside the projects directory crosses roots, so it cannot be a confined rename;
+			// that move checks cancellation itself, as acfs.Rename would.
+			if renameErr := func() error {
+				currentLogical, currentErr := acfs.LogicalPath(projectsDirectory, filepath.Clean(proj.Path))
+				if currentErr == nil {
+					return acfs.Rename(ctx, projectsDirectory, currentLogical, targetLogical)
+				}
+				if cancellationErr := ctx.Err(); cancellationErr != nil {
+					return cancellationErr
+				}
+				return os.Rename(filepath.Clean(proj.Path), targetPath)
+			}(); renameErr != nil {
+				return fmt.Errorf("failed to rename project directory: %w", renameErr)
+			}
+		}
+		*proj = Project{ //exhaustruct:enforce
+			BaseModel:          proj.BaseModel,
+			Name:               newName,
+			DirName:            &newDirName,
+			Path:               kit.Ternary(filepath.Clean(proj.Path) != targetPath, targetPath, proj.Path),
+			Status:             proj.Status,
+			StatusReason:       proj.StatusReason,
+			ServiceCount:       proj.ServiceCount,
+			RunningCount:       proj.RunningCount,
+			GitOpsManagedBy:    proj.GitOpsManagedBy,
+			ComposeProjectName: proj.ComposeProjectName,
+			ImageRefsJSON:      proj.ImageRefsJSON,
+			BuildImageRefsJSON: proj.BuildImageRefsJSON,
+			IsArchived:         proj.IsArchived,
+			ArchivedAt:         proj.ArchivedAt,
 		}
 	}
-	if persistFilesErr := s.persistUpdatedProjectFiles(ctx, proj, projectsDirectory, composeContent, envContent, overrideContent); persistFilesErr != nil {
+	if persistFilesErr := projectsync.PersistUpdatedProjectFiles(ctx, proj.Path, proj.Name, projectsDirectory, composeContent, envContent, overrideContent); persistFilesErr != nil {
 		return persistFilesErr
 	}
 	if migrationErr := projects.ApplyRenameVolumeMigration(ctx, s.updates.Operations(), volumeMigration, renameJournal, &volumeMigrationApplied); migrationErr != nil {
@@ -2909,52 +2921,8 @@ func (s *ProjectService) applyProjectUpdate(
 	if saveErr := s.db.WithContext(ctx).Save(proj).Error; saveErr != nil {
 		return fmt.Errorf("failed to update project: %w", saveErr)
 	}
-	*projectStateCommitted = true
-	projects.FinalizeRenameAfterCommit(ctx, s.updates.Operations(), proj.ID, volumeMigration, renameJournal, journalActive)
+	projects.FinalizeRenameAfterCommit(ctx, s.updates.Operations(), proj.ID, volumeMigration, renameJournal, new(renameJournal != nil))
 	return nil
-}
-
-// handleProjectUpdateFailure restores the pre-update files and replays
-// an active rename journal unless the project row was already committed.
-func (s *ProjectService) handleProjectUpdateFailure(
-	ctx context.Context,
-	projectID, projectsDirectory string,
-	proj *Project,
-	backup *projects.ProjectUpdateBackup,
-	journalActive *bool,
-	projectStateCommitted bool,
-	err error,
-) error {
-	if projectStateCommitted {
-		return err
-	}
-
-	if backup != nil {
-		if restoreErr := projects.RestoreProjectDirectoryBackup(ctx, projectsDirectory, proj.Path, backup); restoreErr != nil {
-			err = errors.Join(err, fmt.Errorf("failed to restore project files after update failure: %w", restoreErr))
-		}
-	}
-	if *journalActive {
-		if recoverErr := s.updates.RecoverProject(ctx, projectID); recoverErr != nil {
-			err = errors.Join(err, fmt.Errorf("project rename recovery failed: %w", recoverErr))
-		} else {
-			*journalActive = false
-		}
-	}
-	return err
-}
-
-// refreshProjectAfterContentUpdate re-derives the compose name, image
-// refs, Compose tags, and service counts after a compose or override write.
-func (s *ProjectService) refreshProjectAfterContentUpdate(ctx context.Context, proj *Project) {
-	s.refreshComposeProjectName(ctx, proj)
-	s.refreshProjectImageRefs(ctx, proj)
-	if err := s.reconcileComposeTagsForProject(ctx, proj); err != nil {
-		slog.WarnContext(ctx, "failed to reconcile Compose project tags after project content update", "projectId", proj.ID, "error", err)
-	}
-	if err := s.updateProjectStatusAndCounts(ctx, proj.ID, proj.Status); err != nil {
-		slog.WarnContext(ctx, "failed to update service counts after project content update", "projectId", proj.ID, "error", err)
-	}
 }
 
 func (s *ProjectService) ApplyGitSyncProjectFiles(
@@ -2964,12 +2932,16 @@ func (s *ProjectService) ApplyGitSyncProjectFiles(
 	gitOverrideFileName string,
 	user usertypes.Actor,
 ) (*Project, bool, error) {
-	proj, projectsDirectory, err := s.getProjectForUpdate(ctx, projectID)
+	proj, err := s.getMutableProject(ctx, projectID)
 	if err != nil {
 		return nil, false, err
 	}
-	if proj.IsArchived {
-		return nil, false, common.Classify(common.ErrProjectArchived, errors.New("project is archived and must be unarchived before this action"))
+	projectsDirectory, err := s.GetProjectsDirectory(ctx)
+	if err != nil {
+		return nil, false, fmt.Errorf("failed to get projects directory: %w", err)
+	}
+	if ensureErr := s.EnsureProjectPathUnderRoot(ctx, proj, false); ensureErr != nil {
+		return nil, false, ensureErr
 	}
 	beforeCompose, beforeEnv, beforeOverride, beforeErr := s.projectContent(ctx, proj.ID)
 
@@ -2998,85 +2970,87 @@ func (s *ProjectService) ApplyGitSyncProjectFiles(
 	}
 	defer cleanupBackup()
 
-	// The env is persisted first so WriteComposeFile targets the COMPOSE_FILE base
-	// the updated .env selects. A failure before the row save restores the backup,
-	// so new env values never pair with an old or partial compose file set.
-	var applyErr error
-	if envErr := projectsync.PersistGitSyncEnvFiles(ctx, proj.Path, projectsDirectory, envUpdate); envErr != nil {
-		applyErr = fmt.Errorf("failed to sync git env files: %w", envErr)
-	} else if composeErr := projects.WriteComposeFile(ctx, projectsDirectory, proj.Path, composeContent); composeErr != nil {
-		applyErr = fmt.Errorf("failed to save compose file: %w", composeErr)
-	} else if overrideErr := projects.WriteComposeOverrideFile(ctx, projectsDirectory, proj.Path, gitOverrideContent, gitOverrideFileName); overrideErr != nil {
-		applyErr = fmt.Errorf("failed to sync git override file: %w", overrideErr)
-	} else if saveErr := s.db.WithContext(ctx).Save(&proj).Error; saveErr != nil {
-		applyErr = fmt.Errorf("failed to update project: %w", saveErr)
-	}
-	if applyErr != nil {
-		journalActive := false
-		return nil, false, s.handleProjectUpdateFailure(ctx, projectID, projectsDirectory, &proj, backup, &journalActive, false, applyErr)
+	// The env is persisted first so WriteComposeFile targets the COMPOSE_FILE base the updated .env selects.
+	// A failure before the row save restores the backup, so new env values never pair with an old compose file set.
+	if applyErr := func() error {
+		if envErr := projectsync.PersistGitSyncEnvFiles(ctx, proj.Path, projectsDirectory, envUpdate); envErr != nil {
+			return fmt.Errorf("failed to sync git env files: %w", envErr)
+		}
+		if composeErr := projects.WriteComposeFile(ctx, projectsDirectory, proj.Path, composeContent); composeErr != nil {
+			return fmt.Errorf("failed to save compose file: %w", composeErr)
+		}
+		if overrideErr := projects.WriteComposeOverrideFile(ctx, projectsDirectory, proj.Path, gitOverrideContent, gitOverrideFileName); overrideErr != nil {
+			return fmt.Errorf("failed to sync git override file: %w", overrideErr)
+		}
+		if saveErr := s.db.WithContext(ctx).Save(proj).Error; saveErr != nil {
+			return fmt.Errorf("failed to update project: %w", saveErr)
+		}
+		return nil
+	}(); applyErr != nil {
+		if restoreErr := projects.RestoreProjectDirectoryBackup(ctx, projectsDirectory, proj.Path, backup); restoreErr != nil {
+			return nil, false, errors.Join(applyErr, fmt.Errorf("failed to restore project files after update failure: %w", restoreErr))
+		}
+		return nil, false, applyErr
 	}
 
-	s.refreshProjectAfterContentUpdate(ctx, &proj)
+	s.refreshComposeProjectName(ctx, proj)
+	s.refreshProjectImageRefs(ctx, proj)
+	if reconcileErr := s.reconcileComposeTagsForProject(ctx, proj); reconcileErr != nil {
+		slog.WarnContext(ctx, "failed to reconcile Compose project tags after project content update", "projectId", proj.ID, "error", reconcileErr)
+	}
+	if countsErr := s.updateProjectStatusAndCounts(ctx, proj.ID, proj.Status); countsErr != nil {
+		slog.WarnContext(ctx, "failed to update service counts after project content update", "projectId", proj.ID, "error", countsErr)
+	}
 
 	// Unreadable content on either side always compares as changed.
 	afterCompose, afterEnv, afterOverride, afterErr := s.projectContent(ctx, proj.ID)
-	unreadable := beforeErr != nil || afterErr != nil
-	if unreadable {
+	if beforeErr != nil || afterErr != nil {
 		slog.WarnContext(ctx, "failed to read project content for git sync change detection; treating as changed", "projectId", proj.ID, "error", errors.Join(beforeErr, afterErr))
 	}
-	composeChanged := unreadable || beforeCompose != afterCompose
-	envChanged := unreadable || projects.EnvContentChanged(beforeEnv, afterEnv)
-	overrideChanged := unreadable || beforeOverride != afterOverride
-	contentChanged := composeChanged || envChanged || overrideChanged
-	envSourceRemoved := gitEnvContent == nil && envUpdate.State.HasGitSource
-	if contentChanged || envSourceRemoved {
+	contentChanged := beforeErr != nil || afterErr != nil || beforeCompose != afterCompose || projects.EnvContentChanged(beforeEnv, afterEnv) || beforeOverride != afterOverride
+	if contentChanged || (gitEnvContent == nil && envUpdate.State.HasGitSource) {
 		metadata := database.JSON{
 			"action":          "git_sync_update",
 			"projectID":       proj.ID,
 			"projectName":     proj.Name,
-			"composeUpdated":  composeChanged,
-			"envUpdated":      envChanged,
-			"overrideUpdated": overrideChanged,
+			"composeUpdated":  beforeErr != nil || afterErr != nil || beforeCompose != afterCompose,
+			"envUpdated":      beforeErr != nil || afterErr != nil || projects.EnvContentChanged(beforeEnv, afterEnv),
+			"overrideUpdated": beforeErr != nil || afterErr != nil || beforeOverride != afterOverride,
 		}
-		if envSourceRemoved {
+		if gitEnvContent == nil && envUpdate.State.HasGitSource {
 			metadata["envSourceRemoved"] = true
 		}
 		s.logProjectEvent(ctx, event.EventTypeProjectUpdate, proj.ID, proj.Name, user, metadata, "could not log git sync project update action")
 	}
 
-	return &proj, contentChanged, nil
+	return proj, contentChanged, nil
 }
 
-func (s *ProjectService) getProjectForUpdate(ctx context.Context, projectID string) (Project, string, error) {
-	var proj Project
-	if err := s.db.WithContext(ctx).First(&proj, "id = ?", projectID).Error; err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return Project{}, "", errors.New("project not found")
-		}
-		return Project{}, "", fmt.Errorf("failed to get project: %w", err)
-	}
-
-	projectsDirectory, err := s.GetProjectsDirectory(ctx)
-	if err != nil {
-		return Project{}, "", fmt.Errorf("failed to get projects directory: %w", err)
-	}
-
-	if ensureProjectPathUnderRootErr := s.EnsureProjectPathUnderRoot(ctx, &proj, false); ensureProjectPathUnderRootErr != nil {
-		return Project{}, "", ensureProjectPathUnderRootErr
-	}
-
-	return proj, projectsDirectory, nil
-}
-
-// prepareProjectRenameVolumeMigration plans the volume rename for a
-// stopped project. Content changes are applied to a scratch preview first so
-// the plan reflects the updated compose files.
+// prepareProjectRenameVolumeMigration rejects an unusable rename target, then plans the volume rename for a stopped
+// project. Content changes are applied to a scratch preview first so the plan reflects the updated compose files.
 func (s *ProjectService) prepareProjectRenameVolumeMigration(
 	ctx context.Context,
 	proj *Project,
 	newName, projectsDirectory string,
 	composeContent, envContent, overrideContent *string,
 ) (volume.Migration, error) {
+	newDirName := projects.SanitizeProjectName(newName)
+	if newDirName == "" || strings.Trim(newDirName, "_") == "" {
+		return nil, errors.New("invalid project name: results in empty directory name")
+	}
+	if targetPath := filepath.Clean(filepath.Join(projectsDirectory, newDirName)); filepath.Clean(proj.Path) != targetPath {
+		targetLogical, logicalErr := acfs.LogicalPath(projectsDirectory, targetPath)
+		if logicalErr != nil {
+			return nil, fmt.Errorf("failed to resolve project directory rename target: %w", logicalErr)
+		}
+		exists, existsErr := acfs.Exists(ctx, projectsDirectory, targetLogical)
+		if existsErr != nil {
+			return nil, fmt.Errorf("failed to check project directory rename target: %w", existsErr)
+		}
+		if exists {
+			return nil, fmt.Errorf("project directory already exists: %s", targetPath)
+		}
+	}
 	target := proj
 	if composeContent != nil || envContent != nil || overrideContent != nil {
 		previewLogical, err := acfs.MkdirTemp(ctx, projectsDirectory, "/", ".project-update-preview-*")
@@ -3096,16 +3070,30 @@ func (s *ProjectService) prepareProjectRenameVolumeMigration(
 		if _, copyDirErr := acfs.CopyDir(ctx, proj.Path, previewPath, acfstypes.CopyOptions{}); copyDirErr != nil {
 			return nil, fmt.Errorf("failed to prepare project update preview: %w", copyDirErr)
 		}
-		previewProject := *proj
-		previewProject.Path = previewPath
-		if persistErr := s.persistUpdatedProjectFiles(ctx, &previewProject, projectsDirectory, composeContent, envContent, overrideContent); persistErr != nil {
+		previewProject := Project{ //exhaustruct:enforce
+			BaseModel:          proj.BaseModel,
+			Name:               proj.Name,
+			DirName:            proj.DirName,
+			Path:               previewPath,
+			Status:             proj.Status,
+			StatusReason:       proj.StatusReason,
+			ServiceCount:       proj.ServiceCount,
+			RunningCount:       proj.RunningCount,
+			GitOpsManagedBy:    proj.GitOpsManagedBy,
+			ComposeProjectName: proj.ComposeProjectName,
+			ImageRefsJSON:      proj.ImageRefsJSON,
+			BuildImageRefsJSON: proj.BuildImageRefsJSON,
+			IsArchived:         proj.IsArchived,
+			ArchivedAt:         proj.ArchivedAt,
+		}
+		if persistErr := projectsync.PersistUpdatedProjectFiles(ctx, previewProject.Path, previewProject.Name, projectsDirectory, composeContent, envContent, overrideContent); persistErr != nil {
 			return nil, fmt.Errorf("failed to prepare project update preview: %w", persistErr)
 		}
 		target = &previewProject
 	}
 
 	oldComposeName, newComposeName := projects.NormalizeProjectName(target.Name), projects.NormalizeProjectName(newName)
-	if s.dockerService == nil || target.Status != ProjectStatusStopped || oldComposeName == "" || newComposeName == "" || oldComposeName == newComposeName {
+	if target.Status != ProjectStatusStopped || oldComposeName == "" || newComposeName == "" || oldComposeName == newComposeName {
 		return nil, nil
 	}
 
@@ -3122,117 +3110,7 @@ func (s *ProjectService) prepareProjectRenameVolumeMigration(
 		return nil, fmt.Errorf("failed to connect to Docker for volume rename: %w", err)
 	}
 
-	toolsRegistry := ""
-	if s.settingsService != nil {
-		toolsRegistry = s.settingsService.GetSettingsConfig().ToolsImageRegistry.Value
-	}
-
-	return projects.PlanVolumeMigration(ctx, dockerClient, composeProject, oldComposeName, newComposeName, volumehelper.ToolsImage(toolsRegistry))
-}
-
-// persistUpdatedProjectFiles validates and writes submitted compose, override,
-// and env content. An override-only save validates the on-disk base merged with
-// the requested override, so a base only valid with its override still passes
-// and a delete that would break the base fails before touching disk.
-func (s *ProjectService) persistUpdatedProjectFiles(ctx context.Context, proj *Project, projectsDirectory string, composeContent, envContent, overrideContent *string) error {
-	if composeContent == nil && overrideContent == nil {
-		if envContent != nil {
-			return projectsync.PersistEffectiveEnvContent(ctx, proj.Path, projectsDirectory, *envContent)
-		}
-		return nil
-	}
-
-	var baseContent string
-	if composeContent != nil {
-		baseContent = *composeContent
-	} else {
-		var err error
-		if baseContent, _, err = projects.ReadProjectFiles(ctx, proj.Path, ""); err != nil {
-			return fmt.Errorf("failed to read project files: %w", err)
-		}
-	}
-	effectiveEnvContent, err := projectsync.EffectiveEnvContentForUpdate(proj.Path, envContent)
-	if err != nil {
-		return fmt.Errorf("invalid compose file: %w", err)
-	}
-	valOverride, valOverrideName := projects.ResolveEffectiveOverrideForValidation(proj.Path, overrideContent)
-	if validateErr := projects.ValidateComposeContentForUpdate(ctx, projectsDirectory, proj.Path, proj.Name, baseContent, effectiveEnvContent, valOverride, valOverrideName, false); validateErr != nil {
-		return fmt.Errorf("invalid compose file: %w", validateErr)
-	}
-
-	// The env is persisted first so WriteComposeFile targets the COMPOSE_FILE
-	// base the updated .env selects. A non-nil composeContent is an explicit
-	// submission and is always written.
-	if envContent != nil {
-		if persistErr := projectsync.PersistEffectiveEnvContent(ctx, proj.Path, projectsDirectory, *envContent); persistErr != nil {
-			return fmt.Errorf("failed to save project files: %w", persistErr)
-		}
-	} else if composeContent != nil {
-		if ensureErr := projectsync.EnsureEffectiveEnvFile(ctx, proj.Path, projectsDirectory); ensureErr != nil {
-			return fmt.Errorf("failed to save project files: %w", ensureErr)
-		}
-	}
-	if composeContent != nil {
-		if writeErr := projects.WriteComposeFile(ctx, projectsDirectory, proj.Path, *composeContent); writeErr != nil {
-			return fmt.Errorf("failed to save project files: %w", writeErr)
-		}
-	}
-	if overrideErr := projects.ApplyOverrideFileChange(ctx, projectsDirectory, proj.Path, overrideContent); overrideErr != nil {
-		return fmt.Errorf("failed to save project files: %w", overrideErr)
-	}
-	return nil
-}
-
-// applyProjectRename moves a stopped project's directory to its sanitized new
-// name under the projects directory and updates the row fields.
-func (s *ProjectService) applyProjectRename(ctx context.Context, proj *Project, newName, projectsDirectory string) error {
-	if proj.Status != ProjectStatusStopped {
-		return fmt.Errorf("project must be stopped before renaming (current status: %s)", proj.Status)
-	}
-
-	newDirName := projects.SanitizeProjectName(newName)
-	if newDirName == "" || strings.Trim(newDirName, "_") == "" {
-		return errors.New("invalid project name: results in empty directory name")
-	}
-
-	currentPath := filepath.Clean(proj.Path)
-	targetPath := filepath.Clean(filepath.Join(projectsDirectory, newDirName))
-	if currentPath != targetPath {
-		targetLogical, err := acfs.LogicalPath(projectsDirectory, targetPath)
-		if err != nil {
-			return fmt.Errorf("failed to resolve project directory rename target: %w", err)
-		}
-		exists, err := acfs.Exists(ctx, projectsDirectory, targetLogical)
-		if err != nil {
-			return fmt.Errorf("failed to check project directory rename target: %w", err)
-		}
-		if exists {
-			return fmt.Errorf("project directory already exists: %s", targetPath)
-		}
-
-		// An imported project can live outside the projects directory, in which
-		// case the move crosses roots and cannot be a confined rename.
-		currentLogical, currentErr := acfs.LogicalPath(projectsDirectory, currentPath)
-		if currentErr != nil {
-			// The cross-root move cannot go through acfs, so the cancellation
-			// check acfs.Rename performs happens here instead.
-			if cancellationErr := ctx.Err(); cancellationErr != nil {
-				return cancellationErr
-			}
-			err = os.Rename(currentPath, targetPath)
-		} else {
-			err = acfs.Rename(ctx, projectsDirectory, currentLogical, targetLogical)
-		}
-		if err != nil {
-			return fmt.Errorf("failed to rename project directory: %w", err)
-		}
-
-		proj.Path = targetPath
-	}
-
-	proj.DirName = &newDirName
-	proj.Name = newName
-	return nil
+	return projects.PlanVolumeMigration(ctx, dockerClient, composeProject, oldComposeName, newComposeName, volumehelper.ToolsImage(s.settingsService.GetSettingsConfig().ToolsImageRegistry.Value))
 }
 
 // UpdateProjectServiceImages persists selected service image tags before recreating them.
@@ -3281,10 +3159,7 @@ func (s *ProjectService) GetProjectWorkspace(ctx context.Context, projectID stri
 		return nil, ensureProjectPathUnderRootErr
 	}
 	ownedPaths, ownedErr := s.gitOpsOwnedWorkspacePaths(ctx, proj)
-	if ownedErr != nil {
-		ownedPaths = nil
-	}
-	return s.workspace.Read(ctx, proj.Path, s.workspaceComposeFileName(ctx, proj), ownedPaths)
+	return s.workspace.Read(ctx, proj.Path, s.workspaceComposeFileName(ctx, proj), kit.Ternary(ownedErr == nil, ownedPaths, nil))
 }
 
 func (s *ProjectService) GetProjectWorkspaceFile(ctx context.Context, projectID, relativePath string) (*workspacetypes.FileContent, error) {
@@ -3293,10 +3168,7 @@ func (s *ProjectService) GetProjectWorkspaceFile(ctx context.Context, projectID,
 		return nil, err
 	}
 	ownedPaths, ownedErr := s.gitOpsOwnedWorkspacePaths(ctx, proj)
-	if ownedErr != nil {
-		ownedPaths = nil
-	}
-	return s.workspace.File(ctx, proj.Path, s.workspaceComposeFileName(ctx, proj), relativePath, ownedPaths)
+	return s.workspace.File(ctx, proj.Path, s.workspaceComposeFileName(ctx, proj), relativePath, kit.Ternary(ownedErr == nil, ownedPaths, nil))
 }
 
 func (s *ProjectService) DownloadProjectWorkspaceFile(ctx context.Context, projectID, relativePath string) (io.ReadCloser, int64, string, error) {
@@ -3447,8 +3319,11 @@ func (s *ProjectService) AggregateProjects(ctx context.Context, params paginatio
 	}
 	byID := func(a, b projecttypes.Details) int { return strings.Compare(a.ID, b.ID) }
 	listConfig := listing.PaginationConfig()
-	listConfig.SortBindings = append([]pagination.SortBinding[projecttypes.Details]{{Key: "id", Fn: byID, DescFn: byID}}, listConfig.SortBindings...)
-	items, resp := pagination.MergeEnvironmentPages(listConfig, pages, params)
+	items, resp := pagination.MergeEnvironmentPages(pagination.Config[projecttypes.Details]{
+		SearchAccessors: listConfig.SearchAccessors,
+		SortBindings:    append([]pagination.SortBinding[projecttypes.Details]{{Key: "id", Fn: byID, DescFn: byID}}, listConfig.SortBindings...),
+		FilterAccessors: listConfig.FilterAccessors,
+	}, pages, params)
 	return base.Paginated[projecttypes.Details]{
 		Success:            true,
 		Data:               items,
@@ -3462,14 +3337,23 @@ func (s *ProjectService) AggregateProjectCounts(ctx context.Context) (base.ApiRe
 	if err != nil {
 		return base.ApiResponse[projecttypes.StatusCounts]{}, fmt.Errorf("collect environment project counts: %w", err)
 	}
-	var counts projecttypes.StatusCounts
+	var running, stopped, total, archived int
 	for _, result := range collection.Results {
-		counts.RunningProjects += result.Value.Data.RunningProjects
-		counts.StoppedProjects += result.Value.Data.StoppedProjects
-		counts.TotalProjects += result.Value.Data.TotalProjects
-		counts.ArchivedProjects += result.Value.Data.ArchivedProjects
+		running += result.Value.Data.RunningProjects
+		stopped += result.Value.Data.StoppedProjects
+		total += result.Value.Data.TotalProjects
+		archived += result.Value.Data.ArchivedProjects
 	}
-	return base.ApiResponse[projecttypes.StatusCounts]{Success: true, Data: counts, FailedEnvironments: collection.Failures}, nil
+	return base.ApiResponse[projecttypes.StatusCounts]{
+		Success: true,
+		Data: projecttypes.StatusCounts{
+			RunningProjects:  running,
+			StoppedProjects:  stopped,
+			TotalProjects:    total,
+			ArchivedProjects: archived,
+		},
+		FailedEnvironments: collection.Failures,
+	}, nil
 }
 
 func (s *ProjectService) AggregateProjectTags(ctx context.Context) (base.ApiResponse[[]projecttypes.TagOption], error) {
@@ -3487,30 +3371,6 @@ func (s *ProjectService) AggregateProjectTags(ctx context.Context) (base.ApiResp
 	}
 	slices.SortStableFunc(options, func(a, b projecttypes.TagOption) int { return strings.Compare(a.Name, b.Name) })
 	return base.ApiResponse[[]projecttypes.TagOption]{Success: true, Data: options, FailedEnvironments: collection.Failures}, nil
-}
-
-// projectListRows builds list rows and persists live-inferred service counts
-// over stored zeros, since SQL sorts and paginates on service_count.
-func (s *ProjectService) projectListRows(ctx context.Context, projectsDir string, projectsList []Project, snapshot listing.Snapshot) []projecttypes.Details {
-	rows, inferredCounts := listing.Rows(projectsDir, IconCatalogForContext(ctx), projectRecords(projectsList), snapshot)
-	ids := slices.Collect(maps.Keys(inferredCounts))
-	for chunk := range slices.Chunk(ids, inferredServiceCountBatchSize) {
-		var caseExpr strings.Builder
-		args := make([]any, 0, 2*len(chunk))
-		caseExpr.WriteString("CASE id")
-		for _, id := range chunk {
-			caseExpr.WriteString(" WHEN ? THEN ?")
-			args = append(args, id, inferredCounts[id])
-		}
-		caseExpr.WriteString(" ELSE service_count END")
-		if err := s.db.WithContext(ctx).Model(&Project{}).
-			Where("id IN ? AND service_count = 0", chunk).
-			Update("service_count", gorm.Expr(caseExpr.String(), args...)).Error; err != nil {
-			slog.WarnContext(ctx, "failed to persist inferred project service counts", "count", len(chunk), "error", err)
-			break
-		}
-	}
-	return rows
 }
 
 // GetProjectTags returns the effective UI and Compose tag associations for a project.

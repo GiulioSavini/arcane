@@ -419,25 +419,15 @@ func SanitizeProjectName(name string) string {
 	}, name)
 }
 
-// IsSafeSubdirectory returns true if subdir is a subdirectory of baseDir (absolute, normalized)
+// IsSafeSubdirectory reports whether subdir is baseDir or lies beneath it, comparing absolute paths.
 func IsSafeSubdirectory(baseDir, subdir string) bool {
 	absBase, err1 := filepath.Abs(baseDir)
 	absSubdir, err2 := filepath.Abs(subdir)
 	if err1 != nil || err2 != nil {
 		return false
 	}
-
-	// Ensure both paths end consistently for comparison
-	absBase = filepath.Clean(absBase)
-	absSubdir = filepath.Clean(absSubdir)
-
 	rel, err := filepath.Rel(absBase, absSubdir)
-	if err != nil {
-		return false
-	}
-
-	// The path must not escape the base directory
-	return !strings.HasPrefix(rel, "..") && !filepath.IsAbs(rel)
+	return err == nil && filepath.IsLocal(rel)
 }
 
 // ResolvePathWithinDir resolves path and rejects paths that escape baseDir.

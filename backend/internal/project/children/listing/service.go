@@ -7,8 +7,8 @@ import (
 	"context"
 	"log/slog"
 	"maps"
-	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -19,7 +19,6 @@ import (
 	"github.com/samber/mo"
 	"go.getarcane.app/docker"
 	"go.getarcane.app/kit/pkg"
-	"go.getarcane.app/kit/pkg/mapping"
 	"go.getarcane.app/sys/cgroup"
 	"go.getarcane.app/updater/labels"
 	"gorm.io/gorm"
@@ -43,11 +42,14 @@ func New(
 	imageService *image.ImageService,
 	summarizeRuns func(imageRefs []string, services []project.RuntimeService, scoped map[string]*imagetypes.UpdateInfo) *project.UpdateInfo,
 ) *Service {
-	return &Service{containers: containers, imageService: imageService, summarizeRuns: summarizeRuns}
+	return &Service{
+		containers:    containers,
+		imageService:  imageService,
+		summarizeRuns: summarizeRuns,
+	}
 }
 
-// Snapshot is the compose container listing shared by
-// every row of one list request, grouped once by compose project name.
+// Snapshot is the compose container listing shared by every row of one list request, grouped by project.
 type Snapshot struct {
 	Containers          []container.Summary
 	byProject           map[string][]container.Summary
@@ -72,17 +74,14 @@ func (s *Service) Snapshot(ctx context.Context) Snapshot {
 	}
 }
 
-// Containers returns the snapshot's compose containers and listing error.
-
-// ProjectContainers matches project names first, then the working
-// directory if it identifies exactly one Compose project group.
+// ProjectContainers matches project names first, then the working directory if it identifies one Compose project.
 func ProjectContainers(p project.Record, containersByProject map[string][]container.Summary) []container.Summary {
 	normName := projects.NormalizeProjectName(p.Name)
 	if c := containersByProject[normName]; len(c) > 0 {
 		return c
 	}
-	if p.ComposeProjectName != nil && *p.ComposeProjectName != normName {
-		if c := containersByProject[*p.ComposeProjectName]; len(c) > 0 {
+	if kit.FromPtr(p.ComposeProjectName) != normName {
+		if c := containersByProject[kit.FromPtr(p.ComposeProjectName)]; len(c) > 0 {
 			return c
 		}
 	}
@@ -109,28 +108,25 @@ func ProjectContainers(p project.Record, containersByProject map[string][]contai
 
 // RuntimeServiceFromContainer derives service state from a labeled container.
 func RuntimeServiceFromContainer(catalog string, c container.Summary, meta projects.ArcaneComposeMetadata, currentContainerID string, currentContainerErr error) project.RuntimeService {
-	svcName := docker.ComposeServiceLabel(c.Labels)
-
-	var health *string
-	statusLower := strings.ToLower(c.Status)
-	switch {
-	case strings.Contains(statusLower, "(healthy)"):
-		health = new("healthy")
-	case strings.Contains(statusLower, "(unhealthy)"):
-		health = new("unhealthy")
-	case strings.Contains(statusLower, "(starting)"):
-		health = new("starting")
-	}
-
-	resolvedIcon := iconcatalog.Resolve(catalog, cmp.Or(projects.FindArcaneIconSet(c.Labels), meta.ServiceIconSets[svcName], meta.ProjectIcon))
+	resolvedIcon := iconcatalog.Resolve(catalog, cmp.Or(projects.FindArcaneIconSet(c.Labels), meta.ServiceIconSets[docker.ComposeServiceLabel(c.Labels)], meta.ProjectIcon))
 	return project.RuntimeService{
-		Name:             svcName,
-		Image:            c.Image,
-		Status:           string(c.State),
-		ContainerID:      c.ID,
-		ContainerName:    docker.ContainerNameFromNames(c.Names),
-		Ports:            projects.FormatDockerPorts(c.Ports),
-		Health:           health,
+		Name:          docker.ComposeServiceLabel(c.Labels),
+		Image:         c.Image,
+		Status:        string(c.State),
+		ContainerID:   c.ID,
+		ContainerName: docker.ContainerNameFromNames(c.Names),
+		Ports:         projects.FormatDockerPorts(c.Ports),
+		Health: func() *string {
+			switch status := strings.ToLower(c.Status); {
+			case strings.Contains(status, "(healthy)"):
+				return new("healthy")
+			case strings.Contains(status, "(unhealthy)"):
+				return new("unhealthy")
+			case strings.Contains(status, "(starting)"):
+				return new("starting")
+			}
+			return nil
+		}(),
 		IconLightURL:     resolvedIcon.IconLightURL,
 		IconDarkURL:      resolvedIcon.IconDarkURL,
 		ContainerLabels:  c.Labels,
@@ -182,122 +178,97 @@ func ProjectStatus(services []project.RuntimeService) string {
 // StatusCounts totals archived, running and stopped projects from live
 // containers, falling back to stored status when Docker is unavailable.
 func (s *Service) StatusCounts(ctx context.Context, records []project.Record) project.StatusCounts {
-	counts := project.StatusCounts{TotalProjects: len(records)}
-	active := make([]project.Record, 0, len(records))
-	for _, p := range records {
-		if p.IsArchived {
-			counts.ArchivedProjects++
-			continue
-		}
-		active = append(active, p)
-	}
-
 	containers, err := s.containers(ctx)
 	if err != nil {
 		slog.ErrorContext(ctx, "Failed to list global compose containers for counts", "error", err)
 	}
 	containersByProject := GroupComposeContainersByProject(containers)
-	for _, p := range active {
-		status := p.Status
-		if err == nil {
-			projectContainers := ProjectContainers(p, containersByProject)
-			services := make([]project.RuntimeService, 0, len(projectContainers))
-			for _, c := range projectContainers {
+	var archived, running, stopped int
+	for _, p := range records {
+		if p.IsArchived {
+			archived++
+			continue
+		}
+		switch func() string {
+			if err != nil {
+				return p.Status
+			}
+			var services []project.RuntimeService
+			for _, c := range ProjectContainers(p, containersByProject) {
 				services = append(services, project.RuntimeService{Status: string(c.State)})
 			}
-			status = kit.Ternary(len(services) > 0, ProjectStatus(services), project.StatusStopped)
-		}
-		switch status {
+			return kit.Ternary(len(services) > 0, ProjectStatus(services), project.StatusStopped)
+		}() {
 		case project.StatusRunning, project.StatusPartiallyRunning, project.StatusDeploying, project.StatusRestarting:
-			counts.RunningProjects++
+			running++
 		case project.StatusStopped, project.StatusStopping:
-			counts.StoppedProjects++
+			stopped++
 		}
 	}
-	return counts
+	return project.StatusCounts{
+		TotalProjects:    len(records),
+		RunningProjects:  running,
+		StoppedProjects:  stopped,
+		ArchivedProjects: archived,
+	}
 }
 
 // RelativePath returns projectPath relative to projectsDir, or "" outside it.
 func RelativePath(projectsDir, projectPath string) string {
-	if strings.TrimSpace(projectsDir) == "" {
+	if strings.TrimSpace(projectsDir) == "" || !projects.IsSafeSubdirectory(projectsDir, projectPath) || filepath.Clean(projectPath) == filepath.Clean(projectsDir) {
 		return ""
 	}
-
 	relativePath, err := filepath.Rel(projectsDir, filepath.Clean(projectPath))
-	if err != nil {
-		return ""
-	}
-	if relativePath == "." {
-		return ""
-	}
-	if relativePath == ".." || strings.HasPrefix(relativePath, ".."+string(os.PathSeparator)) {
-		return ""
-	}
-
-	return filepath.ToSlash(relativePath)
+	return kit.Ternary(err == nil, filepath.ToSlash(relativePath), "")
 }
 
 // row builds the fields list filters, search and sort read from database
 // columns and the container snapshot; compose metadata is left for ApplyPresentation.
-func row(projectsDir, catalog string, p project.Record, snapshot Snapshot) project.Details {
-	var resp project.Details
-	_ = mapping.MapStruct(p, &resp)
-
-	resp.CreatedAt = p.CreatedAt.Format(time.RFC3339)
-	resp.UpdatedAt = p.UpdatedAt.Format(time.RFC3339)
-	resp.IsArchived = p.IsArchived
-	resp.ArchivedAt = p.ArchivedAt
-	resp.DirName = mo.PointerToOption(p.DirName).OrEmpty()
-	resp.RelativePath = RelativePath(projectsDir, p.Path)
-	resp.GitOpsManagedBy = p.GitOpsManagedBy
-	resp.HasBuildDirective = p.BuildImageRefsJSON != nil && len(projects.ParseImageRefsJSON(*p.BuildImageRefsJSON)) > 0
-	// Use DB service count as the source of truth for "Total Services"
-	// since we are not parsing the YAML here.
-	resp.ServiceCount = p.ServiceCount
-	if snapshot.Err != nil {
-		resp.Status = project.StatusUnknown
-		return resp
-	}
-
-	projectContainers := ProjectContainers(p, snapshot.byProject)
-	services := make([]project.RuntimeService, 0, len(projectContainers))
-	for _, c := range projectContainers {
-		service := RuntimeServiceFromContainer(catalog, c, projects.ArcaneComposeMetadata{}, snapshot.currentContainerID, snapshot.currentContainerErr)
-		if service.RedeployDisabled {
-			resp.RedeployDisabled = true
-		}
-		services = append(services, service)
+func row(projectsDir, catalog string, p project.Record, snapshot Snapshot, tags []project.Tag) project.Details {
+	var services []project.RuntimeService
+	for _, c := range ProjectContainers(p, snapshot.byProject) {
+		services = append(services, RuntimeServiceFromContainer(catalog, c, projects.ArcaneComposeMetadata{}, snapshot.currentContainerID, snapshot.currentContainerErr))
 	}
 	_, runningCount := ServiceCounts(services)
-	resp.RuntimeServices = services
-	resp.RunningCount = runningCount
-	// Newly discovered projects have no persisted count yet. Infer it from the
-	// live containers; the parent persists the inferred value so
-	// SQL sorting and pagination on service_count see it on later requests.
-	if resp.ServiceCount == 0 && len(services) > 0 {
-		resp.ServiceCount = len(services)
+	return project.Details{
+		Tags:            tags,
+		StatusReason:    p.StatusReason,
+		GitOpsManagedBy: p.GitOpsManagedBy,
+		ArchivedAt:      p.ArchivedAt,
+		// Status uses the live services, not the possibly stale stored ServiceCount.
+		Status: func() string {
+			switch {
+			case snapshot.Err != nil:
+				return project.StatusUnknown
+			case len(services) == 0:
+				return project.StatusStopped
+			}
+			return ProjectStatus(services)
+		}(),
+		DirName:         mo.PointerToOption(p.DirName).OrEmpty(),
+		Name:            p.Name,
+		RelativePath:    RelativePath(projectsDir, p.Path),
+		ID:              p.ID,
+		Path:            p.Path,
+		UpdatedAt:       p.UpdatedAt.Format(time.RFC3339),
+		CreatedAt:       p.CreatedAt.Format(time.RFC3339),
+		RuntimeServices: services,
+		RunningCount:    kit.Ternary(snapshot.Err != nil, p.RunningCount, runningCount),
+		// Newly discovered projects have no persisted count yet; infer it from live containers so the parent can persist it.
+		ServiceCount:      cmp.Or(p.ServiceCount, len(services)),
+		IsArchived:        p.IsArchived,
+		HasBuildDirective: len(projects.ParseImageRefsJSON(kit.FromPtr(p.BuildImageRefsJSON))) > 0,
+		RedeployDisabled:  slices.ContainsFunc(services, func(service project.RuntimeService) bool { return service.RedeployDisabled }),
 	}
-
-	// Status uses the live services, not the possibly stale stored ServiceCount.
-	switch {
-	case runningCount > 0 && runningCount >= len(services):
-		resp.Status = project.StatusRunning
-	case runningCount > 0:
-		resp.Status = project.StatusPartiallyRunning
-	default:
-		resp.Status = project.StatusStopped
-	}
-
-	return resp
 }
 
 // Rows builds list rows and reports service counts inferred from live
 // containers for projects whose stored count is still zero.
-func Rows(projectsDir, catalog string, records []project.Record, snapshot Snapshot) ([]project.Details, map[string]int) {
+func Rows(projectsDir, catalog string, records []project.Record, snapshot Snapshot, tagsByProject map[string][]project.Tag) ([]project.Details, map[string]int) {
 	rows := make([]project.Details, len(records))
 	inferredCounts := make(map[string]int)
 	for i, p := range records {
-		rows[i] = row(projectsDir, catalog, p, snapshot)
+		rows[i] = row(projectsDir, catalog, p, snapshot, tagsByProject[p.ID])
 		if p.ServiceCount == 0 && rows[i].ServiceCount > 0 {
 			inferredCounts[p.ID] = rows[i].ServiceCount
 		}
@@ -305,22 +276,72 @@ func Rows(projectsDir, catalog string, records []project.Record, snapshot Snapsh
 	return rows, inferredCounts
 }
 
-// ApplyPresentation fills the fields filtering and sorting never read:
-// project and service icons, custom URLs, and the env access probe. records,
-// details and metas must align by index.
-func ApplyPresentation(ctx context.Context, projectsDir, catalog string, records []project.Record, details []project.Details, metas []projects.ArcaneComposeMetadata) {
-	for i := range records {
-		resp := &details[i]
+// ApplyPresentation returns details with the fields filtering and sorting never
+// read: project and service icons, custom URLs, and the env access probe.
+// records, details and metas must align by index.
+func ApplyPresentation(ctx context.Context, projectsDir, catalog string, records []project.Record, details []project.Details, metas []projects.ArcaneComposeMetadata) []project.Details {
+	out := make([]project.Details, 0, len(details))
+	for i, d := range details {
 		icon := iconcatalog.Resolve(catalog, metas[i].ProjectIcon)
-		resp.IconLightURL, resp.IconDarkURL = icon.IconLightURL, icon.IconDarkURL
-		resp.URLs = metas[i].ProjectURLS
-		resp.ConfigurationError = projects.CheckProjectEnvAccess(ctx, projectsDir, records[i].Path)
-		for k := range resp.RuntimeServices {
-			service := &resp.RuntimeServices[k]
+		services := make([]project.RuntimeService, 0, len(d.RuntimeServices))
+		for _, service := range d.RuntimeServices {
 			localIcon := iconcatalog.Resolve(catalog, cmp.Or(projects.FindArcaneIconSet(service.ContainerLabels), metas[i].ServiceIconSets[service.Name], metas[i].ProjectIcon))
-			service.IconLightURL, service.IconDarkURL = localIcon.IconLightURL, localIcon.IconDarkURL
+			services = append(services, project.RuntimeService{ //exhaustruct:enforce
+				ContainerLabels:  service.ContainerLabels,
+				ImageID:          service.ImageID,
+				Name:             service.Name,
+				Image:            service.Image,
+				Status:           service.Status,
+				ContainerID:      service.ContainerID,
+				ContainerName:    service.ContainerName,
+				Ports:            service.Ports,
+				Health:           service.Health,
+				IconLightURL:     localIcon.IconLightURL,
+				IconDarkURL:      localIcon.IconDarkURL,
+				ServiceConfig:    service.ServiceConfig,
+				RedeployDisabled: service.RedeployDisabled,
+			})
 		}
+		out = append(out, project.Details{ //exhaustruct:enforce
+			EnvironmentTag:     d.EnvironmentTag,
+			Tags:               d.Tags,
+			StatusReason:       d.StatusReason,
+			ActivityID:         d.ActivityID,
+			LastSyncCommit:     d.LastSyncCommit,
+			GitOpsManagedBy:    d.GitOpsManagedBy,
+			UpdateInfo:         d.UpdateInfo,
+			ArchivedAt:         d.ArchivedAt,
+			Status:             d.Status,
+			DirName:            d.DirName,
+			ComposeContent:     d.ComposeContent,
+			ComposeFileName:    d.ComposeFileName,
+			ComposeFiles:       d.ComposeFiles,
+			EnvContent:         d.EnvContent,
+			OverrideContent:    d.OverrideContent,
+			OverrideFileName:   d.OverrideFileName,
+			Name:               d.Name,
+			GitRepositoryURL:   d.GitRepositoryURL,
+			IconLightURL:       icon.IconLightURL,
+			RelativePath:       d.RelativePath,
+			ID:                 d.ID,
+			IconDarkURL:        icon.IconDarkURL,
+			Path:               d.Path,
+			UpdatedAt:          d.UpdatedAt,
+			CreatedAt:          d.CreatedAt,
+			RuntimeServices:    services,
+			Services:           d.Services,
+			URLs:               metas[i].ProjectURLS,
+			IncludeFiles:       d.IncludeFiles,
+			RunningCount:       d.RunningCount,
+			ServiceCount:       d.ServiceCount,
+			IsDiscovered:       d.IsDiscovered,
+			IsArchived:         d.IsArchived,
+			HasBuildDirective:  d.HasBuildDirective,
+			RedeployDisabled:   d.RedeployDisabled,
+			ConfigurationError: projects.CheckProjectEnvAccess(ctx, projectsDir, records[i].Path),
+		})
 	}
+	return out
 }
 
 // KnownComposeProjectNames collects every name a tracked project uses.
@@ -352,8 +373,7 @@ func (s *Service) CountDiscoveredUpdates(ctx context.Context, allContainers []co
 	return len(s.DiscoveredUpdateRows(ctx, composeContainers, known, catalog))
 }
 
-// DiscoveredUpdateRows builds rows for running compose projects Arcane does
-// not track that have a pending image update.
+// DiscoveredUpdateRows builds rows for untracked running compose projects that have a pending image update.
 func (s *Service) DiscoveredUpdateRows(
 	ctx context.Context,
 	composeContainers []container.Summary,
@@ -385,14 +405,14 @@ func (s *Service) DiscoveredUpdateRows(
 		return nil
 	}
 
-	var scoped map[string]*imagetypes.UpdateInfo
-	if s.imageService != nil {
-		var err error
-		if scoped, err = s.imageService.GetUpdateInfoByContainers(ctx, composeContainers); err != nil {
+	scoped := func() map[string]*imagetypes.UpdateInfo {
+		info, err := s.imageService.GetUpdateInfoByContainers(ctx, composeContainers)
+		if err != nil {
 			slog.WarnContext(ctx, "failed to fetch discovered project tag updates", "error", err)
-			scoped = nil
+			return nil
 		}
-	}
+		return info
+	}()
 	rows := make([]project.Details, 0, len(containersByProject))
 	for projectName, projectContainers := range containersByProject {
 		// One runtime service per distinct service name and image.
@@ -420,43 +440,32 @@ func (s *Service) DiscoveredUpdateRows(
 				IconDarkURL:     resolvedIcon.IconDarkURL,
 			})
 		}
-		imageRefs := projects.ImageRefsFromRuntimeServices(runtimeServices)
 		checkServices := make([]project.RuntimeService, 0, len(projectContainers))
 		for _, c := range projectContainers {
-			checkServices = append(checkServices, project.RuntimeService{Name: docker.ComposeServiceLabel(c.Labels), ContainerID: c.ID, Image: c.Image, ImageID: c.ImageID, ContainerLabels: c.Labels})
+			checkServices = append(checkServices, project.RuntimeService{
+				ContainerLabels: c.Labels,
+				ImageID:         c.ImageID,
+				Name:            docker.ComposeServiceLabel(c.Labels),
+				Image:           c.Image,
+				ContainerID:     c.ID,
+			})
 		}
-		updateInfo := s.summarizeRuns(imageRefs, checkServices, scoped)
-		if updateInfo == nil || !updateInfo.HasUpdate {
+		updateInfo := s.summarizeRuns(projects.ImageRefsFromRuntimeServices(runtimeServices), checkServices, scoped)
+		if !kit.FromPtr(updateInfo).HasUpdate {
 			continue
 		}
 
 		serviceCount, runningCount := ServiceCounts(runtimeServices)
-		// Unlike tracked rows, a discovered project without services is unknown.
-		status := project.StatusStopped
-		switch {
-		case serviceCount == 0:
-			status = project.StatusUnknown
-		case runningCount >= serviceCount:
-			status = project.StatusRunning
-		case runningCount > 0:
-			status = project.StatusPartiallyRunning
-		}
-
-		lastCheckedAt := ""
-		if updateInfo.LastCheckedAt != nil {
-			lastCheckedAt = updateInfo.LastCheckedAt.Format(time.RFC3339)
-		}
-
 		rows = append(rows, project.Details{
-			ID:              "compose:" + projectName,
-			Name:            projectName,
-			Path:            "",
-			Status:          status,
+			ID:   "compose:" + projectName,
+			Name: projectName,
+			// Unlike tracked rows, a discovered project without services is unknown.
+			Status:          ProjectStatus(runtimeServices),
 			ServiceCount:    serviceCount,
 			RunningCount:    runningCount,
 			IsDiscovered:    true,
-			CreatedAt:       lastCheckedAt,
-			UpdatedAt:       lastCheckedAt,
+			CreatedAt:       kit.Ternary(updateInfo.LastCheckedAt != nil, kit.FromPtr(updateInfo.LastCheckedAt).Format(time.RFC3339), ""),
+			UpdatedAt:       kit.Ternary(updateInfo.LastCheckedAt != nil, kit.FromPtr(updateInfo.LastCheckedAt).Format(time.RFC3339), ""),
 			RuntimeServices: runtimeServices,
 			UpdateInfo:      updateInfo,
 		})
@@ -534,11 +543,7 @@ func PaginationConfig() pagination.Config[project.Details] {
 			{
 				Key: "updates",
 				Fn: func(p project.Details, filterValue string) bool {
-					status := "unknown"
-					if p.UpdateInfo != nil && strings.TrimSpace(p.UpdateInfo.Status) != "" {
-						status = p.UpdateInfo.Status
-					}
-					return strings.EqualFold(strings.TrimSpace(status), strings.TrimSpace(filterValue))
+					return strings.EqualFold(cmp.Or(strings.TrimSpace(kit.FromPtr(p.UpdateInfo).Status), "unknown"), strings.TrimSpace(filterValue))
 				},
 			},
 			{
@@ -556,16 +561,10 @@ func PaginationConfig() pagination.Config[project.Details] {
 				NoSplit: true,
 				Fn: func(p project.Details, filterValue string) bool {
 					key, value, hasValue := strings.Cut(filterValue, "=")
-					key = strings.TrimSpace(key)
-					if key == "" {
-						return true
-					}
-					for _, service := range p.RuntimeServices {
-						if actual, ok := service.ContainerLabels[key]; ok && (!hasValue || actual == value) {
-							return true
-						}
-					}
-					return false
+					return strings.TrimSpace(key) == "" || slices.ContainsFunc(p.RuntimeServices, func(service project.RuntimeService) bool {
+						actual, ok := service.ContainerLabels[strings.TrimSpace(key)]
+						return ok && (!hasValue || actual == value)
+					})
 				},
 			},
 		},
@@ -575,12 +574,20 @@ func PaginationConfig() pagination.Config[project.Details] {
 // Page searches, orders and paginates rows by their derived fields and returns
 // the page indexes of tracked rows still needing enrichment.
 func Page(items []project.Details, params pagination.QueryParams, tracked func(id string) bool) (pagination.FilterResult[project.Details], []int) {
-	// Tags are filtered in the database query.
-	if _, exists := params.Filters["tags"]; exists {
-		params.Filters = maps.Clone(params.Filters)
-		delete(params.Filters, "tags")
-	}
-	result := PaginationConfig().SearchOrderAndPaginate(items, params)
+	result := PaginationConfig().SearchOrderAndPaginate(items, pagination.QueryParams{
+		SearchQuery: params.SearchQuery,
+		SortParams:  params.SortParams,
+		Params:      params.Params,
+		// Tags are filtered in the database query.
+		Filters: func() map[string]string {
+			if _, exists := params.Filters["tags"]; !exists {
+				return params.Filters
+			}
+			filters := maps.Clone(params.Filters)
+			delete(filters, "tags")
+			return filters
+		}(),
+	})
 	pageIndexes := make([]int, 0, len(result.Items))
 	for i, item := range result.Items {
 		if tracked(item.ID) {

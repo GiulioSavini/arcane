@@ -8,6 +8,7 @@ import (
 
 	"github.com/getarcaneapp/arcane/types/v2/gitops"
 	projecttypes "github.com/getarcaneapp/arcane/types/v2/project"
+	kit "go.getarcane.app/kit/pkg"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 
@@ -130,10 +131,7 @@ func (s GitOpsSync) BackupState() string {
 	if s.Mode != gitops.SyncModeBackup {
 		return ""
 	}
-	status := ""
-	if s.LastSyncStatus != nil {
-		status = *s.LastSyncStatus
-	}
+	status := kit.FromPtr(s.LastSyncStatus)
 	switch {
 	case status == "running":
 		return gitops.BackupStateBackingUp
@@ -158,7 +156,7 @@ func (GitOpsSync) TableName() string {
 
 // SyncedFileList decodes the tracked synced-file paths.
 func (s GitOpsSync) SyncedFileList() []string {
-	if s.SyncedFiles == nil || *s.SyncedFiles == "" {
+	if kit.FromPtr(s.SyncedFiles) == "" {
 		return nil
 	}
 	var files []string
@@ -170,7 +168,7 @@ func (s GitOpsSync) SyncedFileList() []string {
 
 // BackupSnapshot decodes the file hashes recorded by the last backup push.
 func (s GitOpsSync) BackupSnapshot() map[string]string {
-	if s.LastBackupSnapshot == nil || *s.LastBackupSnapshot == "" {
+	if kit.FromPtr(s.LastBackupSnapshot) == "" {
 		return nil
 	}
 	var hashes map[string]string

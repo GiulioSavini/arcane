@@ -39,6 +39,11 @@ import (
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/utils/imageref"
 )
 
+var testDockerService = &docker.DockerClientService{Client: func() *client.Client {
+	cli, _ := client.New(client.WithHost("tcp://127.0.0.1:1"), client.WithAPIVersion("1.41"))
+	return cli
+}()}
+
 func setupDashboardServiceTestDB(t *testing.T) (*database.DB, *settings.SettingsService) {
 	t.Helper()
 
@@ -198,7 +203,7 @@ func TestDashboardService_GetSnapshot_ReturnsDashboardSnapshot(t *testing.T) {
 		Status:  project.ProjectStatusStopped,
 	}).Error)
 	imageSvc := image.NewImageService(db, nil, nil, nil, nil, nil, nil, nil)
-	projectSvc := project.NewProjectService(db, settingsSvc, nil, imageSvc, nil, nil, nil, nil, config.Load(), nil, nil)
+	projectSvc := project.NewProjectService(db, settingsSvc, nil, imageSvc, testDockerService, nil, nil, nil, config.Load(), nil, nil)
 	svc := NewDashboardService(db, dockerSvc, nil, projectSvc, imageSvc, settingsSvc, nil, nil, nil, volume.NewVolumeService(db, nil, nil, nil, nil, nil, nil, nil, nil, nil))
 
 	snapshot, err := svc.GetSnapshot(t.Context(), DashboardActionItemsOptions{}, true)

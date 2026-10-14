@@ -178,7 +178,7 @@ func TestMapProjectToDto_SetsRedeployDisabledFromRuntimeServices(t *testing.T) {
 						},
 					},
 				},
-			}, currentContainerID: tt.currentContainerID, currentContainerErr: tt.currentErr})
+			}, currentContainerID: tt.currentContainerID, currentContainerErr: tt.currentErr}, nil)
 
 			require.Equal(t, tt.wantProject, details.RedeployDisabled)
 			require.Len(t, details.RuntimeServices, 1)
@@ -205,7 +205,7 @@ func TestProjectListRow_SeedsHasBuildDirectiveFromPersistedRefs(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			p := project.Record{ID: tt.name, Name: tt.name, Path: t.TempDir(), UpdatedAt: &now, BuildImageRefsJSON: tt.buildImageRefsJSON}
-			assert.Equal(t, tt.want, row(projectsDirectory, iconcatalog.DefaultCatalog, p, Snapshot{}).HasBuildDirective)
+			assert.Equal(t, tt.want, row(projectsDirectory, iconcatalog.DefaultCatalog, p, Snapshot{}, nil).HasBuildDirective)
 		})
 	}
 }
