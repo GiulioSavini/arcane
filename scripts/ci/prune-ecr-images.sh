@@ -52,15 +52,24 @@ done
 for repo in manager agent; do
     directory="$workspace/$repo"
     deleted=$(wc -l <"$directory/delete" | tr -d ' ')
-    while [[ -s "$directory/delete" ]]; do
-        args=()
-        while read -r digest; do
-            args+=("imageDigest=$digest")
-        done < <(head -n 100 "$directory/delete")
-        aws ecr-public batch-delete-image --repository-name "$repo" --image-ids "${args[@]}" --output json >"$directory/result.json"
-        jq -e '(.failures // [] | length) == 0' "$directory/result.json" >/dev/null
-        tail -n +101 "$directory/delete" >"$directory/remaining"
-        mv "$directory/remaining" "$directory/delete"
+    # ECR refuses to delete a manifest an index still references, so indexes go first.
+    jq -r 'select(.manifests) | .digest' "$directory/manifests/"*.json | sort -u >"$directory/indexes"
+    comm -12 "$directory/delete" "$directory/indexes" >"$directory/delete-indexes"
+    comm -23 "$directory/delete" "$directory/indexes" >"$directory/delete-manifests"
+    for pass in delete-indexes delete-manifests; do
+        while [[ -s "$directory/$pass" ]]; do
+            args=()
+            while read -r digest; do
+                args+=("imageDigest=$digest")
+            done < <(head -n 100 "$directory/$pass")
+            aws ecr-public batch-delete-image --repository-name "$repo" --image-ids "${args[@]}" --output json >"$directory/result.json"
+            if ! jq -e '(.failures // [] | length) == 0' "$directory/result.json" >/dev/null; then
+                jq '.failures' "$directory/result.json" >&2
+                exit 1
+            fi
+            tail -n +101 "$directory/$pass" >"$directory/remaining"
+            mv "$directory/remaining" "$directory/$pass"
+        done
     done
     echo "$repo: deleted $deleted stale manifests" >>"$GITHUB_STEP_SUMMARY"
 done
