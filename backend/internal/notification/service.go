@@ -633,8 +633,14 @@ func (s *NotificationService) notifyEnabledProviders(
 	}
 
 	if s.apnsSvc != nil {
-		if enqueueErr := s.apnsSvc.Enqueue(ctx, target.EnvironmentID, target.EnvironmentName, eventType, logRef, metadata); enqueueErr != nil {
+		// A queued push counts as a delivery, so push-only setups still mark
+		// updates notified instead of re-sending them on every poll.
+		enqueued, enqueueErr := s.apnsSvc.Enqueue(ctx, target.EnvironmentID, target.EnvironmentName, eventType, logRef, metadata)
+		if enqueueErr != nil {
 			slog.WarnContext(ctx, "Failed to enqueue mobile push notification", "error", enqueueErr)
+		}
+		if enqueued {
+			delivered++
 		}
 	}
 
@@ -880,8 +886,13 @@ func (s *NotificationService) sendBatchImageUpdateNotificationForTarget(ctx cont
 	}
 	content := s.templates.BatchImageUpdate(target.EnvironmentName, updatesWithChanges)
 	content.Vars = notifications.EventVars(target.EnvironmentName, target.EnvironmentID, notifications.NotificationEventImageUpdate)
-	logRef := strings.Join(slices.Collect(maps.Keys(updatesWithChanges)), ", ")
-	return s.notifyEnabledProviders(ctx, target, notifications.NotificationEventImageUpdate, logRef, metadata, content)
+	return s.notifyEnabledProviders(ctx, target, notifications.NotificationEventImageUpdate, batchImageUpdateLogRefInternal(updatesWithChanges), metadata, content)
+}
+
+// batchImageUpdateLogRefInternal lists the image refs in sorted order. The push body is built
+// from it, and the relay dedupes on that body, so a repeat of the same set must read the same.
+func batchImageUpdateLogRefInternal(updates map[string]*imageupdate.Response) string {
+	return strings.Join(slices.Sorted(maps.Keys(updates)), ", ")
 }
 
 func (s *NotificationService) SendPruneReportNotification(ctx context.Context, result *system.PruneAllResult) error {

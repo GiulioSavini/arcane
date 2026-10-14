@@ -441,13 +441,15 @@ func truncateInternal(s string, limit int) string {
 	return string(r[:limit-1]) + "…"
 }
 
-func (s *ApnsService) Enqueue(ctx context.Context, environmentID, environmentName string, eventType notifications.NotificationEventType, subject string, metadata database.JSON) error {
+// Enqueue queues a push for every subscribed device and reports whether one was
+// queued. The outbox retries delivery to the relay, so a queued push counts as delivered.
+func (s *ApnsService) Enqueue(ctx context.Context, environmentID, environmentName string, eventType notifications.NotificationEventType, subject string, metadata database.JSON) (bool, error) {
 	if !s.Enabled(ctx) {
-		return nil
+		return false, nil
 	}
 	recipients, err := s.recipientsInternal(ctx, environmentID, eventType)
 	if err != nil || len(recipients) == 0 {
-		return err
+		return false, err
 	}
 
 	batchCount := 0
@@ -499,11 +501,11 @@ func (s *ApnsService) Enqueue(ctx context.Context, environmentID, environmentNam
 	}
 	raw, err := json.Marshal(envelope)
 	if err != nil {
-		return fmt.Errorf("failed to marshal push envelope: %w", err)
+		return false, fmt.Errorf("failed to marshal push envelope: %w", err)
 	}
 	entry := OutboxEntry{EventID: envelope.EventID, Envelope: string(raw), NextAttemptAt: time.Now()}
 	if enqueueNotificationErr := s.db.WithContext(ctx).Create(&entry).Error; enqueueNotificationErr != nil {
-		return fmt.Errorf("failed to enqueue push notification: %w", enqueueNotificationErr)
+		return false, fmt.Errorf("failed to enqueue push notification: %w", enqueueNotificationErr)
 	}
 	go func() {
 		drainCtx := context.WithoutCancel(ctx)
@@ -511,7 +513,7 @@ func (s *ApnsService) Enqueue(ctx context.Context, environmentID, environmentNam
 			slog.WarnContext(drainCtx, "Push outbox drain failed", "error", drainOutboxErr)
 		}
 	}()
-	return nil
+	return true, nil
 }
 
 func (s *ApnsService) recipientsInternal(ctx context.Context, environmentID string, eventType notifications.NotificationEventType) ([]string, error) {

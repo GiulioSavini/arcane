@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"log/slog"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -792,4 +793,16 @@ func TestNotificationService_AgentDispatchHTTPFailureFallsBackToTunnel(t *testin
 	})
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "failed to dispatch notification to manager")
+}
+
+func TestBatchImageUpdateLogRef_IsSortedSoRepeatsMatch(t *testing.T) {
+	updates := map[string]*imageupdate.Response{}
+	for _, ref := range []string{"redis:7", "nginx:latest", "postgres:16", "alpine:3", "caddy:2"} {
+		updates[ref] = newNotificationTestUpdateInfo()
+	}
+
+	want := "alpine:3, caddy:2, nginx:latest, postgres:16, redis:7"
+	for range 20 {
+		require.Equal(t, want, batchImageUpdateLogRefInternal(maps.Clone(updates)))
+	}
 }
