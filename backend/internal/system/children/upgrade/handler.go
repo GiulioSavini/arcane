@@ -2,8 +2,8 @@ package upgrade
 
 import (
 	"context"
-	"errors"
 	"log/slog"
+	"net/http"
 
 	"github.com/danielgtaylor/huma/v2"
 	"github.com/getarcaneapp/arcane/types/v2/base"
@@ -97,12 +97,8 @@ func (h *Handler) TriggerUpgrade(ctx context.Context, input *TriggerUpgradeInput
 	err = h.service.TriggerUpgradeAsync(utils.ActivityRuntimeContext(ctx, h.appCtx), *user, kit.FromPtr(input.Body).TargetVersion)
 	if err != nil {
 		slog.ErrorContext(ctx, "System upgrade failed", "error", err, "user", user.Username)
-
-		if errors.Is(err, common.ErrUpgradeInProgress) {
-			return nil, huma.Error409Conflict("Failed to initiate upgrade: " + err.Error())
-		}
-
-		return nil, huma.Error500InternalServerError("Failed to initiate upgrade: " + err.Error())
+		apiErr := common.ToAPIError(err)
+		return nil, huma.NewError(apiErr.HTTPStatus(), "Failed to initiate upgrade: "+err.Error())
 	}
 
 	message := kit.Ternary(
@@ -124,7 +120,7 @@ func (h *Handler) TriggerUpgrade(ctx context.Context, input *TriggerUpgradeInput
 
 // TriggerUpdateAll starts a fleet-wide update: every remote agent in turn, then the manager last.
 func (h *Handler) TriggerUpdateAll(ctx context.Context, input *TriggerUpdateAllInput) (*handlerutil.Out[system.EnvironmentUpdateJob], error) {
-	if h.cfg != nil && h.cfg.AgentMode {
+	if h.cfg.AgentMode {
 		return nil, huma.Error400BadRequest("update-all is managed on the Arcane manager")
 	}
 
@@ -137,8 +133,8 @@ func (h *Handler) TriggerUpdateAll(ctx context.Context, input *TriggerUpdateAllI
 
 	job, err := h.service.StartUpdateAll(ctx, *user)
 	if err != nil {
-		if errors.Is(err, common.ErrUpdateAllInProgress) {
-			return nil, huma.Error409Conflict(err.Error())
+		if apiErr := common.ToAPIError(err); apiErr.HTTPStatus() != http.StatusInternalServerError {
+			return nil, huma.NewError(apiErr.HTTPStatus(), apiErr.Message)
 		}
 		return nil, huma.Error500InternalServerError("Failed to initiate upgrade: " + err.Error())
 	}
@@ -154,7 +150,7 @@ func (h *Handler) TriggerUpdateAll(ctx context.Context, input *TriggerUpdateAllI
 
 // GetUpdateAllStatus returns the latest update-all job for live progress polling.
 func (h *Handler) GetUpdateAllStatus(ctx context.Context, input *UpdateAllStatusInput) (*handlerutil.Out[system.EnvironmentUpdateJob], error) {
-	if h.cfg != nil && h.cfg.AgentMode {
+	if h.cfg.AgentMode {
 		return nil, huma.Error400BadRequest("update-all is managed on the Arcane manager")
 	}
 

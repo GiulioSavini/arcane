@@ -48,16 +48,6 @@ func (b SystemBackupRun) ToDTO() backup.SystemBackupRun {
 	}
 }
 
-func systemBackupRunFromDTOInternal(dto backup.SystemBackupRun) SystemBackupRun {
-	run := SystemBackupRun{
-		Size: dto.Size, CreatedAt: dto.CreatedAt, Status: SystemBackupStatus(dto.Status), Trigger: SystemBackupTrigger(dto.Trigger),
-		Destination: dto.Destination, LocalSnapshotID: dto.LocalSnapshotID, RemoteSnapshotID: dto.RemoteSnapshotID,
-		S3DestinationID: dto.S3DestinationID, S3DestinationName: dto.S3DestinationName, PolicyID: dto.PolicyID, Error: dto.Error,
-	}
-	run.ID = dto.ID
-	return run
-}
-
 type SystemBackupPolicy struct {
 	database.BaseModel
 
@@ -76,9 +66,4 @@ func (p SystemBackupPolicy) ToDTO() backup.SystemBackupPolicy {
 		ID: p.ID, Enabled: p.Enabled, Schedule: p.Schedule, RetentionCount: p.RetentionCount,
 		LocalEnabled: p.LocalEnabled, S3Enabled: p.S3Enabled, S3DestinationID: p.S3DestinationID,
 	}
-}
-
-func (p *SystemBackupPolicy) applyDTOInternal(dto backup.SystemBackupPolicy) {
-	p.Enabled, p.Schedule, p.RetentionCount = dto.Enabled, dto.Schedule, dto.RetentionCount
-	p.LocalEnabled, p.S3Enabled, p.S3DestinationID = dto.LocalEnabled, dto.S3Enabled, dto.S3DestinationID
 }

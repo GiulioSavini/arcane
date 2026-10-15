@@ -12,27 +12,33 @@ import (
 	"github.com/getarcaneapp/arcane/backend/v2/internal/config"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/database"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/s3"
+	"github.com/getarcaneapp/arcane/backend/v2/internal/settings"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/pagination"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/scheduler/flow/flowtest"
 )
 
-func TestProjectsSettingFallsBackToConfig(t *testing.T) {
-	service := &Service{config: &config.Config{ProjectsDirectory: "/app/data/projects:/host/projects"}}
-	require.Equal(t, "/app/data/projects:/host/projects", service.projectsSetting(t.Context()))
-}
-
 func TestHistoryDestinationDecoration(t *testing.T) {
 	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
 	require.NoError(t, err)
-	require.NoError(t, db.AutoMigrate(&s3.S3Destination{}))
+	require.NoError(t, db.AutoMigrate(&s3.S3Destination{}, &settings.SettingVariable{}))
 	destination := s3.S3Destination{Name: "Offsite", Bucket: "backups"}
 	require.NoError(t, db.Create(&destination).Error)
-	service := &Service{
-		s3Destinations: s3.NewS3DestinationService(&database.DB{DB: db}, nil),
-		store: Store{ListHistory: func(context.Context, pagination.QueryParams) ([]backup.HistoryEntry, pagination.Response, error) {
-			return []backup.HistoryEntry{{S3DestinationID: destination.ID}, {S3DestinationID: "missing"}}, pagination.Response{}, nil
-		}},
-	}
+	store := &database.DB{DB: db}
+	settingsService, err := settings.NewSettingsService(t.Context(), store)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, settingsService.Stop(context.WithoutCancel(t.Context()))) })
+	service := NewService(Dependencies{
+		S3Destinations: s3.NewS3DestinationService(store, func(context.Context, string) error { return nil }),
+		Settings:       settingsService,
+		Store: Store{
+			ListHistory: func(context.Context, pagination.QueryParams) ([]backup.HistoryEntry, pagination.Response, error) {
+				return []backup.HistoryEntry{
+					{S3DestinationID: destination.ID},
+					{S3DestinationID: "missing"},
+				}, pagination.Response{}, nil
+			},
+		},
+	})
 	history, _, err := service.ListBackupHistory(t.Context(), pagination.QueryParams{})
 	require.NoError(t, err)
 	require.Equal(t, "Offsite", history[0].S3DestinationName)
@@ -58,7 +64,16 @@ func TestRecoveryEnvironmentIncludesRuntimeSecrets(t *testing.T) {
 		OidcClientSecret:  "oidc-secret",
 		FilePerm:          0o640,
 	}
-	environment := (&Service{config: cfg}).recoveryEnvironment(t.Context())
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, db.AutoMigrate(&settings.SettingVariable{}))
+	settingsService, err := settings.NewSettingsService(t.Context(), &database.DB{DB: db})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, settingsService.Stop(context.WithoutCancel(t.Context()))) })
+	environment := NewService(Dependencies{
+		Config:   cfg,
+		Settings: settingsService,
+	}).recoveryEnvironment(t.Context())
 	require.Equal(t, "jwt-secret", environment["JWT_SECRET"])
 	require.Equal(t, "encryption-secret", environment["ENCRYPTION_KEY"])
 	require.Equal(t, "admin-key", environment["ADMIN_STATIC_API_KEY"])

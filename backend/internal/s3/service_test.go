@@ -1,6 +1,7 @@
 package s3
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -23,7 +24,7 @@ import (
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/utils/s3"
 )
 
-func setupS3DestinationServiceTestInternal(t *testing.T) (*S3DestinationService, *gorm.DB) {
+func setupS3DestinationServiceTest(t *testing.T) (*S3DestinationService, *gorm.DB) {
 	t.Helper()
 
 	gormDB, err := gorm.Open(sqlite.Open("file:"+t.Name()+"?mode=memory&cache=shared"), &gorm.Config{})
@@ -40,11 +41,11 @@ func setupS3DestinationServiceTestInternal(t *testing.T) (*S3DestinationService,
 		EncryptionKey: "test-encryption-key-for-s3-destination-32bytes",
 		Environment:   "test",
 	})
-	return NewS3DestinationService(&database.DB{DB: gormDB}, nil), gormDB
+	return NewS3DestinationService(&database.DB{DB: gormDB}, func(context.Context, string) error { return nil }), gormDB
 }
 
 func TestS3DestinationService_CRUD(t *testing.T) {
-	service, gormDB := setupS3DestinationServiceTestInternal(t)
+	service, gormDB := setupS3DestinationServiceTest(t)
 	ctx := t.Context()
 
 	created, err := service.CreateS3Destination(ctx, backup.CreateS3Destination{
@@ -99,7 +100,7 @@ func TestS3DestinationService_CRUD(t *testing.T) {
 }
 
 func TestS3DestinationService_DeleteRejectsConfiguredDestination(t *testing.T) {
-	service, gormDB := setupS3DestinationServiceTestInternal(t)
+	service, gormDB := setupS3DestinationServiceTest(t)
 	ctx := t.Context()
 	destination, err := service.CreateS3Destination(ctx, backup.CreateS3Destination{
 		Name:            "In use",
@@ -117,7 +118,7 @@ func TestS3DestinationService_DeleteRejectsConfiguredDestination(t *testing.T) {
 }
 
 func TestS3DestinationService_SyncS3Destinations(t *testing.T) {
-	service, gormDB := setupS3DestinationServiceTestInternal(t)
+	service, gormDB := setupS3DestinationServiceTest(t)
 	ctx := t.Context()
 
 	legacy, err := service.CreateS3Destination(ctx, backup.CreateS3Destination{
@@ -213,7 +214,7 @@ func TestS3DestinationService_TestS3DestinationRoundTrip(t *testing.T) {
 	}))
 	defer server.Close()
 
-	service, _ := setupS3DestinationServiceTestInternal(t)
+	service, _ := setupS3DestinationServiceTest(t)
 	require.NoError(t, service.TestS3DestinationConfiguration(t.Context(), backup.CreateS3Destination{
 		Name:            "Unsaved destination",
 		Endpoint:        server.URL,
@@ -344,7 +345,7 @@ func TestS3DestinationService_TestS3DestinationRoundTrip(t *testing.T) {
 }
 
 func TestDestinationsByID(t *testing.T) {
-	service, db := setupS3DestinationServiceTestInternal(t)
+	service, db := setupS3DestinationServiceTest(t)
 	require.Empty(t, service.DestinationsByID(t.Context()))
 	destination := S3Destination{Name: "Offsite", Bucket: "backups", SecretAccessKey: "encrypted"}
 	require.NoError(t, db.Create(&destination).Error)
@@ -354,8 +355,7 @@ func TestDestinationsByID(t *testing.T) {
 	require.Equal(t, "backups", indexed[destination.ID].Bucket)
 	require.True(t, indexed[destination.ID].SecretConfigured)
 	require.Empty(t, indexed["missing"].Name)
-	// Listing failures and a missing service leave records undecorated rather than failing.
+	// Listing failures leave records undecorated rather than failing.
 	require.NoError(t, db.Migrator().DropTable(&S3Destination{}))
 	require.Nil(t, service.DestinationsByID(t.Context()))
-	require.Nil(t, (*S3DestinationService)(nil).DestinationsByID(t.Context()))
 }

@@ -2,11 +2,12 @@ package volumes
 
 import (
 	"context"
-	"errors"
 
 	"github.com/danielgtaylor/huma/v2"
 	"github.com/getarcaneapp/arcane/types/v2/backup"
+	kit "go.getarcane.app/kit/pkg"
 
+	"github.com/getarcaneapp/arcane/backend/v2/internal/common"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/utils"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/utils/handlerutil"
 )
@@ -66,20 +67,14 @@ func (h *Handler) ListSystemVolumeOptions(ctx context.Context, _ *struct{}) (*Sy
 }
 
 func (h *Handler) RunSystemVolumeBackups(ctx context.Context, input *RunSystemVolumeBackupsInput) (*SystemVolumeBackupRunOutput, error) {
-	request := backup.RunSystemVolumeBackupsRequest{}
-	if input.Body != nil {
-		request = *input.Body
-	}
 	user, err := handlerutil.RequireUser(ctx)
 	if err != nil {
 		return nil, err
 	}
-	result, err := h.service.Start(utils.ActivityRuntimeContext(ctx, h.appCtx), *user, request)
-	if errors.Is(err, h.service.alreadyRunning) {
-		return nil, huma.Error409Conflict(err.Error())
-	}
+	result, err := h.service.Start(utils.ActivityRuntimeContext(ctx, h.appCtx), *user, kit.FromPtr(input.Body))
 	if err != nil {
-		return nil, huma.Error500InternalServerError(err.Error())
+		apiErr := common.ToAPIError(err)
+		return nil, huma.NewError(apiErr.HTTPStatus(), apiErr.Message)
 	}
 	return &SystemVolumeBackupRunOutput{Body: *result}, nil
 }

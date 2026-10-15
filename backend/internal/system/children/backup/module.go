@@ -4,6 +4,7 @@ import (
 	"net/http"
 
 	"github.com/danielgtaylor/huma/v2"
+	kit "go.getarcane.app/kit/pkg"
 
 	"github.com/getarcaneapp/arcane/backend/v2/internal/middleware"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/system/children/backup/children/volumes"
@@ -211,9 +212,5 @@ func RegisterRoutes(api huma.API, h *Handler) {
 		h.Delete,
 	)
 
-	var volumeService *volumes.Service
-	if h.service != nil {
-		volumeService = h.service.volumes
-	}
-	volumes.RegisterRoutes(api, volumes.NewHandler(volumeService, h.appCtx))
+	volumes.RegisterRoutes(api, volumes.NewHandler(kit.FromPtr(h.service).volumes, h.appCtx))
 }

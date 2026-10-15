@@ -2,7 +2,6 @@ package backup
 
 import (
 	"context"
-	"errors"
 
 	"github.com/danielgtaylor/huma/v2"
 	activitytypes "github.com/getarcaneapp/arcane/types/v2/activity"
@@ -108,7 +107,7 @@ func NewHandler(service *Service, activityService *activity.ActivityService, app
 
 func (h *Handler) ListHistory(ctx context.Context, input *ListBackupHistoryInput) (*handlerutil.Page[backup.HistoryEntry], error) {
 	params := handlerutil.PaginationParams(input.Start, input.Limit, input.Sort, input.Order, input.Search)
-	params.Filters = map[string]string{"type": input.Type}
+	params.Filters["type"] = input.Type
 	history, page, err := h.service.ListBackupHistory(ctx, params)
 	if err != nil {
 		return nil, huma.Error500InternalServerError(err.Error())
@@ -222,11 +221,9 @@ func (h *Handler) Create(ctx context.Context, input *CreateSystemBackupInput) (*
 		return nil, err
 	}
 	run, err := h.service.StartBackup(utils.ActivityRuntimeContext(ctx, h.appCtx), *user, input.Body)
-	if errors.Is(err, ErrSystemBackupAlreadyRunning) {
-		return nil, huma.Error409Conflict(err.Error())
-	}
 	if err != nil {
-		return nil, huma.Error500InternalServerError(err.Error())
+		apiErr := common.ToAPIError(err)
+		return nil, huma.NewError(apiErr.HTTPStatus(), apiErr.Message)
 	}
 	return &SystemBackupOutput{Body: *run}, nil
 }
@@ -274,14 +271,9 @@ func (h *Handler) RestoreFiles(ctx context.Context, input *RestoreSystemBackupFi
 	}, func(activityCtx context.Context) error {
 		return h.service.RestoreBackupFiles(activityCtx, input.ID, input.Body, *user)
 	})
-	if errors.Is(err, ErrSystemBackupAlreadyRunning) {
-		return nil, huma.Error409Conflict(err.Error())
-	}
-	if errors.Is(err, common.ErrBadRequest) {
-		return nil, huma.Error400BadRequest(err.Error())
-	}
 	if err != nil {
-		return nil, huma.Error500InternalServerError(err.Error())
+		apiErr := common.ToAPIError(err)
+		return nil, huma.NewError(apiErr.HTTPStatus(), apiErr.Message)
 	}
 	return handlerutil.MessageOutput("Arcane project files restored successfully", activityID), nil
 }

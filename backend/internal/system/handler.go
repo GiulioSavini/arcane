@@ -99,9 +99,6 @@ func (h *SystemHandler) GetDockerInfo(ctx context.Context, input *GetDockerInfoI
 	}
 	info := infoResult.Info
 
-	cpuCount := info.NCPU
-	memTotal := info.MemTotal
-
 	// Apply cgroup limits only when running outside Docker (e.g. in LXC).
 	// In Docker, --cpus/--memory are artificial operator constraints that
 	// should not cap the host totals shown in the dashboard. The Docker
@@ -111,20 +108,14 @@ func (h *SystemHandler) GetDockerInfo(ctx context.Context, input *GetDockerInfoI
 	// dashboard shows what Arcane's host actually has available.
 	if !cgroup.IsDockerContainer() {
 		if cgroupLimits, detectLimitsErr := cgroup.DetectLimits(); detectLimitsErr == nil {
-			if limit := cgroupLimits.MemoryLimit; limit > 0 {
-				limitInt := limit
-				if memTotal == 0 || limitInt < memTotal {
-					memTotal = limitInt
-				}
+			if limit := cgroupLimits.MemoryLimit; limit > 0 && (info.MemTotal == 0 || limit < info.MemTotal) {
+				info.MemTotal = limit // keep: copying Docker's ~70-field system.Info as a literal is unreadable
 			}
-			if cgroupLimits.CPUCount > 0 && (cpuCount == 0 || cgroupLimits.CPUCount < cpuCount) {
-				cpuCount = cgroupLimits.CPUCount
+			if cgroupLimits.CPUCount > 0 && (info.NCPU == 0 || cgroupLimits.CPUCount < info.NCPU) {
+				info.NCPU = cgroupLimits.CPUCount // keep: copying Docker's ~70-field system.Info as a literal is unreadable
 			}
 		}
 	}
-
-	info.NCPU = cpuCount
-	info.MemTotal = memTotal
 
 	gitCommit, goVersion, buildTime := extractVersionDetailsFromComponents(version.Components)
 
@@ -221,17 +212,17 @@ func (h *SystemHandler) ConvertDockerRun(ctx context.Context, input *ConvertDock
 		return nil, huma.Error500InternalServerError("Failed to convert to Docker Compose format.")
 	}
 
-	serviceName := ""
-	if len(result.Services) > 0 {
-		serviceName = result.Services[0].Name
-	}
-
 	return &ConvertDockerRunOutput{
 		Body: system.ConvertDockerRunResponse{
 			Success:       true,
 			DockerCompose: string(result.YAML),
 			EnvVars:       strings.TrimSuffix(string(result.EnvFile), "\n"),
-			ServiceName:   serviceName,
+			ServiceName: func() string {
+				if len(result.Services) == 0 {
+					return ""
+				}
+				return result.Services[0].Name
+			}(),
 		},
 	}, nil
 }

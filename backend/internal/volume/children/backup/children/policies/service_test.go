@@ -56,7 +56,11 @@ func TestVolumeBackupPolicy_UpdateRegistersIndependentJobsAndSettings(t *testing
 	require.NoError(t, gormDB.AutoMigrate(&VolumeBackupPolicy{}))
 	db := &database.DB{DB: gormDB}
 	jobScheduler := &volumeBackupPolicyScheduler{jobs: make(map[string]scheduler.Job)}
-	service := NewService(Dependencies{DB: db, LatestRun: noLatestRun})
+	service := NewService(Dependencies{
+		DB:             db,
+		S3Destinations: s3.NewS3DestinationService(db, func(context.Context, string) error { return nil }),
+		LatestRun:      noLatestRun,
+	})
 	gate := newVolumeAdmissionForTest(t)
 	require.NoError(t, service.SetScheduler(t.Context(), jobScheduler, gate))
 
@@ -96,7 +100,8 @@ func TestVolumeBackupPolicy_GetReturnsLastRunForEachPolicy(t *testing.T) {
 	}
 
 	service := NewService(Dependencies{
-		DB: &database.DB{DB: gormDB},
+		DB:             &database.DB{DB: gormDB},
+		S3Destinations: s3.NewS3DestinationService(&database.DB{DB: gormDB}, func(context.Context, string) error { return nil }),
 		LatestRun: func(_ context.Context, policyID string) (*volume.BackupEntry, error) {
 			return latest[policyID], nil
 		},

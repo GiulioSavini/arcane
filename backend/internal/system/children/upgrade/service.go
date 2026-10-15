@@ -253,30 +253,35 @@ func (s *Service) prepareUpgrade(ctx context.Context, user usertypes.Actor, targ
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to Docker: %w", err)
 	}
-	var current container.InspectResponse
-	if containerID := strings.TrimSpace(target.ContainerID); containerID != "" {
+	current, err := func() (container.InspectResponse, error) {
+		containerID := strings.TrimSpace(target.ContainerID)
+		if containerID == "" {
+			self, inspectErr := libarcane.InspectCurrentArcaneContainer(ctx, dockerClient)
+			if inspectErr != nil {
+				return container.InspectResponse{}, errors.New("get current container: arcane is not running in a Docker container")
+			}
+			return *self, nil
+		}
 		inspect, inspectErr := compat.ContainerInspectWithCompatibility(ctx, dockerClient, containerID, client.ContainerInspectOptions{})
-		if inspectErr != nil {
-			// Fall back to a prefix match across every container.
-			containers, listErr := dockerClient.ContainerList(ctx, client.ContainerListOptions{All: true})
-			if listErr != nil {
-				return nil, fmt.Errorf("inspect container: %w", listErr)
-			}
-			idx := slices.IndexFunc(containers.Items, func(c container.Summary) bool { return strings.HasPrefix(c.ID, containerID) })
-			if idx < 0 {
-				return nil, fmt.Errorf("inspect container: %w", common.Classify(common.ErrNotFound, errors.New("could not find Arcane container")))
-			}
-			if inspect, inspectErr = compat.ContainerInspectWithCompatibility(ctx, dockerClient, containers.Items[idx].ID, client.ContainerInspectOptions{}); inspectErr != nil {
-				return nil, fmt.Errorf("inspect container: %w", inspectErr)
-			}
+		if inspectErr == nil {
+			return inspect.Container, nil
 		}
-		current = inspect.Container
-	} else {
-		self, inspectErr := libarcane.InspectCurrentArcaneContainer(ctx, dockerClient)
-		if inspectErr != nil {
-			return nil, errors.New("get current container: arcane is not running in a Docker container")
+		// Fall back to a prefix match across every container.
+		containers, listErr := dockerClient.ContainerList(ctx, client.ContainerListOptions{All: true})
+		if listErr != nil {
+			return container.InspectResponse{}, fmt.Errorf("inspect container: %w", listErr)
 		}
-		current = *self
+		idx := slices.IndexFunc(containers.Items, func(c container.Summary) bool { return strings.HasPrefix(c.ID, containerID) })
+		if idx < 0 {
+			return container.InspectResponse{}, fmt.Errorf("inspect container: %w", common.Classify(common.ErrNotFound, errors.New("could not find Arcane container")))
+		}
+		if inspect, inspectErr = compat.ContainerInspectWithCompatibility(ctx, dockerClient, containers.Items[idx].ID, client.ContainerInspectOptions{}); inspectErr != nil {
+			return container.InspectResponse{}, fmt.Errorf("inspect container: %w", inspectErr)
+		}
+		return inspect.Container, nil
+	}()
+	if err != nil {
+		return nil, err
 	}
 
 	containerName := strings.TrimPrefix(current.Name, "/")
@@ -286,9 +291,11 @@ func (s *Service) prepareUpgrade(ctx context.Context, user usertypes.Actor, targ
 	targetImage := strings.TrimSpace(target.NewImageRef)
 	if targetImage == "" {
 		// A blank target resolves against the version check; a manager-supplied version outranks this instance's own.
-		info := kit.FromPtr(s.versionService.GetAppVersionInfo(ctx))
-		info.NewestVersion = cmp.Or(strings.TrimSpace(targetVersion), info.NewestVersion)
-		if targetImage, err = resolveSelfUpgradeTargetImage(config.Image, &info); err != nil {
+		info := s.versionService.GetAppVersionInfo(ctx)
+		if targetImage, err = resolveSelfUpgradeTargetImage(config.Image, &versiontypes.Info{
+			NewestVersion: cmp.Or(strings.TrimSpace(targetVersion), kit.FromPtr(info).NewestVersion),
+			NewestDigest:  kit.FromPtr(info).NewestDigest,
+		}); err != nil {
 			return nil, fmt.Errorf("resolve upgrade target image: %w", err)
 		}
 	}
@@ -387,18 +394,6 @@ func (s *Service) runPreparedUpgrade(ctx context.Context, prepared *preparedUpgr
 		upgradeCmd = append(upgradeCmd, "--pull-image", prepared.pullImage)
 	}
 
-	config := &container.Config{
-		Image: prepared.pullImage,
-		Cmd:   upgradeCmd,
-		// Root for the Docker socket: the short-lived upgrader never goes through the runtime-identity drop.
-		User: "0:0",
-		Env:  containerEnv,
-		Labels: map[string]string{
-			"com.getarcaneapp.arcane.upgrader": "true",
-			"com.getarcaneapp.arcane":          "true",
-		},
-	}
-
 	mounts := append([]mount.Mount{}, runtimeMounts...)
 	if appDataMount != nil {
 		mounts = append(mounts, *appDataMount)
@@ -409,42 +404,50 @@ func (s *Service) runPreparedUpgrade(ctx context.Context, prepared *preparedUpgr
 		slog.InfoContext(ctx, "Keeping upgrader container after exit (ARCANE_UPGRADE_KEEP_CONTAINER=true)")
 	}
 
-	hostConfig := &container.HostConfig{
-		AutoRemove:  !keepUpgraderContainer,
-		Mounts:      mounts,
-		NetworkMode: networkMode,
-	}
 	// Inherit the security context (SELinux label, privileged) that lets Arcane reach the socket on hardened hosts.
-	if prepared.current.HostConfig != nil {
-		hostConfig.SecurityOpt = slices.Clone(prepared.current.HostConfig.SecurityOpt)
-		hostConfig.Privileged = prepared.current.HostConfig.Privileged
-	}
+	securityOpt := slices.Clone(kit.FromPtr(prepared.current.HostConfig).SecurityOpt)
 	// On SELinux-enforcing hosts the socket is container_var_run_t, so without a label opt the upgrader exits with EACCES.
-	hasLabelOpt := slices.ContainsFunc(hostConfig.SecurityOpt, func(opt string) bool { return strings.HasPrefix(strings.TrimSpace(opt), "label") })
-	if !hostConfig.Privileged && !hasLabelOpt {
+	if !kit.FromPtr(prepared.current.HostConfig).Privileged &&
+		!slices.ContainsFunc(securityOpt, func(opt string) bool { return strings.HasPrefix(strings.TrimSpace(opt), "label") }) {
 		infoResult, infoErr := dockerClient.Info(ctx, client.InfoOptions{})
 		if infoErr != nil {
 			slog.DebugContext(ctx, "Failed to query daemon info for SELinux detection", "error", infoErr)
 		} else if slices.Contains(infoResult.Info.SecurityOptions, "name=selinux") {
-			hostConfig.SecurityOpt = append(hostConfig.SecurityOpt, "label=disable")
-		}
-	}
-
-	var networkingConfig *network.NetworkingConfig
-	if networkMode != "" && networkMode.IsUserDefined() {
-		networkingConfig = &network.NetworkingConfig{
-			EndpointsConfig: map[string]*network.EndpointSettings{
-				string(networkMode): {Aliases: []string{"arcane-upgrader"}},
-			},
+			securityOpt = append(securityOpt, "label=disable")
 		}
 	}
 
 	upgraderName := fmt.Sprintf("%s-upgrader-%d", prepared.containerName, time.Now().Unix())
 	resp, err := dockerClient.ContainerCreate(ctx, client.ContainerCreateOptions{
-		Config:           config,
-		HostConfig:       hostConfig,
-		NetworkingConfig: networkingConfig,
-		Name:             upgraderName,
+		Config: &container.Config{
+			Image: prepared.pullImage,
+			Cmd:   upgradeCmd,
+			// Root for the Docker socket: the short-lived upgrader never goes through the runtime-identity drop.
+			User: "0:0",
+			Env:  containerEnv,
+			Labels: map[string]string{
+				"com.getarcaneapp.arcane.upgrader": "true",
+				"com.getarcaneapp.arcane":          "true",
+			},
+		},
+		HostConfig: &container.HostConfig{
+			AutoRemove:  !keepUpgraderContainer,
+			Mounts:      mounts,
+			NetworkMode: networkMode,
+			SecurityOpt: securityOpt,
+			Privileged:  kit.FromPtr(prepared.current.HostConfig).Privileged,
+		},
+		NetworkingConfig: func() *network.NetworkingConfig {
+			if networkMode == "" || !networkMode.IsUserDefined() {
+				return nil
+			}
+			return &network.NetworkingConfig{
+				EndpointsConfig: map[string]*network.EndpointSettings{
+					string(networkMode): {Aliases: []string{"arcane-upgrader"}},
+				},
+			}
+		}(),
+		Name: upgraderName,
 	})
 	if err != nil {
 		return "", fmt.Errorf("create upgrader container: %w", err)
@@ -578,15 +581,15 @@ func (s *Service) StartUpdateAll(ctx context.Context, user usertypes.Actor) (*En
 		ManagerVersionAtStart: info.CurrentVersion,
 		ManagerDigestAtStart:  info.CurrentDigest,
 		ManagerTargetVersion:  cmp.Or(info.NewestVersion, info.NewestDigest, info.CurrentVersion, info.CurrentDigest),
+		// The manager row stays pending until the final manager step.
+		Results: EnvironmentUpdateResults{{
+			EnvironmentID:   environment.LocalEnvironmentID,
+			EnvironmentName: s.environments.ResolveEnvironmentName(ctx, environment.LocalEnvironmentID),
+			Status:          EnvironmentUpdateResultStatusPending,
+			FromVersion:     info.CurrentVersion,
+			ToVersion:       cmp.Or(info.NewestVersion, info.NewestDigest, info.CurrentVersion, info.CurrentDigest),
+		}},
 	}
-	// The manager row stays pending until the final manager step.
-	job.Results = EnvironmentUpdateResults{{
-		EnvironmentID:   environment.LocalEnvironmentID,
-		EnvironmentName: s.environments.ResolveEnvironmentName(ctx, environment.LocalEnvironmentID),
-		Status:          EnvironmentUpdateResultStatusPending,
-		FromVersion:     info.CurrentVersion,
-		ToVersion:       job.ManagerTargetVersion,
-	}}
 	// Seed every remote row so the dialog shows the whole fleet at once; the agents step fills any gaps.
 	if remotes, listErr := s.environments.ListRemoteEnvironments(ctx); listErr != nil {
 		slog.WarnContext(ctx, "update-all: failed to pre-list remote environments for seeding", "error", listErr)
@@ -600,9 +603,11 @@ func (s *Service) StartUpdateAll(ctx context.Context, user usertypes.Actor) (*En
 		return nil, fmt.Errorf("create update-all job: %w", createUpgradeJobErr)
 	}
 
-	input := updateAllInput{JobID: job.ID}
-	input.KeyID, _ = ctx.Value(middleware.ContextKeyApiKeyID).(string)
-	instanceID, submitErr := s.flow.Submit(ctx, s.updateAllWorkflow, input, activitylib.StartRequest{})
+	keyID, _ := ctx.Value(middleware.ContextKeyApiKeyID).(string)
+	instanceID, submitErr := s.flow.Submit(ctx, s.updateAllWorkflow, updateAllInput{
+		JobID: job.ID,
+		KeyID: keyID,
+	}, activitylib.StartRequest{})
 	if submitErr != nil {
 		s.markUpdateAllFailed(context.WithoutCancel(ctx), job, fmt.Sprintf("failed to start update-all: %v", submitErr))
 		return nil, fmt.Errorf("start update-all: %w", submitErr)
@@ -667,8 +672,7 @@ func resolveResumeAction(job *EnvironmentUpdateJob, currentVersion, currentDiges
 	if now.Sub(job.CreatedAt) > updateAllStaleThreshold {
 		return resumeAction{markStale: true}
 	}
-	landed := upgradeLanded(job.ManagerVersionAtStart, job.ManagerDigestAtStart, job.ManagerTargetVersion, currentVersion, currentDigest)
-	return resumeAction{managerSucceeded: landed}
+	return resumeAction{managerSucceeded: upgradeLanded(job.ManagerVersionAtStart, job.ManagerDigestAtStart, job.ManagerTargetVersion, currentVersion, currentDigest)}
 }
 
 // upgradeLanded reports whether the version or digest moved off its baseline, or already matches target (a version or
@@ -727,12 +731,25 @@ func (s *Service) upgradeAgentTask(ctx context.Context, t flow.Task) (_ any, err
 	// Only a later stage proves the agent accepted it.
 	triggered := result.Status == EnvironmentUpdateResultStatusUpdating && result.Stage != "" && result.Stage != EnvironmentUpdateStageChecking
 	unconfirmed := triggered && result.Stage == EnvironmentUpdateStageStarting
-	result.Status = EnvironmentUpdateResultStatusUpdating
+	settle := func(status EnvironmentUpdateResultStatus, message string) {
+		*result = EnvironmentUpdateResult{ //exhaustruct:enforce
+			EnvironmentID:   result.EnvironmentID,
+			EnvironmentName: result.EnvironmentName,
+			Status:          status,
+			FromVersion:     result.FromVersion,
+			FromDigest:      result.FromDigest,
+			ToVersion:       result.ToVersion,
+			Stage:           result.Stage,
+			StageStartedAt:  result.StageStartedAt,
+			Error:           message[:min(len(message), updateAllErrorMaxLen)],
+		}
+	}
+	settle(EnvironmentUpdateResultStatusUpdating, result.Error)
 	if persistErr := s.db.WithContext(ctx).Save(job).Error; persistErr != nil {
 		slog.WarnContext(ctx, "update-all: failed to persist updating status", "jobId", job.ID, "environmentId", remote.ID, "error", persistErr)
 	}
 	defer func() {
-		result.clearStage()
+		*result = result.clearStage()
 		// Shutdown: leave the row updating at its stage so the redelivered task resumes it.
 		if err = ctx.Err(); err != nil {
 			return
@@ -744,15 +761,17 @@ func (s *Service) upgradeAgentTask(ctx context.Context, t flow.Task) (_ any, err
 
 	var info versiontypes.Info
 	if triggered {
-		info.CurrentVersion, info.CurrentDigest = result.FromVersion, result.FromDigest
+		info = versiontypes.Info{
+			CurrentVersion: result.FromVersion,
+			CurrentDigest:  result.FromDigest,
+		}
 	} else {
 		s.setUpdateStage(ctx, job, result, EnvironmentUpdateStageChecking)
 		versionCtx, cancel := context.WithTimeout(ctx, updateAllAgentRequestTimeout)
 		checkErr := s.environments.ProxyJSONRequest(versionCtx, remote.ID, http.MethodGet, "/api/app-version", nil, &info)
 		cancel()
 		if checkErr != nil {
-			msg := checkErr.Error()
-			result.Status, result.Error = updateAllAgentFailureStatus(checkErr), msg[:min(len(msg), updateAllErrorMaxLen)]
+			settle(updateAllAgentFailureStatus(checkErr), checkErr.Error())
 			return nil, nil
 		}
 		// The manager's newest release outranks the agent's own check, so the recorded target tracks what was sent.
@@ -762,16 +781,23 @@ func (s *Service) upgradeAgentTask(ctx context.Context, t flow.Task) (_ any, err
 			if marshalErr != nil {
 				slog.WarnContext(ctx, "update-all: failed to marshal trigger body", "environmentId", remote.ID, "error", marshalErr)
 			} else {
-				info.NewestVersion, triggerBody = newest, body
+				info.NewestVersion, triggerBody = newest, body // keep: versiontypes.Info is decoded by ProxyJSONRequest and has ~20 fields
 			}
 		}
-		result.FromVersion, result.FromDigest = info.CurrentVersion, info.CurrentDigest
-		result.ToVersion = cmp.Or(info.NewestVersion, info.NewestDigest, info.CurrentVersion, info.CurrentDigest)
-
 		// The saved starting stage keeps a replay from sending the trigger again, so the trigger waits on it.
-		result.Stage, result.StageStartedAt = EnvironmentUpdateStageStarting, new(time.Now())
+		*result = EnvironmentUpdateResult{ //exhaustruct:enforce
+			EnvironmentID:   result.EnvironmentID,
+			EnvironmentName: result.EnvironmentName,
+			Status:          result.Status,
+			FromVersion:     info.CurrentVersion,
+			FromDigest:      info.CurrentDigest,
+			ToVersion:       cmp.Or(info.NewestVersion, info.NewestDigest, info.CurrentVersion, info.CurrentDigest),
+			Stage:           EnvironmentUpdateStageStarting,
+			StageStartedAt:  new(time.Now()),
+			Error:           result.Error,
+		}
 		if saveErr := s.db.WithContext(ctx).Save(job).Error; saveErr != nil {
-			result.Status, result.Error = EnvironmentUpdateResultStatusFailed, "Could not save upgrade progress: "+saveErr.Error()
+			settle(EnvironmentUpdateResultStatusFailed, "Could not save upgrade progress: "+saveErr.Error())
 			return nil, nil
 		}
 		triggerCtx, cancel := context.WithTimeout(ctx, updateAllAgentRequestTimeout)
@@ -781,14 +807,23 @@ func (s *Service) upgradeAgentTask(ctx context.Context, t flow.Task) (_ any, err
 			triggerErr = resp.RequireSuccess()
 		}
 		if triggerErr != nil {
-			msg := triggerErr.Error()
-			result.Status, result.Error = EnvironmentUpdateResultStatusFailed, msg[:min(len(msg), updateAllErrorMaxLen)]
+			settle(EnvironmentUpdateResultStatusFailed, triggerErr.Error())
 			return nil, nil
 		}
 
 		// An agent already on the target finds nothing to swap in; confirming would only burn the poll window.
 		if info.AlreadyOnNewest() {
-			result.Status, result.ToVersion = EnvironmentUpdateResultStatusUpToDate, info.CurrentVersion
+			*result = EnvironmentUpdateResult{ //exhaustruct:enforce
+				EnvironmentID:   result.EnvironmentID,
+				EnvironmentName: result.EnvironmentName,
+				Status:          EnvironmentUpdateResultStatusUpToDate,
+				FromVersion:     result.FromVersion,
+				FromDigest:      result.FromDigest,
+				ToVersion:       info.CurrentVersion,
+				Stage:           result.Stage,
+				StageStartedAt:  result.StageStartedAt,
+				Error:           result.Error,
+			}
 			return nil, nil
 		}
 	}
@@ -820,15 +855,15 @@ func (s *Service) upgradeAgentTask(ctx context.Context, t flow.Task) (_ any, err
 		stage(EnvironmentUpdateStageVerifying)
 		// An unconfirmed request proves nothing by the agent merely matching the target, so it needs a real change.
 		if upgradeLanded(info.CurrentVersion, info.CurrentDigest, kit.Ternary(unconfirmed, "", result.ToVersion), current.CurrentVersion, current.CurrentDigest) {
-			result.Status = EnvironmentUpdateResultStatusUpdated
+			settle(EnvironmentUpdateResultStatusUpdated, result.Error)
 			return nil, nil
 		}
 	}
 	if unconfirmed {
-		result.Status, result.Error = EnvironmentUpdateResultStatusFailed, "Upgrade request was interrupted before the agent confirmed it"
+		settle(EnvironmentUpdateResultStatusFailed, "Upgrade request was interrupted before the agent confirmed it")
 		return nil, nil
 	}
-	result.Status = EnvironmentUpdateResultStatusTriggered
+	settle(EnvironmentUpdateResultStatusTriggered, result.Error)
 	return nil, nil
 }
 
@@ -843,28 +878,61 @@ func (s *Service) upgradeManagerTask(ctx context.Context, t flow.Task) (any, err
 	if err != nil {
 		return nil, err
 	}
-	allowed := false
-	if job.Status == EnvironmentUpdateJobStatusRunning {
-		if allowed, err = s.authorizeUpdateAll(ctx, job, input.KeyID); err != nil {
-			return nil, err
+	allowed, err := func() (bool, error) {
+		if job.Status != EnvironmentUpdateJobStatusRunning {
+			return false, nil
 		}
+		return s.authorizeUpdateAll(ctx, job, input.KeyID)
+	}()
+	if err != nil {
+		return nil, err
 	}
 	if allowed {
 		// Every agent task has finished, so an agent row still in progress belongs to a task that failed first.
-		for i := range job.Results {
-			pending := job.Results[i].Status == EnvironmentUpdateResultStatusPending || job.Results[i].Status == EnvironmentUpdateResultStatusUpdating
-			if job.Results[i].EnvironmentID != environment.LocalEnvironmentID && pending {
-				job.Results[i].clearStage()
-				job.Results[i].Status, job.Results[i].Error = EnvironmentUpdateResultStatusFailed, "Agent upgrade did not finish"
+		results := make(EnvironmentUpdateResults, 0, len(job.Results))
+		for _, row := range job.Results {
+			switch {
+			case row.EnvironmentID == environment.LocalEnvironmentID:
+				results = append(results, EnvironmentUpdateResult{ //exhaustruct:enforce
+					EnvironmentID:   row.EnvironmentID,
+					EnvironmentName: row.EnvironmentName,
+					Status:          EnvironmentUpdateResultStatusUpdating,
+					FromVersion:     row.FromVersion,
+					FromDigest:      row.FromDigest,
+					ToVersion:       row.ToVersion,
+					Stage:           EnvironmentUpdateStageStarting,
+					StageStartedAt:  new(time.Now()),
+					Error:           row.Error,
+				})
+			case row.Status == EnvironmentUpdateResultStatusPending || row.Status == EnvironmentUpdateResultStatusUpdating:
+				results = append(results, EnvironmentUpdateResult{ //exhaustruct:enforce
+					EnvironmentID:   row.EnvironmentID,
+					EnvironmentName: row.EnvironmentName,
+					Status:          EnvironmentUpdateResultStatusFailed,
+					FromVersion:     row.FromVersion,
+					FromDigest:      row.FromDigest,
+					ToVersion:       row.ToVersion,
+					Stage:           "",
+					StageStartedAt:  nil,
+					Error:           "Agent upgrade did not finish",
+				})
+			default:
+				results = append(results, row)
 			}
 		}
-		manager := slices.IndexFunc(job.Results, func(r EnvironmentUpdateResult) bool { return r.EnvironmentID == environment.LocalEnvironmentID })
-		if manager >= 0 {
-			job.Results[manager].Status = EnvironmentUpdateResultStatusUpdating
-			job.Results[manager].Stage = EnvironmentUpdateStageStarting
-			job.Results[manager].StageStartedAt = new(time.Now())
+		manager := slices.IndexFunc(results, func(r EnvironmentUpdateResult) bool { return r.EnvironmentID == environment.LocalEnvironmentID })
+		*job = EnvironmentUpdateJob{ //exhaustruct:enforce
+			BaseModel:             job.BaseModel,
+			Status:                EnvironmentUpdateJobStatusPendingRestart,
+			UserID:                job.UserID,
+			Username:              job.Username,
+			ManagerVersionAtStart: job.ManagerVersionAtStart,
+			ManagerDigestAtStart:  job.ManagerDigestAtStart,
+			ManagerTargetVersion:  job.ManagerTargetVersion,
+			Results:               results,
+			Error:                 job.Error,
+			CompletedAt:           job.CompletedAt,
 		}
-		job.Status = EnvironmentUpdateJobStatusPendingRestart
 		// A replay that misses pending_restart would trigger the manager upgrade again, so the trigger waits on it.
 		if savePendingRestartErr := s.db.WithContext(ctx).Save(job).Error; savePendingRestartErr != nil {
 			return nil, fmt.Errorf("persist pending_restart before manager upgrade: %w", savePendingRestartErr)
@@ -933,14 +1001,10 @@ func (s *Service) watchManagerUpgrader(ctx context.Context, job *EnvironmentUpda
 	}
 
 	// Let a recreate already underway stop this process; an unobserved run waits out the stale window instead.
-	hold := updateAllManagerNoRestartGrace
-	if exit == upgraderExitUnobserved {
-		hold = time.Until(job.CreatedAt.Add(updateAllStaleThreshold))
-	}
 	select {
 	case <-ctx.Done():
 		return
-	case <-time.After(hold):
+	case <-time.After(kit.Ternary(exit == upgraderExitUnobserved, time.Until(job.CreatedAt.Add(updateAllStaleThreshold)), updateAllManagerNoRestartGrace)):
 	}
 
 	job, err = s.loadUpdateAllJob(ctx, job.ID)
@@ -973,11 +1037,23 @@ func upsertPendingResult(job *EnvironmentUpdateJob, envID, envName string) int {
 	if idx := slices.IndexFunc(job.Results, func(r EnvironmentUpdateResult) bool { return r.EnvironmentID == envID }); idx >= 0 {
 		return idx
 	}
-	job.Results = append(job.Results, EnvironmentUpdateResult{
+	pending := EnvironmentUpdateResult{
 		EnvironmentID:   envID,
 		EnvironmentName: envName,
 		Status:          EnvironmentUpdateResultStatusPending,
-	})
+	}
+	*job = EnvironmentUpdateJob{ //exhaustruct:enforce
+		BaseModel:             job.BaseModel,
+		Status:                job.Status,
+		UserID:                job.UserID,
+		Username:              job.Username,
+		ManagerVersionAtStart: job.ManagerVersionAtStart,
+		ManagerDigestAtStart:  job.ManagerDigestAtStart,
+		ManagerTargetVersion:  job.ManagerTargetVersion,
+		Results:               append(job.Results, pending),
+		Error:                 job.Error,
+		CompletedAt:           job.CompletedAt,
+	}
 	return len(job.Results) - 1
 }
 
@@ -998,8 +1074,17 @@ func (s *Service) setUpdateStage(ctx context.Context, job *EnvironmentUpdateJob,
 	if result.Stage == stage {
 		return
 	}
-	result.Stage = stage
-	result.StageStartedAt = new(time.Now())
+	*result = EnvironmentUpdateResult{ //exhaustruct:enforce
+		EnvironmentID:   result.EnvironmentID,
+		EnvironmentName: result.EnvironmentName,
+		Status:          result.Status,
+		FromVersion:     result.FromVersion,
+		FromDigest:      result.FromDigest,
+		ToVersion:       result.ToVersion,
+		Stage:           stage,
+		StageStartedAt:  new(time.Now()),
+		Error:           result.Error,
+	}
 	if err := s.db.WithContext(ctx).Save(job).Error; err != nil {
 		slog.WarnContext(ctx, "update-all: failed to persist stage", "jobId", job.ID, "environmentId", result.EnvironmentID, "stage", stage, "error", err)
 	}
@@ -1047,15 +1132,35 @@ func (s *Service) authorizeUpdateAll(ctx context.Context, job *EnvironmentUpdate
 }
 
 func (s *Service) markUpdateAllFailed(ctx context.Context, job *EnvironmentUpdateJob, reason string) {
-	job.Status = EnvironmentUpdateJobStatusFailed
-	job.Error = &reason
-	job.CompletedAt = new(time.Now())
-	for i := range job.Results {
-		job.Results[i].clearStage()
-		if job.Results[i].Status == EnvironmentUpdateResultStatusUpdating {
-			job.Results[i].Status = EnvironmentUpdateResultStatusFailed
-			job.Results[i].Error = reason
+	results := make(EnvironmentUpdateResults, 0, len(job.Results))
+	for _, row := range job.Results {
+		if row.Status != EnvironmentUpdateResultStatusUpdating {
+			results = append(results, row.clearStage())
+			continue
 		}
+		results = append(results, EnvironmentUpdateResult{ //exhaustruct:enforce
+			EnvironmentID:   row.EnvironmentID,
+			EnvironmentName: row.EnvironmentName,
+			Status:          EnvironmentUpdateResultStatusFailed,
+			FromVersion:     row.FromVersion,
+			FromDigest:      row.FromDigest,
+			ToVersion:       row.ToVersion,
+			Stage:           "",
+			StageStartedAt:  nil,
+			Error:           reason,
+		})
+	}
+	*job = EnvironmentUpdateJob{ //exhaustruct:enforce
+		BaseModel:             job.BaseModel,
+		Status:                EnvironmentUpdateJobStatusFailed,
+		UserID:                job.UserID,
+		Username:              job.Username,
+		ManagerVersionAtStart: job.ManagerVersionAtStart,
+		ManagerDigestAtStart:  job.ManagerDigestAtStart,
+		ManagerTargetVersion:  job.ManagerTargetVersion,
+		Results:               results,
+		Error:                 &reason,
+		CompletedAt:           new(time.Now()),
 	}
 	if err := s.db.WithContext(ctx).Save(job).Error; err != nil {
 		slog.WarnContext(ctx, "update-all: failed to mark job failed", "jobId", job.ID, "error", err)
@@ -1084,22 +1189,38 @@ func (s *Service) markUpdateAllFailed(ctx context.Context, job *EnvironmentUpdat
 
 // finalizeUpdateAllJob settles the manager row, completes the job and records the audit event.
 func (s *Service) finalizeUpdateAllJob(ctx context.Context, job *EnvironmentUpdateJob, managerStatus EnvironmentUpdateResultStatus, managerVersion string) {
-	if idx := slices.IndexFunc(job.Results, func(r EnvironmentUpdateResult) bool { return r.EnvironmentID == environment.LocalEnvironmentID }); idx >= 0 {
-		job.Results[idx].Status = managerStatus
-		if managerStatus == EnvironmentUpdateResultStatusFailed {
-			job.Results[idx].Error = "manager version did not change after upgrade"
-		} else {
-			job.Results[idx].ToVersion = managerVersion
-		}
-	}
-	job.Status = EnvironmentUpdateJobStatusCompleted
-	job.CompletedAt = new(time.Now())
+	results := make(EnvironmentUpdateResults, 0, len(job.Results))
 	failed := 0
-	for i := range job.Results {
-		job.Results[i].clearStage()
-		if job.Results[i].Status == EnvironmentUpdateResultStatusFailed {
+	for _, row := range job.Results {
+		if row.EnvironmentID == environment.LocalEnvironmentID {
+			row = EnvironmentUpdateResult{ //exhaustruct:enforce
+				EnvironmentID:   row.EnvironmentID,
+				EnvironmentName: row.EnvironmentName,
+				Status:          managerStatus,
+				FromVersion:     row.FromVersion,
+				FromDigest:      row.FromDigest,
+				ToVersion:       kit.Ternary(managerStatus == EnvironmentUpdateResultStatusFailed, row.ToVersion, managerVersion),
+				Stage:           row.Stage,
+				StageStartedAt:  row.StageStartedAt,
+				Error:           kit.Ternary(managerStatus == EnvironmentUpdateResultStatusFailed, "manager version did not change after upgrade", row.Error),
+			}
+		}
+		if row.Status == EnvironmentUpdateResultStatusFailed {
 			failed++
 		}
+		results = append(results, row.clearStage())
+	}
+	*job = EnvironmentUpdateJob{ //exhaustruct:enforce
+		BaseModel:             job.BaseModel,
+		Status:                EnvironmentUpdateJobStatusCompleted,
+		UserID:                job.UserID,
+		Username:              job.Username,
+		ManagerVersionAtStart: job.ManagerVersionAtStart,
+		ManagerDigestAtStart:  job.ManagerDigestAtStart,
+		ManagerTargetVersion:  job.ManagerTargetVersion,
+		Results:               results,
+		Error:                 job.Error,
+		CompletedAt:           new(time.Now()),
 	}
 	if err := s.db.WithContext(ctx).Save(job).Error; err != nil {
 		slog.WarnContext(ctx, "update-all: failed to finalize job", "jobId", job.ID, "error", err)

@@ -1,6 +1,7 @@
 package s3
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -8,8 +9,8 @@ import (
 	"strings"
 
 	"github.com/getarcaneapp/arcane/types/v2/backup"
-	"github.com/samber/mo"
 	"go.getarcane.app/kit/normalization"
+	kit "go.getarcane.app/kit/pkg"
 	"go.getarcane.app/sys/crypto"
 	"gorm.io/gorm"
 
@@ -22,9 +23,9 @@ import (
 var (
 	ErrS3DestinationNotFound = errors.New("S3 destination not found")
 	ErrS3DestinationInUse    = errors.New("S3 destination is in use")
-	// errS3SecretRequiredInternal enforces the fresh-secret rule: a stored
+	// errS3SecretRequired enforces the fresh-secret rule: a stored
 	// secret is never combined with changed connection or trust settings.
-	errS3SecretRequiredInternal = errors.New("re-enter the secret access key when changing the endpoint, bucket, region, access key ID, SSL mode, or path style")
+	errS3SecretRequired = errors.New("re-enter the secret access key when changing the endpoint, bucket, region, access key ID, SSL mode, or path style")
 )
 
 type S3DestinationService struct {
@@ -39,7 +40,7 @@ func NewS3DestinationService(db *database.DB, checkRemoteReferences func(context
 	return &S3DestinationService{db: db, checkRemoteReferences: checkRemoteReferences}
 }
 
-func destinationConfigurationInternal(id string, input backup.CreateS3Destination) s3.Configuration {
+func destinationConfiguration(id string, input backup.CreateS3Destination) s3.Configuration {
 	return s3.Configuration{
 		ID:              id,
 		Name:            input.Name,
@@ -54,14 +55,6 @@ func destinationConfigurationInternal(id string, input backup.CreateS3Destinatio
 	}.Normalized()
 }
 
-func s3DestinationsToDTOsInternal(destinations []S3Destination) []backup.S3Destination {
-	result := make([]backup.S3Destination, len(destinations))
-	for i := range destinations {
-		result[i] = destinations[i].ToDTO()
-	}
-	return result
-}
-
 func (s *S3DestinationService) ListS3Destinations(ctx context.Context, params pagination.QueryParams) ([]backup.S3Destination, pagination.Response, error) {
 	var destinations []S3Destination
 	query := s.db.WithContext(ctx).Model(&S3Destination{})
@@ -73,7 +66,11 @@ func (s *S3DestinationService) ListS3Destinations(ctx context.Context, params pa
 	if err != nil {
 		return nil, pagination.Response{}, fmt.Errorf("failed to list S3 destinations: %w", err)
 	}
-	return s3DestinationsToDTOsInternal(destinations), response, nil
+	result := make([]backup.S3Destination, len(destinations))
+	for i := range destinations {
+		result[i] = destinations[i].ToDTO()
+	}
+	return result, response, nil
 }
 
 func (s *S3DestinationService) ListAllS3Destinations(ctx context.Context) ([]backup.S3Destination, error) {
@@ -81,15 +78,16 @@ func (s *S3DestinationService) ListAllS3Destinations(ctx context.Context) ([]bac
 	if err := s.db.WithContext(ctx).Order("name ASC").Find(&destinations).Error; err != nil {
 		return nil, fmt.Errorf("failed to list S3 destinations: %w", err)
 	}
-	return s3DestinationsToDTOsInternal(destinations), nil
+	result := make([]backup.S3Destination, len(destinations))
+	for i := range destinations {
+		result[i] = destinations[i].ToDTO()
+	}
+	return result, nil
 }
 
 // DestinationsByID indexes destinations to decorate backup records, such as with their names. Decoration never fails
-// its caller, so a missing service or failed listing yields an empty index.
+// its caller, so a failed listing yields an empty index.
 func (s *S3DestinationService) DestinationsByID(ctx context.Context) map[string]backup.S3Destination {
-	if s == nil {
-		return nil
-	}
 	destinations, err := s.ListAllS3Destinations(ctx)
 	if err != nil {
 		slog.WarnContext(ctx, "could not list S3 destinations", "error", err)
@@ -102,7 +100,7 @@ func (s *S3DestinationService) DestinationsByID(ctx context.Context) map[string]
 	return indexed
 }
 
-func (s *S3DestinationService) getS3DestinationModelInternal(ctx context.Context, id string) (*S3Destination, error) {
+func (s *S3DestinationService) getS3DestinationModel(ctx context.Context, id string) (*S3Destination, error) {
 	var destination S3Destination
 	if err := s.db.WithContext(ctx).Where("id = ?", strings.TrimSpace(id)).First(&destination).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -114,7 +112,7 @@ func (s *S3DestinationService) getS3DestinationModelInternal(ctx context.Context
 }
 
 func (s *S3DestinationService) GetS3Destination(ctx context.Context, id string) (*backup.S3Destination, error) {
-	destination, err := s.getS3DestinationModelInternal(ctx, id)
+	destination, err := s.getS3DestinationModel(ctx, id)
 	if err != nil {
 		return nil, err
 	}
@@ -122,26 +120,11 @@ func (s *S3DestinationService) GetS3Destination(ctx context.Context, id string) 
 	return &dto, nil
 }
 
-// applyS3ConfigurationInternal copies configuration onto destination and
-// reports whether any field actually changed.
-func applyS3ConfigurationInternal(destination *S3Destination, configuration s3.Configuration, encryptedSecret string) bool {
-	changed := utils.ApplyChanged(&destination.Name, mo.Some(configuration.Name))
-	changed = utils.ApplyChanged(&destination.Endpoint, mo.Some(configuration.Endpoint)) || changed
-	changed = utils.ApplyChanged(&destination.Bucket, mo.Some(configuration.Bucket)) || changed
-	changed = utils.ApplyChanged(&destination.Region, mo.Some(configuration.Region)) || changed
-	changed = utils.ApplyChanged(&destination.AccessKeyID, mo.Some(configuration.AccessKeyID)) || changed
-	changed = utils.ApplyChanged(&destination.SecretAccessKey, mo.Some(encryptedSecret)) || changed
-	changed = utils.ApplyChanged(&destination.Prefix, mo.Some(configuration.Prefix)) || changed
-	changed = utils.ApplyChanged(&destination.UseSSL, mo.Some(configuration.UseSSL)) || changed
-	changed = utils.ApplyChanged(&destination.ForcePathStyle, mo.Some(configuration.ForcePathStyle)) || changed
-	return changed
-}
-
 func (s *S3DestinationService) CreateS3Destination(ctx context.Context, input backup.CreateS3Destination) (*backup.S3Destination, error) {
 	if err := normalization.Normalize(&input); err != nil {
 		return nil, err
 	}
-	configuration := destinationConfigurationInternal("", input)
+	configuration := destinationConfiguration("", input)
 	if err := configuration.Validate(true); err != nil {
 		return nil, err
 	}
@@ -149,8 +132,17 @@ func (s *S3DestinationService) CreateS3Destination(ctx context.Context, input ba
 	if err != nil {
 		return nil, fmt.Errorf("failed to encrypt S3 secret access key: %w", err)
 	}
-	destination := &S3Destination{}
-	applyS3ConfigurationInternal(destination, configuration, encryptedSecret)
+	destination := &S3Destination{
+		Name:            configuration.Name,
+		Endpoint:        configuration.Endpoint,
+		Bucket:          configuration.Bucket,
+		Region:          configuration.Region,
+		AccessKeyID:     configuration.AccessKeyID,
+		SecretAccessKey: encryptedSecret,
+		Prefix:          configuration.Prefix,
+		UseSSL:          configuration.UseSSL,
+		ForcePathStyle:  configuration.ForcePathStyle,
+	}
 	if createDestinationErr := s.db.WithContext(ctx).Create(destination).Error; createDestinationErr != nil {
 		return nil, fmt.Errorf("failed to create S3 destination: %w", createDestinationErr)
 	}
@@ -158,10 +150,21 @@ func (s *S3DestinationService) CreateS3Destination(ctx context.Context, input ba
 	return &dto, nil
 }
 
-// storedConfigurationInternal returns the persisted configuration without the
-// decrypted secret, for comparing connection fields against an update.
-func storedConfigurationInternal(destination *S3Destination) s3.Configuration {
-	return s3.Configuration{
+func (s *S3DestinationService) UpdateS3Destination(ctx context.Context, id string, input backup.UpdateS3Destination) (*backup.S3Destination, error) {
+	if err := normalization.Normalize(&input); err != nil {
+		return nil, err
+	}
+	configuration := destinationConfiguration("", input)
+	if err := configuration.Validate(false); err != nil {
+		return nil, err
+	}
+	destination, err := s.getS3DestinationModel(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	// The persisted configuration without the
+	// decrypted secret, for comparing connection fields against an update.
+	if configuration.SecretAccessKey == "" && !s3.ConnectionFieldsEqual(s3.Configuration{
 		ID:             destination.ID,
 		Name:           destination.Name,
 		Endpoint:       destination.Endpoint,
@@ -171,32 +174,30 @@ func storedConfigurationInternal(destination *S3Destination) s3.Configuration {
 		Prefix:         destination.Prefix,
 		UseSSL:         destination.UseSSL,
 		ForcePathStyle: destination.ForcePathStyle,
-	}.Normalized()
-}
-
-func (s *S3DestinationService) UpdateS3Destination(ctx context.Context, id string, input backup.UpdateS3Destination) (*backup.S3Destination, error) {
-	if err := normalization.Normalize(&input); err != nil {
-		return nil, err
+	}.Normalized(), configuration) {
+		return nil, errS3SecretRequired
 	}
-	configuration := destinationConfigurationInternal("", input)
-	if err := configuration.Validate(false); err != nil {
-		return nil, err
-	}
-	destination, err := s.getS3DestinationModelInternal(ctx, id)
-	if err != nil {
-		return nil, err
-	}
-	if configuration.SecretAccessKey == "" && !s3.ConnectionFieldsEqual(storedConfigurationInternal(destination), configuration) {
-		return nil, errS3SecretRequiredInternal
-	}
-	encryptedSecret := destination.SecretAccessKey
-	if configuration.SecretAccessKey != "" {
-		encryptedSecret, err = crypto.Encrypt(configuration.SecretAccessKey)
-		if err != nil {
-			return nil, fmt.Errorf("failed to encrypt S3 secret access key: %w", err)
+	encryptedSecret, err := func() (string, error) {
+		if configuration.SecretAccessKey == "" {
+			return destination.SecretAccessKey, nil
 		}
+		return crypto.Encrypt(configuration.SecretAccessKey)
+	}()
+	if err != nil {
+		return nil, fmt.Errorf("failed to encrypt S3 secret access key: %w", err)
 	}
-	applyS3ConfigurationInternal(destination, configuration, encryptedSecret)
+	*destination = S3Destination{ //exhaustruct:enforce
+		BaseModel:       destination.BaseModel,
+		Name:            configuration.Name,
+		Endpoint:        configuration.Endpoint,
+		Bucket:          configuration.Bucket,
+		Region:          configuration.Region,
+		AccessKeyID:     configuration.AccessKeyID,
+		SecretAccessKey: encryptedSecret,
+		Prefix:          configuration.Prefix,
+		UseSSL:          configuration.UseSSL,
+		ForcePathStyle:  configuration.ForcePathStyle,
+	}
 	if updateDestinationErr := s.db.WithContext(ctx).Save(destination).Error; updateDestinationErr != nil {
 		return nil, fmt.Errorf("failed to update S3 destination: %w", updateDestinationErr)
 	}
@@ -205,7 +206,7 @@ func (s *S3DestinationService) UpdateS3Destination(ctx context.Context, id strin
 }
 
 func (s *S3DestinationService) DeleteS3Destination(ctx context.Context, id string) error {
-	destination, err := s.getS3DestinationModelInternal(ctx, id)
+	destination, err := s.getS3DestinationModel(ctx, id)
 	if err != nil {
 		return err
 	}
@@ -216,10 +217,8 @@ func (s *S3DestinationService) DeleteS3Destination(ctx context.Context, id strin
 	if inUse {
 		return fmt.Errorf("%w: remove it from backup configurations and retained backups first", ErrS3DestinationInUse)
 	}
-	if s.checkRemoteReferences != nil {
-		if checkRemoteReferencesErr := s.checkRemoteReferences(ctx, id); checkRemoteReferencesErr != nil {
-			return fmt.Errorf("%w: %s", ErrS3DestinationInUse, checkRemoteReferencesErr.Error())
-		}
+	if checkRemoteReferencesErr := s.checkRemoteReferences(ctx, id); checkRemoteReferencesErr != nil {
+		return fmt.Errorf("%w: %s", ErrS3DestinationInUse, checkRemoteReferencesErr.Error())
 	}
 	if deleteDestinationErr := s.db.WithContext(ctx).Delete(destination).Error; deleteDestinationErr != nil {
 		return fmt.Errorf("failed to delete S3 destination: %w", deleteDestinationErr)
@@ -266,41 +265,56 @@ func (s *S3DestinationService) SyncS3Destinations(ctx context.Context, destinati
 	if err := s.db.WithContext(ctx).Find(&existing).Error; err != nil {
 		return fmt.Errorf("failed to load existing S3 destinations: %w", err)
 	}
-	existingByID := make(map[string]*S3Destination, len(existing))
-	for i := range existing {
-		existingByID[existing[i].ID] = &existing[i]
+	existingByID := make(map[string]S3Destination, len(existing))
+	for _, destination := range existing {
+		existingByID[destination.ID] = destination
 	}
 
 	syncedIDs := make(map[string]struct{}, len(destinations))
 	for _, item := range destinations {
-		configuration := destinationConfigurationInternal(item.ID, item.CreateS3Destination)
+		configuration := destinationConfiguration(item.ID, item.CreateS3Destination)
 		if configuration.ID == "" {
 			return errors.New("S3 destination ID is required")
 		}
 		if err := configuration.Validate(true); err != nil {
 			return fmt.Errorf("invalid S3 destination %s: %w", configuration.ID, err)
 		}
-		destination, exists := existingByID[configuration.ID]
-		if !exists {
-			destination = &S3Destination{ID: configuration.ID}
-		}
+		current, exists := existingByID[configuration.ID]
 		// The manager resends the full set every health tick; unchanged rows
 		// keep their ciphertext and skip the write.
-		secretChanged, err := utils.ApplyEncrypted(&destination.SecretAccessKey, configuration.SecretAccessKey)
+		encryptedSecret := current.SecretAccessKey
+		secretChanged, err := utils.ApplyEncrypted(&encryptedSecret, configuration.SecretAccessKey)
 		if err != nil {
 			return fmt.Errorf("failed to apply S3 secret access key for %s: %w", configuration.ID, err)
 		}
-		changed := applyS3ConfigurationInternal(destination, configuration, destination.SecretAccessKey) || secretChanged || !exists
-		if !item.CreatedAt.IsZero() && !destination.CreatedAt.Equal(item.CreatedAt) {
-			destination.CreatedAt = item.CreatedAt
-			changed = true
-		}
-		if item.UpdatedAt != nil && (destination.UpdatedAt == nil || !destination.UpdatedAt.Equal(*item.UpdatedAt)) {
-			destination.UpdatedAt = item.UpdatedAt
-			changed = true
-		}
+		changed := !exists || secretChanged ||
+			current.Name != configuration.Name ||
+			current.Endpoint != configuration.Endpoint ||
+			current.Bucket != configuration.Bucket ||
+			current.Region != configuration.Region ||
+			current.AccessKeyID != configuration.AccessKeyID ||
+			current.Prefix != configuration.Prefix ||
+			current.UseSSL != configuration.UseSSL ||
+			current.ForcePathStyle != configuration.ForcePathStyle ||
+			(!item.CreatedAt.IsZero() && !current.CreatedAt.Equal(item.CreatedAt)) ||
+			(item.UpdatedAt != nil && !kit.FromPtr(current.UpdatedAt).Equal(*item.UpdatedAt))
 		if changed {
-			if syncDestinationErr := s.db.WithContext(ctx).Save(destination).Error; syncDestinationErr != nil {
+			if syncDestinationErr := s.db.WithContext(ctx).Save(&S3Destination{ //exhaustruct:enforce
+				BaseModel: database.BaseModel{
+					ID:        configuration.ID,
+					CreatedAt: kit.Ternary(item.CreatedAt.IsZero(), current.CreatedAt, item.CreatedAt),
+					UpdatedAt: kit.Ternary(item.UpdatedAt != nil, item.UpdatedAt, current.UpdatedAt),
+				},
+				Name:            configuration.Name,
+				Endpoint:        configuration.Endpoint,
+				Bucket:          configuration.Bucket,
+				Region:          configuration.Region,
+				AccessKeyID:     configuration.AccessKeyID,
+				SecretAccessKey: encryptedSecret,
+				Prefix:          configuration.Prefix,
+				UseSSL:          configuration.UseSSL,
+				ForcePathStyle:  configuration.ForcePathStyle,
+			}).Error; syncDestinationErr != nil {
 				return fmt.Errorf("failed to sync S3 destination %s: %w", configuration.ID, syncDestinationErr)
 			}
 		}
@@ -323,7 +337,7 @@ func (s *S3DestinationService) SyncS3Destinations(ctx context.Context, destinati
 
 // Configuration returns a destination's decrypted runtime configuration for backup domains.
 func (s *S3DestinationService) Configuration(ctx context.Context, id string) (s3.Configuration, error) {
-	destination, err := s.getS3DestinationModelInternal(ctx, id)
+	destination, err := s.getS3DestinationModel(ctx, id)
 	if err != nil {
 		return s3.Configuration{}, err
 	}
@@ -350,28 +364,35 @@ func (s *S3DestinationService) TestS3Destination(ctx context.Context, id string,
 	if err != nil {
 		return err
 	}
-	if input != nil {
-		if normalizeErr := normalization.Normalize(input); normalizeErr != nil {
-			return normalizeErr
-		}
-		updated := destinationConfigurationInternal("", *input)
-		updated.ID = configuration.ID
-		if updated.SecretAccessKey == "" {
-			// The stored secret may only sign requests against the stored
-			// connection settings; any change requires a fresh secret.
-			if !s3.ConnectionFieldsEqual(configuration, updated) {
-				return errS3SecretRequiredInternal
-			}
-			updated.SecretAccessKey = configuration.SecretAccessKey
-		}
-		configuration = updated
+	if input == nil {
+		return s3.TestConnection(ctx, configuration)
 	}
-	return s3.TestConnection(ctx, configuration)
+	if normalizeErr := normalization.Normalize(input); normalizeErr != nil {
+		return normalizeErr
+	}
+	updated := destinationConfiguration(configuration.ID, *input)
+	// The stored secret may only sign requests against the stored
+	// connection settings; any change requires a fresh secret.
+	if updated.SecretAccessKey == "" && !s3.ConnectionFieldsEqual(configuration, updated) {
+		return errS3SecretRequired
+	}
+	return s3.TestConnection(ctx, s3.Configuration{
+		ID:              updated.ID,
+		Name:            updated.Name,
+		Endpoint:        updated.Endpoint,
+		Bucket:          updated.Bucket,
+		Region:          updated.Region,
+		AccessKeyID:     updated.AccessKeyID,
+		SecretAccessKey: cmp.Or(updated.SecretAccessKey, configuration.SecretAccessKey),
+		Prefix:          updated.Prefix,
+		UseSSL:          updated.UseSSL,
+		ForcePathStyle:  updated.ForcePathStyle,
+	})
 }
 
 func (s *S3DestinationService) TestS3DestinationConfiguration(ctx context.Context, input backup.CreateS3Destination) error {
 	if err := normalization.Normalize(&input); err != nil {
 		return err
 	}
-	return s3.TestConnection(ctx, destinationConfigurationInternal("", input))
+	return s3.TestConnection(ctx, destinationConfiguration("", input))
 }

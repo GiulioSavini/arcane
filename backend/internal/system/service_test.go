@@ -15,6 +15,7 @@ import (
 	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/api/types/mount"
 	"github.com/moby/moby/api/types/network"
+	"github.com/moby/moby/client"
 	"github.com/stretchr/testify/require"
 	"go.getarcane.app/kit/pkg"
 	"go.getarcane.app/sys/crypto"
@@ -24,8 +25,9 @@ import (
 	"github.com/getarcaneapp/arcane/backend/v2/internal/backup"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/config"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/database"
+	"github.com/getarcaneapp/arcane/backend/v2/internal/docker"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/s3"
-	systembackup "github.com/getarcaneapp/arcane/backend/v2/internal/system/children/backup"
+	"github.com/getarcaneapp/arcane/backend/v2/internal/settings"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/volume"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/pagination"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/scheduler/flow/flowtest"
@@ -33,7 +35,7 @@ import (
 	francistest "github.com/getarcaneapp/arcane/backend/v2/pkg/utils/francis/testing"
 )
 
-func TestResolveSystemUpgraderRuntimeOptionsInternal_TCPDockerHost(t *testing.T) {
+func TestResolveSystemUpgraderRuntimeOptions_TCPDockerHost(t *testing.T) {
 	currentContainer := &container.InspectResponse{
 		HostConfig: &container.HostConfig{NetworkMode: "bridge"},
 		NetworkSettings: &container.NetworkSettings{
@@ -44,7 +46,7 @@ func TestResolveSystemUpgraderRuntimeOptionsInternal_TCPDockerHost(t *testing.T)
 		},
 	}
 
-	containerEnv, mounts, networkMode, err := resolveUpgraderRuntimeOptionsInternal(
+	containerEnv, mounts, networkMode, err := resolveUpgraderRuntimeOptions(
 		t.Context(),
 		"tcp://docker-socket-proxy:2375",
 		currentContainer,
@@ -58,8 +60,8 @@ func TestResolveSystemUpgraderRuntimeOptionsInternal_TCPDockerHost(t *testing.T)
 	require.Equal(t, container.NetworkMode("arcane-test"), networkMode)
 }
 
-func TestResolveSystemUpgraderRuntimeOptionsInternal_UnixDockerHost(t *testing.T) {
-	containerEnv, mounts, networkMode, err := resolveUpgraderRuntimeOptionsInternal(
+func TestResolveSystemUpgraderRuntimeOptions_UnixDockerHost(t *testing.T) {
+	containerEnv, mounts, networkMode, err := resolveUpgraderRuntimeOptions(
 		t.Context(),
 		"unix:///var/run/docker.sock",
 		nil,
@@ -81,8 +83,8 @@ func TestResolveSystemUpgraderRuntimeOptionsInternal_UnixDockerHost(t *testing.T
 	}, mounts)
 }
 
-func TestResolveSystemUpgraderRuntimeOptionsInternal_DefaultDockerHost(t *testing.T) {
-	containerEnv, mounts, _, err := resolveUpgraderRuntimeOptionsInternal(
+func TestResolveSystemUpgraderRuntimeOptions_DefaultDockerHost(t *testing.T) {
+	containerEnv, mounts, _, err := resolveUpgraderRuntimeOptions(
 		t.Context(),
 		"",
 		nil,
@@ -103,8 +105,8 @@ func TestResolveSystemUpgraderRuntimeOptionsInternal_DefaultDockerHost(t *testin
 	}, mounts)
 }
 
-func TestResolveSystemUpgraderRuntimeOptionsInternal_UnixDockerHostResolutionError(t *testing.T) {
-	_, _, _, err := resolveUpgraderRuntimeOptionsInternal(
+func TestResolveSystemUpgraderRuntimeOptions_UnixDockerHostResolutionError(t *testing.T) {
+	_, _, _, err := resolveUpgraderRuntimeOptions(
 		t.Context(),
 		"unix:///var/run/docker.sock",
 		nil,
@@ -121,7 +123,7 @@ func TestResolveSystemUpgraderRuntimeOptionsInternal_UnixDockerHostResolutionErr
 func TestListBackupHistoryClassifiesAndFiltersOrigins(t *testing.T) {
 	gormDB, err := gorm.Open(sqlite.Open("file:system-volume-history?mode=memory&cache=shared"), &gorm.Config{})
 	require.NoError(t, err)
-	require.NoError(t, gormDB.AutoMigrate(&SystemBackupRun{}, &volume.VolumeBackup{}))
+	require.NoError(t, gormDB.AutoMigrate(&SystemBackupRun{}, &volume.VolumeBackup{}, &s3.S3Destination{}, &settings.SettingVariable{}))
 	now := time.Now().UTC()
 	require.NoError(t, gormDB.Create(&SystemBackupRun{
 		CreatedAt: now.Add(-2 * time.Minute), Status: SystemBackupStatusSucceeded, Trigger: SystemBackupTriggerManual,
@@ -137,8 +139,14 @@ func TestListBackupHistoryClassifiesAndFiltersOrigins(t *testing.T) {
 		Trigger: volume.VolumeBackupTriggerManual, Destination: volumetypes.BackupDestinationLocal,
 		Format: volume.VolumeBackupFormatRustic,
 	}).Error)
-	service := &SystemService{db: &database.DB{DB: gormDB}}
-	service.backup = systembackup.NewService(systembackup.Dependencies{Store: service.backupStoreInternal(nil)})
+	db := &database.DB{DB: gormDB}
+	settingsService, err := settings.NewSettingsService(t.Context(), db)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, settingsService.Stop(context.WithoutCancel(t.Context()))) })
+	service := NewSystemService(
+		db, nil, nil, nil, nil, nil, settingsService, nil, nil, nil, nil, nil,
+		s3.NewS3DestinationService(db, func(context.Context, string) error { return nil }), nil, nil, &config.Config{},
+	)
 
 	systemRows, page, err := service.backup.ListBackupHistory(t.Context(), pagination.QueryParams{
 		Sort: "createdAt", Order: pagination.SortDesc, Limit: 20,
@@ -162,7 +170,7 @@ func TestListBackupHistoryClassifiesAndFiltersOrigins(t *testing.T) {
 	require.Equal(t, "cache", volumeRows[0].ResourceName)
 }
 
-func newSystemBackupAdmissionGateForTestInternal(t testing.TB) *runs.Admission {
+func newSystemBackupAdmissionGateForTest(t testing.TB) *runs.Admission {
 	t.Helper()
 	runtime := francistest.New(t)
 	gate := runs.NewAdmission(runtime.Service(), t.Name())
@@ -171,26 +179,26 @@ func newSystemBackupAdmissionGateForTestInternal(t testing.TB) *runs.Admission {
 	return gate
 }
 
-type systemBackupPolicySchedulerInternal struct {
+type systemBackupPolicyScheduler struct {
 	submitted []scheduler.Request
 	jobs      map[string]scheduler.Job
 }
 
-func (s *systemBackupPolicySchedulerInternal) AddJob(_ context.Context, job scheduler.Job) error {
+func (s *systemBackupPolicyScheduler) AddJob(_ context.Context, job scheduler.Job) error {
 	s.jobs[job.Name()] = job
 	return nil
 }
 
-func (s *systemBackupPolicySchedulerInternal) RemoveJob(_ context.Context, name string) {
+func (s *systemBackupPolicyScheduler) RemoveJob(_ context.Context, name string) {
 	delete(s.jobs, name)
 }
 
-func (s *systemBackupPolicySchedulerInternal) HasJob(name string) bool {
+func (s *systemBackupPolicyScheduler) HasJob(name string) bool {
 	_, ok := s.jobs[name]
 	return ok
 }
 
-func (s *systemBackupPolicySchedulerInternal) Submit(_ context.Context, request scheduler.Request) (scheduler.Run, error) {
+func (s *systemBackupPolicyScheduler) Submit(_ context.Context, request scheduler.Request) (scheduler.Run, error) {
 	s.submitted = append(s.submitted, request)
 	return scheduler.Run{ID: request.RunID, JobID: request.JobID, EnvironmentID: request.EnvironmentID, Status: scheduler.Queued}, nil
 }
@@ -198,25 +206,51 @@ func (s *systemBackupPolicySchedulerInternal) Submit(_ context.Context, request 
 func TestSystemBackupPoliciesRegisterIndependentJobs(t *testing.T) {
 	gormDB, err := gorm.Open(sqlite.Open("file:system-backup-schedules?mode=memory&cache=shared"), &gorm.Config{})
 	require.NoError(t, err)
-	require.NoError(t, gormDB.AutoMigrate(&SystemBackupPolicy{}, &SystemBackupRun{}, &backup.SystemBackupRecoveryConfig{}, &s3.S3Destination{}, &activity.Activity{}, &activity.ActivityMessage{}))
+	require.NoError(t, gormDB.AutoMigrate(
+		&SystemBackupPolicy{},
+		&SystemBackupRun{},
+		&backup.SystemBackupRecoveryConfig{},
+		&s3.S3Destination{},
+		&activity.Activity{},
+		&activity.ActivityMessage{},
+		&settings.SettingVariable{},
+		&volume.VolumeBackup{},
+	))
 	crypto.InitEncryption(&crypto.Config{EncryptionKey: "system-backup-policy-test-key-32bytes", Environment: "test"})
 	db := &database.DB{DB: gormDB}
 	recoveryKeys := backup.NewRecoveryKeyStore(db)
-	s3Destinations := s3.NewS3DestinationService(db, nil)
-	service := &SystemService{db: db}
-	service.backup = systembackup.NewService(systembackup.Dependencies{
-		Store:          service.backupStoreInternal(s3Destinations),
-		DB:             db,
-		SQLDB:          db.SQLDB,
-		S3Destinations: s3Destinations,
-		Config:         &config.Config{DatabaseURL: "file:system-backup-schedules-test.db"},
-		RecoveryKeys:   recoveryKeys,
-	})
+	s3Destinations := s3.NewS3DestinationService(db, func(context.Context, string) error { return nil })
+	settingsService, err := settings.NewSettingsService(t.Context(), db)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, settingsService.Stop(context.WithoutCancel(t.Context()))) })
+	gate := newSystemBackupAdmissionGateForTest(t)
+	dockerService := &docker.DockerClientService{Client: func() *client.Client {
+		cli, _ := client.New(client.WithHost("tcp://127.0.0.1:1"), client.WithAPIVersion("1.41"))
+		return cli
+	}()}
+	service := NewSystemService(
+		db,
+		dockerService,
+		nil,
+		nil,
+		volume.NewVolumeService(db, dockerService, nil, nil, nil, nil, nil, nil, nil, nil),
+		nil,
+		settingsService,
+		nil,
+		nil,
+		nil,
+		nil,
+		backup.NewEngine(gate, nil),
+		s3Destinations,
+		recoveryKeys,
+		nil,
+		&config.Config{DatabaseURL: "file:system-backup-schedules-test.db"},
+	)
 	harness := flowtest.New(t, activity.NewActivityService(db, nil))
 	require.NoError(t, service.backup.RegisterWorkflows(harness.Engine))
 	harness.Start(t)
-	jobScheduler := &systemBackupPolicySchedulerInternal{jobs: make(map[string]scheduler.Job)}
-	require.NoError(t, service.SetBackupScheduler(t.Context(), jobScheduler, newSystemBackupAdmissionGateForTestInternal(t)))
+	jobScheduler := &systemBackupPolicyScheduler{jobs: make(map[string]scheduler.Job)}
+	require.NoError(t, service.SetBackupScheduler(t.Context(), jobScheduler, gate))
 
 	status, err := service.backup.SetRecoveryKey(t.Context(), "QWERTY-ABCDEF-234567-GHIJKL-MNOPQR-STUVWX-YZ2345-ZXCVBN")
 	require.NoError(t, err)
@@ -263,12 +297,12 @@ func TestSystemBackupPoliciesRegisterIndependentJobs(t *testing.T) {
 		job, registered := jobScheduler.jobs[jobName]
 		require.True(t, registered)
 		// The scheduled run checks the remote first; a local policy then
-		// attempts its backup, which has no engine in this test.
+		// attempts its backup, which has no reachable Docker in this test.
 		outcome, runErr := job.Run(t.Context())
 		require.NoError(t, runErr)
 		if local {
 			require.Equal(t, scheduler.Failed, outcome.Status)
-			require.Contains(t, outcome.Message, "backup engine is unavailable")
+			require.Contains(t, outcome.Message, "failed to create local system recovery snapshot")
 		} else {
 			require.Equal(t, scheduler.NeedsAttention, outcome.Status)
 			require.Equal(t, backup.RemoteDisabledMessage, outcome.Message)
@@ -283,15 +317,13 @@ func TestSystemBackupPoliciesRegisterIndependentJobs(t *testing.T) {
 func TestSystemBackupPolicyRequiresConfiguredRecoveryKeyWhenEnabled(t *testing.T) {
 	gormDB, err := gorm.Open(sqlite.Open("file:system-backup-key-required?mode=memory&cache=shared"), &gorm.Config{})
 	require.NoError(t, err)
-	require.NoError(t, gormDB.AutoMigrate(&SystemBackupPolicy{}, &backup.SystemBackupRecoveryConfig{}))
+	require.NoError(t, gormDB.AutoMigrate(&SystemBackupPolicy{}, &backup.SystemBackupRecoveryConfig{}, &s3.S3Destination{}))
 	db := &database.DB{DB: gormDB}
-	service := &SystemService{db: db}
-	service.backup = systembackup.NewService(systembackup.Dependencies{
-		Store:        service.backupStoreInternal(nil),
-		DB:           db,
-		Config:       &config.Config{DatabaseURL: "file:system-backup-key-required-test.db"},
-		RecoveryKeys: backup.NewRecoveryKeyStore(db),
-	})
+	service := NewSystemService(
+		db, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil,
+		s3.NewS3DestinationService(db, func(context.Context, string) error { return nil }),
+		backup.NewRecoveryKeyStore(db), nil, &config.Config{DatabaseURL: "file:system-backup-key-required-test.db"},
+	)
 
 	_, err = service.backup.UpdatePolicies(t.Context(), []backuptypes.UpdateSystemBackupPolicy{{
 		Enabled: true, Schedule: "0 0 2 * * *", RetentionCount: 7, LocalEnabled: true,

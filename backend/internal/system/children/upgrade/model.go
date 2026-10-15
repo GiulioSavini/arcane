@@ -71,9 +71,18 @@ type EnvironmentUpdateResult struct {
 }
 
 // clearStage drops live-progress fields once the row leaves updating.
-func (r *EnvironmentUpdateResult) clearStage() {
-	r.Stage = ""
-	r.StageStartedAt = nil
+func (r EnvironmentUpdateResult) clearStage() EnvironmentUpdateResult {
+	return EnvironmentUpdateResult{ //exhaustruct:enforce
+		EnvironmentID:   r.EnvironmentID,
+		EnvironmentName: r.EnvironmentName,
+		Status:          r.Status,
+		FromVersion:     r.FromVersion,
+		FromDigest:      r.FromDigest,
+		ToVersion:       r.ToVersion,
+		Stage:           "",
+		StageStartedAt:  nil,
+		Error:           r.Error,
+	}
 }
 
 // EnvironmentUpdateResults is a JSON-serialized slice of per-environment results,

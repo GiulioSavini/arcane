@@ -161,9 +161,6 @@ func NewEngine(admission *runs.Admission, imageService *image.ImageService) *Eng
 
 // TryAcquireRun takes the admission lease for one backup resource, reporting false while another run holds it.
 func (e *Engine) TryAcquireRun(ctx context.Context, scope, id string) (*runs.Lease, bool, error) {
-	if e == nil || e.admission == nil {
-		return nil, false, errors.New("backup engine is unavailable")
-	}
 	return e.admission.TryAcquire(ctx, scheduler.AdmissionKey{Scope: scope, ID: id})
 }
 
@@ -307,12 +304,7 @@ func qualifySnapshotListing(files []string, prefix string) []string {
 		return qualified
 	}
 	for index, file := range qualified {
-		directory := strings.HasSuffix(file, "/")
-		relative := strings.TrimPrefix(strings.TrimPrefix(file, "./"), "/")
-		qualified[index] = path.Join(prefix, relative)
-		if directory {
-			qualified[index] += "/"
-		}
+		qualified[index] = path.Join(prefix, strings.TrimPrefix(strings.TrimPrefix(file, "./"), "/")) + kit.Ternary(strings.HasSuffix(file, "/"), "/", "")
 	}
 	return qualified
 }
@@ -393,11 +385,7 @@ func (e *Engine) FindRunSnapshot(ctx context.Context, dockerClient *client.Clien
 	}
 	var found Snapshot
 	for _, snapshot := range snapshots {
-		match := snapshotID != "" && snapshot.ID == snapshotID
-		if snapshotID == "" {
-			match = slices.Contains(snapshot.Tags, RunSnapshotTag(runID))
-		}
-		if !match {
+		if !kit.Ternary(snapshotID == "", slices.Contains(snapshot.Tags, RunSnapshotTag(runID)), snapshot.ID == snapshotID) {
 			continue
 		}
 		if found.ID != "" {
@@ -558,12 +546,19 @@ func (e *Engine) Replicate(ctx context.Context, dockerClient *client.Client, fro
 	defer func() {
 		_, _ = dockerClient.VolumeRemove(context.WithoutCancel(ctx), temporaryVolume, client.VolumeRemoveOptions{Force: true})
 	}()
-	copyMount := mount.Mount{Type: mount.TypeVolume, Source: temporaryVolume, Target: "/volume"}
-	if err := e.RestoreSnapshot(ctx, dockerClient, from, password, fromSnapshotID, copyMount, RestoreOptions{DeleteExtra: true}); err != nil {
+	if err := e.RestoreSnapshot(ctx, dockerClient, from, password, fromSnapshotID, mount.Mount{
+		Type:   mount.TypeVolume,
+		Source: temporaryVolume,
+		Target: "/volume",
+	}, RestoreOptions{DeleteExtra: true}); err != nil {
 		return Snapshot{}, fmt.Errorf("failed to load Rustic snapshot for replication: %w", err)
 	}
-	copyMount.ReadOnly = true
-	snapshot, err := e.CreateSnapshot(ctx, dockerClient, to, password, label, RootSnapshotInput(copyMount, tags...))
+	snapshot, err := e.CreateSnapshot(ctx, dockerClient, to, password, label, RootSnapshotInput(mount.Mount{
+		Type:     mount.TypeVolume,
+		Source:   temporaryVolume,
+		Target:   "/volume",
+		ReadOnly: true,
+	}, tags...))
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("failed to replicate Rustic snapshot: %w", err)
 	}
@@ -582,22 +577,26 @@ func (e *Engine) run(ctx context.Context, dockerClient *client.Client, repositor
 // runContainer runs one Rustic command; callers hold the repository lock.
 func (e *Engine) runContainer(ctx context.Context, dockerClient *client.Client, repository Repository, password string, command []string, extraMounts ...mount.Mount) (string, error) {
 	if _, err := dockerClient.ImageInspect(ctx, rustic.DefaultImage); err != nil {
-		if e.imageService == nil {
-			return "", errors.New("image service is unavailable")
-		}
 		if pullErr := e.imageService.PullImage(ctx, rustic.DefaultImage, io.Discard, user.SystemUser, nil); pullErr != nil {
 			return "", fmt.Errorf("failed to pull official Rustic image: %w", pullErr)
 		}
 	}
-	var networkMode container.NetworkMode
-	arcane, err := libarcane.InspectCurrentArcaneContainer(ctx, dockerClient)
-	if err != nil || arcane == nil || arcane.ID == "" {
-		slog.DebugContext(ctx, "backup engine: running Rustic on the default network", "error", err)
-	} else {
-		networkMode = container.NetworkMode("container:" + arcane.ID)
-	}
-	mounts := append(slices.Clone(repository.Mounts), extraMounts...)
-	return rustic.Run(ctx, dockerClient, password, command, repository.Environment, mounts, networkMode)
+	return rustic.Run(
+		ctx,
+		dockerClient,
+		password,
+		command,
+		repository.Environment,
+		append(slices.Clone(repository.Mounts), extraMounts...),
+		func() container.NetworkMode {
+			arcane, err := libarcane.InspectCurrentArcaneContainer(ctx, dockerClient)
+			if err != nil || kit.FromPtr(arcane).ID == "" {
+				slog.DebugContext(ctx, "backup engine: running Rustic on the default network", "error", err)
+				return ""
+			}
+			return container.NetworkMode("container:" + arcane.ID)
+		}(),
+	)
 }
 
 var (
@@ -719,8 +718,13 @@ func (s *RecoveryKeyStore) save(ctx context.Context, id, recoveryKey string) err
 func AcceptedTarget(backupID string) scheduler.TargetOutcome {
 	data, _ := json.Marshal(struct {
 		BackupID string `json:"backupId"`
-	}{backupID})
-	return scheduler.TargetOutcome{ResourceType: "backup", ID: "accepted:" + backupID, Status: scheduler.Queued, RecoveryData: data}
+	}{BackupID: backupID})
+	return scheduler.TargetOutcome{
+		ResourceType: "backup",
+		ID:           "accepted:" + backupID,
+		Status:       scheduler.Queued,
+		RecoveryData: data,
+	}
 }
 
 // AcceptedBackupID returns the backup a manual backup workflow's run owns, from its AcceptedTarget.
@@ -736,9 +740,6 @@ func AcceptedBackupID(run scheduler.Run) string {
 
 // lockRepository serializes commands against one repository and returns its unlock func.
 func (e *Engine) lockRepository(ctx context.Context, id string) (func(), error) {
-	if e == nil {
-		return nil, errors.New("backup engine is unavailable")
-	}
 	if strings.TrimSpace(id) == "" {
 		return nil, errors.New("backup repository ID is required")
 	}
@@ -815,8 +816,6 @@ func (r PolicyReconciliation[P, U]) Run(ctx context.Context, updates []U) error 
 	switch {
 	case r.Persist != nil:
 		persistErr = r.Persist(ctx, policies)
-	case r.DB == nil:
-		persistErr = errors.New("backup policy database is unavailable")
 	default:
 		persistErr = r.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 			for i := range policies {
@@ -850,27 +849,30 @@ func ValidatePolicyUpdate(ctx context.Context, domain string, update backup.Upda
 	if err != nil {
 		return update, err
 	}
-	update.Schedule = normalized
 	if update.RetentionCount < 0 || update.RetentionCount > 3650 {
 		return update, errors.New("retentionCount must be between 0 and 3650")
 	}
 	if !update.LocalEnabled && !update.S3Enabled {
 		return update, fmt.Errorf("select at least one %s backup destination", domain)
 	}
+	if update.S3Enabled && strings.TrimSpace(update.S3DestinationID) == "" {
+		return update, fmt.Errorf("select an S3 destination for %s backups", domain)
+	}
 	if update.S3Enabled {
-		if strings.TrimSpace(update.S3DestinationID) == "" {
-			return update, fmt.Errorf("select an S3 destination for %s backups", domain)
-		}
-		if s3Service == nil {
-			return update, errors.New("S3 backup destinations are unavailable")
-		}
 		if _, configurationErr := s3Service.Configuration(ctx, update.S3DestinationID); configurationErr != nil {
 			return update, fmt.Errorf("select a valid S3 destination for %s backups", domain)
 		}
-	} else {
-		update.S3DestinationID = ""
 	}
-	return update, nil
+	return backup.UpdateBackupPolicy{
+		ID:              update.ID,
+		Enabled:         update.Enabled,
+		Schedule:        normalized,
+		RetentionCount:  update.RetentionCount,
+		StopContainers:  update.StopContainers,
+		LocalEnabled:    update.LocalEnabled,
+		S3Enabled:       update.S3Enabled,
+		S3DestinationID: kit.Ternary(update.S3Enabled, update.S3DestinationID, ""),
+	}, nil
 }
 
 var ErrRemoteRepositoryMissing = errors.New("S3 backup storage is missing")
@@ -883,7 +885,7 @@ func RemoteSnapshotChecker(ctx context.Context, destinations *s3.S3DestinationSe
 	checked := make(map[string]*backup.RepositoryObservation)
 	deadline := time.Now().Add(10 * time.Second)
 	return func(destinationID, root, snapshotID string) *bool {
-		if destinations == nil || root == "" || destinationID == "" || snapshotID == "" {
+		if root == "" || destinationID == "" || snapshotID == "" {
 			return nil
 		}
 		key := destinationID + ":" + root + ":" + snapshotID
@@ -913,9 +915,6 @@ func RemoteSnapshotChecker(ctx context.Context, destinations *s3.S3DestinationSe
 // CheckRemoteRepository probes the destination's repository config within a bounded budget.
 // Transport and credential failures are returned as errors so callers never forget snapshots blindly.
 func CheckRemoteRepository(ctx context.Context, destinations *s3.S3DestinationService, destinationID, root string) (backup.RepositoryObservation, error) {
-	if destinations == nil {
-		return backup.RepositoryObservation{}, errors.New("S3 destinations are unavailable")
-	}
 	configuration, err := destinations.Configuration(ctx, destinationID)
 	if err != nil {
 		return backup.RepositoryObservation{}, err
@@ -932,15 +931,11 @@ func DisableMissingRemote(remoteErr error, localEnabled bool, s3Enabled, enabled
 	if !errors.Is(remoteErr, ErrRemoteRepositoryMissing) {
 		return false, nil
 	}
-	field, flag := "enabled", enabled
-	if localEnabled {
-		field, flag = "s3_enabled", s3Enabled
-	}
-	saved, err := save(field)
+	saved, err := save(kit.Ternary(localEnabled, "s3_enabled", "enabled"))
 	if err != nil || !saved {
 		return false, err
 	}
-	*flag = false
+	*kit.Ternary(localEnabled, s3Enabled, enabled) = false
 	return true, nil
 }
 

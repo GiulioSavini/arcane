@@ -3,7 +3,6 @@ package system
 import (
 	"cmp"
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -25,6 +24,7 @@ import (
 	"github.com/samber/mo"
 	"go.getarcane.app/docker"
 	"go.getarcane.app/docker/compat"
+	kit "go.getarcane.app/kit/pkg"
 	"go.getarcane.app/sys/cgroup"
 	"go.getarcane.app/updater"
 	"go.getarcane.app/updater/labels"
@@ -91,10 +91,6 @@ func NewSystemService(
 	actors *francis.Runtime,
 	cfg *config.Config,
 ) *SystemService {
-	location := time.UTC
-	if cfg != nil {
-		location = cfg.GetLocation()
-	}
 	s := &SystemService{
 		db:               db,
 		dockerService:    dockerService,
@@ -104,17 +100,13 @@ func NewSystemService(
 		dockerHostMemoryCache: hot.NewHotCache[struct{}, dockerHostMemoryInfo](hot.LRU, 1).
 			WithTTL(dockerHostMemoryCacheTTL).
 			Build(),
-		prune:   prune.NewService(location, dockerService.GetClient, activityService, imageUpdateService, volumeService, networkService),
-		upgrade: upgrade.NewService(db, dockerService, versionService, eventService, settingsService, projectService, resolveUpgraderRuntimeOptionsInternal),
-	}
-	var sqlDB func() (*sql.DB, error)
-	if db != nil {
-		sqlDB = db.SQLDB
+		prune:   prune.NewService(cfg.GetLocation(), dockerService.GetClient, activityService, imageUpdateService, volumeService, networkService),
+		upgrade: upgrade.NewService(db, dockerService, versionService, eventService, settingsService, projectService, resolveUpgraderRuntimeOptions),
 	}
 	s.backup = systembackup.NewService(systembackup.Dependencies{
-		Store:                 s.backupStoreInternal(s3Destinations),
+		Store:                 s.backupStore(s3Destinations),
 		DB:                    db,
-		SQLDB:                 sqlDB,
+		SQLDB:                 db.SQLDB,
 		ActorStore:            actors.Store,
 		Docker:                dockerService,
 		Volumes:               volumeService,
@@ -124,7 +116,7 @@ func NewSystemService(
 		Settings:              settingsService,
 		Config:                cfg,
 		RecoveryKeys:          recoveryKeys,
-		ResolveRuntimeOptions: resolveUpgraderRuntimeOptionsInternal,
+		ResolveRuntimeOptions: resolveUpgraderRuntimeOptions,
 	})
 	return s
 }
@@ -188,184 +180,130 @@ func (s *SystemService) PruneUpgradeLogs(ctx context.Context, dataDir string, no
 	return s.upgrade.PruneUpgradeLogs(ctx, dataDir, now)
 }
 
-func (
-	s *SystemService,
-) performBatchContainerAction(
-	ctx context.Context,
-	containers []mobycontainer.Summary,
-	actionName string,
-	shouldProcess func(
-		mobycontainer.Summary,
-	) bool,
-	action func(
-		context.Context,
-		string,
-	) error,
-) *containertypes.ActionResult {
-	result := &containertypes.ActionResult{Success: true}
-	var mu sync.Mutex
-
-	g, groupCtx := errgroup.WithContext(ctx)
-	// Limit concurrency to avoid overwhelming Docker daemon
-	g.SetLimit(5)
-
-	for _, containerSummary := range containers {
-		c := containerSummary // capture loop var
-		if !shouldProcess(c) {
-			continue
-		}
-
-		g.Go(func() (workerErr error) {
-			defer utils.RecoverToError(&workerErr, "system info worker")
-
-			err := action(groupCtx, c.ID)
-
-			mu.Lock()
-			defer mu.Unlock()
-
-			if err != nil {
-				result.Failed = append(result.Failed, c.ID)
-				result.Errors = append(result.Errors, fmt.Sprintf("Failed to %s container %s: %v", actionName, c.ID, err))
-				result.Success = false
-			} else {
-				if actionName == "start" {
-					result.Started = append(result.Started, c.ID)
-				} else {
-					result.Stopped = append(result.Stopped, c.ID)
-				}
-			}
-			return nil
-		})
-	}
-
-	_ = g.Wait()
-	return result
-}
-
 func (s *SystemService) StartAllContainers(ctx context.Context, environmentID string) (*containertypes.ActionResult, error) {
-	return s.startMatchingContainersInternal(ctx, environmentID, startMatchingContainersOptionsInternal{
+	return s.performBatchContainerAction(ctx, environmentID, startMatchingContainersOptions{
+		ActivityType:   activitytypes.TypeContainerStart,
+		ActionName:     "start",
 		ResourceName:   "All containers",
 		StartMessage:   "Starting all containers",
-		FailureMessage: "Starting all containers failed",
 		SuccessMessage: "Started all containers",
 		ShouldStart:    func(c mobycontainer.Summary) bool { return c.State != "running" },
+		Action: func(ctx context.Context, id string) error {
+			return s.containerService.StartContainer(ctx, id, usertypes.SystemUser)
+		},
 	})
 }
 
 func (s *SystemService) StartAllStoppedContainers(ctx context.Context, environmentID string) (*containertypes.ActionResult, error) {
-	return s.startMatchingContainersInternal(ctx, environmentID, startMatchingContainersOptionsInternal{
+	return s.performBatchContainerAction(ctx, environmentID, startMatchingContainersOptions{
+		ActivityType:   activitytypes.TypeContainerStart,
+		ActionName:     "start",
 		ResourceName:   "Stopped containers",
 		StartMessage:   "Starting stopped containers",
-		FailureMessage: "Starting stopped containers failed",
 		SuccessMessage: "Started stopped containers",
 		ShouldStart:    func(c mobycontainer.Summary) bool { return c.State == "exited" },
+		Action: func(ctx context.Context, id string) error {
+			return s.containerService.StartContainer(ctx, id, usertypes.SystemUser)
+		},
 	})
-}
-
-type startMatchingContainersOptionsInternal struct {
-	ResourceName   string
-	StartMessage   string
-	FailureMessage string
-	SuccessMessage string
-	ShouldStart    func(mobycontainer.Summary) bool
-}
-
-func (s *SystemService) startMatchingContainersInternal(ctx context.Context, environmentID string, opts startMatchingContainersOptionsInternal) (*containertypes.ActionResult, error) {
-	activityID := s.startSystemContainerActivityInternal(ctx, environmentID, activitytypes.TypeContainerStart, opts.ResourceName, opts.StartMessage)
-	ctx = s.activityService.Track(ctx, activityID)
-	containers, _, _, _, err := s.dockerService.GetAllContainers(ctx)
-	if err != nil {
-		result := &containertypes.ActionResult{
-			Success:    false,
-			Errors:     []string{fmt.Sprintf("Failed to list containers: %v", err)},
-			ActivityID: mo.EmptyableToOption(strings.TrimSpace(activityID)).ToPointer(),
-		}
-		s.completeSystemContainerActivityInternal(ctx, activityID, opts.FailureMessage, result)
-		return result, err
-	}
-
-	result := s.performBatchContainerAction(ctx, containers, "start", opts.ShouldStart, func(ctx context.Context, id string) error {
-		return s.containerService.StartContainer(ctx, id, usertypes.SystemUser)
-	})
-	result.ActivityID = mo.EmptyableToOption(strings.TrimSpace(activityID)).ToPointer()
-	s.completeSystemContainerActivityInternal(ctx, activityID, opts.SuccessMessage, result)
-	return result, nil
 }
 
 func (s *SystemService) StopAllContainers(ctx context.Context, environmentID string) (*containertypes.ActionResult, error) {
-	activityID := s.startSystemContainerActivityInternal(ctx, environmentID, activitytypes.TypeContainerStop, "All containers", "Stopping all containers")
-	ctx = s.activityService.Track(ctx, activityID)
-	containers, _, _, _, err := s.dockerService.GetAllContainers(ctx)
-	if err != nil {
-		result := &containertypes.ActionResult{
-			Success:    false,
-			Errors:     []string{fmt.Sprintf("Failed to list containers: %v", err)},
-			ActivityID: mo.EmptyableToOption(strings.TrimSpace(activityID)).ToPointer(),
-		}
-		s.completeSystemContainerActivityInternal(ctx, activityID, "Stopping all containers failed", result)
-		return result, err
-	}
-
-	result := s.performBatchContainerAction(ctx, containers, "stop",
-		func(c mobycontainer.Summary) bool {
-			// Skip Arcane container
-			return !labels.IsArcaneContainer(c.Labels)
-		},
-		func(ctx context.Context, id string) error {
+	return s.performBatchContainerAction(ctx, environmentID, startMatchingContainersOptions{
+		ActivityType:   activitytypes.TypeContainerStop,
+		ActionName:     "stop",
+		ResourceName:   "All containers",
+		StartMessage:   "Stopping all containers",
+		SuccessMessage: "Stopped all containers",
+		// Skip Arcane container
+		ShouldStart: func(c mobycontainer.Summary) bool { return !labels.IsArcaneContainer(c.Labels) },
+		Action: func(ctx context.Context, id string) error {
 			return s.containerService.StopContainer(ctx, id, usertypes.SystemUser)
-		})
-	result.ActivityID = mo.EmptyableToOption(strings.TrimSpace(activityID)).ToPointer()
-	s.completeSystemContainerActivityInternal(ctx, activityID, "Stopped all containers", result)
-	return result, nil
+		},
+	})
 }
 
-func (s *SystemService) startSystemContainerActivityInternal(ctx context.Context, environmentID string, activityType activitytypes.Type, resourceName, message string) string {
-	if s.activityService == nil {
-		return ""
-	}
+type startMatchingContainersOptions struct {
+	ActivityType   activitytypes.Type
+	ActionName     string
+	ResourceName   string
+	StartMessage   string
+	SuccessMessage string
+	ShouldStart    func(mobycontainer.Summary) bool
+	Action         func(context.Context, string) error
+}
+
+func (s *SystemService) performBatchContainerAction(ctx context.Context, environmentID string, opts startMatchingContainersOptions) (*containertypes.ActionResult, error) {
 	localActivity, err := s.activityService.StartActivity(ctx, activity.StartActivityRequest{
 		EnvironmentID: environmentID,
-		Type:          activityType,
+		Type:          opts.ActivityType,
 		ResourceType:  new("system"),
-		ResourceName:  &resourceName,
-		Step:          message,
-		LatestMessage: message,
-		Metadata:      database.JSON{"scope": resourceName},
+		ResourceName:  &opts.ResourceName,
+		Step:          opts.StartMessage,
+		LatestMessage: opts.StartMessage,
+		Metadata:      database.JSON{"scope": opts.ResourceName},
 	})
 	if err != nil {
-		slog.DebugContext(ctx, "failed to start system container activity", "type", activityType, "error", err)
-		return ""
+		slog.DebugContext(ctx, "failed to start system container activity", "type", opts.ActivityType, "error", err)
 	}
-	return localActivity.ID
-}
+	activityID := kit.Ternary(err != nil, "", kit.FromPtr(localActivity).ID)
+	ctx = s.activityService.Track(ctx, activityID)
 
-func (s *SystemService) completeSystemContainerActivityInternal(ctx context.Context, activityID, successMessage string, result *containertypes.ActionResult) {
-	if s.activityService == nil || activityID == "" || result == nil {
-		return
+	var mu sync.Mutex
+	var processed, failed, errs []string
+	containers, _, _, _, listErr := s.dockerService.GetAllContainers(ctx)
+	if listErr != nil {
+		errs = append(errs, fmt.Sprintf("Failed to list containers: %v", listErr))
+	} else {
+		g, groupCtx := errgroup.WithContext(ctx)
+		// Limit concurrency to avoid overwhelming Docker daemon
+		g.SetLimit(5)
+		for _, c := range containers {
+			if !opts.ShouldStart(c) {
+				continue
+			}
+			g.Go(func() (workerErr error) {
+				defer utils.RecoverToError(&workerErr, "system info worker")
+				actionErr := opts.Action(groupCtx, c.ID)
+				mu.Lock()
+				defer mu.Unlock()
+				if actionErr != nil {
+					failed = append(failed, c.ID)
+					errs = append(errs, fmt.Sprintf("Failed to %s container %s: %v", opts.ActionName, c.ID, actionErr))
+					return nil
+				}
+				processed = append(processed, c.ID)
+				return nil
+			})
+		}
+		_ = g.Wait()
 	}
 
-	status := activitytypes.StatusSuccess
-	message := successMessage
-	var errMessage *string
-	if !result.Success || len(result.Errors) > 0 {
-		status = activitytypes.StatusFailed
-		message = strings.Join(result.Errors, "; ")
-		errMessage = &message
+	result := &containertypes.ActionResult{
+		Success:    len(errs) == 0,
+		Started:    kit.Ternary(opts.ActionName == "start", processed, nil),
+		Stopped:    kit.Ternary(opts.ActionName == "start", nil, processed),
+		Failed:     failed,
+		Errors:     errs,
+		ActivityID: mo.EmptyableToOption(strings.TrimSpace(activityID)).ToPointer(),
 	}
-
-	if _, err := s.activityService.CompleteActivity(utils.ActivityRuntimeContext(ctx, nil), activityID, status, message, errMessage); err != nil {
-		slog.DebugContext(ctx, "failed to complete system container activity", "activityId", activityID, "error", err)
+	if activityID != "" {
+		_, completeErr := s.activityService.CompleteActivity(
+			utils.ActivityRuntimeContext(ctx, nil),
+			activityID,
+			kit.Ternary(len(errs) > 0, activitytypes.StatusFailed, activitytypes.StatusSuccess),
+			kit.Ternary(len(errs) > 0, strings.Join(errs, "; "), opts.SuccessMessage),
+			kit.Ternary(len(errs) > 0, new(strings.Join(errs, "; ")), nil),
+		)
+		if completeErr != nil {
+			slog.DebugContext(ctx, "failed to complete system container activity", "activityId", activityID, "error", completeErr)
+		}
 	}
+	return result, listErr
 }
 
 func (s *SystemService) GetDiskUsagePath(ctx context.Context) string {
-	cfg := s.settingsService.GetSettingsConfig()
-	if cfg == nil {
-		return "/"
-	}
-
-	path := cmp.Or(cfg.DiskUsagePath.Value, "/")
-	return path
+	return cmp.Or(s.settingsService.GetSettingsConfig().DiskUsagePath.Value, "/")
 }
 
 const dockerHostMemoryCacheTTL = 30 * time.Second
@@ -378,17 +316,16 @@ type dockerHostMemoryInfo struct {
 // GetDockerHostMemory reports enclosing guest memory when Docker shares its
 // host's cgroup namespace. A false result leaves the caller's baseline intact.
 func (s *SystemService) GetDockerHostMemory(ctx context.Context) (uint64, uint64, bool) {
-	if runtime.GOOS != "linux" || s.dockerService == nil || s.dockerHostMemoryCache == nil || !cgroup.IsDockerContainer() {
+	if runtime.GOOS != "linux" || !cgroup.IsDockerContainer() {
 		return 0, 0, false
 	}
 
 	info, found, err := s.dockerHostMemoryCache.GetWithLoaders(struct{}{}, func(_ []struct{}) (map[struct{}]dockerHostMemoryInfo, error) {
-		metadata, err := s.loadDockerHostMemoryInternal(ctx)
+		metadata, err := s.loadDockerHostMemory(ctx)
 		if err != nil {
 			slog.DebugContext(ctx, "Docker host memory accounting unavailable", "error", err)
-			// Cache failures too, without retaining expired metadata.
-			metadata = dockerHostMemoryInfo{}
 		}
+		// Cache failures too, without retaining expired metadata.
 		return map[struct{}]dockerHostMemoryInfo{{}: metadata}, nil
 	})
 	if err != nil || !found || info.total == 0 || ctx.Err() != nil {
@@ -402,7 +339,7 @@ func (s *SystemService) GetDockerHostMemory(ctx context.Context) (uint64, uint64
 	return min(used, info.total), info.total, true
 }
 
-func (s *SystemService) loadDockerHostMemoryInternal(ctx context.Context) (dockerHostMemoryInfo, error) {
+func (s *SystemService) loadDockerHostMemory(ctx context.Context) (dockerHostMemoryInfo, error) {
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 
@@ -418,8 +355,7 @@ func (s *SystemService) loadDockerHostMemoryInternal(ctx context.Context) (docke
 	if err != nil {
 		return dockerHostMemoryInfo{}, err
 	}
-	if !strings.HasPrefix(inspect.Container.ID, containerID) || inspect.Container.HostConfig == nil ||
-		inspect.Container.HostConfig.CgroupnsMode != "host" {
+	if !strings.HasPrefix(inspect.Container.ID, containerID) || kit.FromPtr(inspect.Container.HostConfig).CgroupnsMode != "host" {
 		return dockerHostMemoryInfo{}, errors.New("current container does not share the Docker host cgroup namespace")
 	}
 	// Inspection expands hostname and mountinfo short IDs before cgroup validation.
@@ -438,8 +374,8 @@ func (s *SystemService) loadDockerHostMemoryInternal(ctx context.Context) (docke
 	return dockerHostMemoryInfo{root: root, total: uint64(info.Info.MemTotal)}, nil
 }
 
-// resolveUpgraderRuntimeOptionsInternal determines how a helper container reaches the Docker daemon.
-func resolveUpgraderRuntimeOptionsInternal(
+// resolveUpgraderRuntimeOptions determines how a helper container reaches the Docker daemon.
+func resolveUpgraderRuntimeOptions(
 	ctx context.Context,
 	dockerHost string,
 	currentContainer *mobycontainer.InspectResponse,
@@ -447,21 +383,18 @@ func resolveUpgraderRuntimeOptionsInternal(
 	isRunningInDocker func() bool,
 	selectReachableNetwork func(context.Context, *mobycontainer.InspectResponse, string) string,
 ) ([]string, []mount.Mount, mobycontainer.NetworkMode, error) {
-	containerEnv := vuln.BuildDockerHostEnv(dockerHost)
-
 	scheme, socketPath, err := vuln.ParseDockerHost(dockerHost)
 	if err != nil {
 		return nil, nil, "", fmt.Errorf("resolve docker host %q: %w", dockerHost, err)
 	}
 
+	// The upgrader must reach the tcp DOCKER_HOST, so prefer a network the
+	// daemon proxy is actually on over the plain auto heuristic (#3533).
+	if scheme != "unix" && selectReachableNetwork != nil {
+		return vuln.BuildDockerHostEnv(dockerHost), nil, mobycontainer.NetworkMode(selectReachableNetwork(ctx, currentContainer, dockerHost)), nil
+	}
 	if scheme != "unix" {
-		// The upgrader must reach the tcp DOCKER_HOST, so prefer a network the
-		// daemon proxy is actually on over the plain auto heuristic (#3533).
-		networkMode := docker.SelectAutoNetworkMode(currentContainer)
-		if selectReachableNetwork != nil {
-			networkMode = selectReachableNetwork(ctx, currentContainer, dockerHost)
-		}
-		return containerEnv, nil, mobycontainer.NetworkMode(networkMode), nil
+		return vuln.BuildDockerHostEnv(dockerHost), nil, mobycontainer.NetworkMode(docker.SelectAutoNetworkMode(currentContainer)), nil
 	}
 
 	socketSource, err := vuln.ResolveUnixSocketSource(
@@ -474,13 +407,11 @@ func resolveUpgraderRuntimeOptionsInternal(
 		return nil, nil, "", fmt.Errorf("resolve unix socket source: %w", err)
 	}
 
-	mounts := []mount.Mount{{
+	return vuln.BuildDockerHostEnv(dockerHost), []mount.Mount{{
 		Type:   mount.TypeBind,
 		Source: socketSource,
 		Target: socketPath,
-	}}
-
-	return containerEnv, mounts, "", nil
+	}}, "", nil
 }
 
 const systemBackupHistoryUnion = "SELECT id, size, created_at, status, trigger, destination, '' AS format, local_snapshot_id, " +
@@ -490,20 +421,68 @@ const systemBackupHistoryUnion = "SELECT id, size, created_at, status, trigger, 
 	"s3_destination_id, policy_id, error, CASE WHEN policy_id LIKE 'system-volume:%' THEN 'system' ELSE " +
 	"'volume' END AS type, 'volume' AS resource_type, volume_name AS resource_name FROM volume_backups"
 
-// backupStoreInternal persists system backup runs and policies for the backup child.
-func (s *SystemService) backupStoreInternal(s3Destinations *s3.S3DestinationService) systembackup.Store {
+// backupStore persists system backup runs and policies for the backup child.
+func (s *SystemService) backupStore(s3Destinations *s3.S3DestinationService) systembackup.Store {
 	return systembackup.Store{
 		CreateRun: func(ctx context.Context, dto *backuptypes.SystemBackupRun) error {
-			run := systemBackupRunFromDTOInternal(*dto)
+			run := SystemBackupRun{ //exhaustruct:enforce
+				BaseModel: database.BaseModel{
+					ID:        dto.ID,
+					CreatedAt: time.Time{},
+					UpdatedAt: nil,
+				},
+				Size:              dto.Size,
+				CreatedAt:         dto.CreatedAt,
+				Status:            SystemBackupStatus(dto.Status),
+				Trigger:           SystemBackupTrigger(dto.Trigger),
+				Destination:       dto.Destination,
+				LocalSnapshotID:   dto.LocalSnapshotID,
+				RemoteSnapshotID:  dto.RemoteSnapshotID,
+				S3DestinationID:   dto.S3DestinationID,
+				S3DestinationName: dto.S3DestinationName,
+				PolicyID:          dto.PolicyID,
+				Error:             dto.Error,
+			}
 			if err := s.db.WithContext(ctx).Create(&run).Error; err != nil {
 				return err
 			}
-			dto.ID, dto.CreatedAt = run.ID, run.CreatedAt
+			*dto = backuptypes.SystemBackupRun{ //exhaustruct:enforce
+				RemoteAvailable:   dto.RemoteAvailable,
+				ActivityID:        dto.ActivityID,
+				ID:                run.ID,
+				Size:              dto.Size,
+				CreatedAt:         run.CreatedAt,
+				Status:            dto.Status,
+				Trigger:           dto.Trigger,
+				Destination:       dto.Destination,
+				LocalSnapshotID:   dto.LocalSnapshotID,
+				RemoteSnapshotID:  dto.RemoteSnapshotID,
+				S3DestinationID:   dto.S3DestinationID,
+				S3DestinationName: dto.S3DestinationName,
+				PolicyID:          dto.PolicyID,
+				Error:             dto.Error,
+			}
 			return nil
 		},
 		SaveRun: func(ctx context.Context, dto *backuptypes.SystemBackupRun) error {
-			run := systemBackupRunFromDTOInternal(*dto)
-			return s.db.WithContext(ctx).Save(&run).Error
+			return s.db.WithContext(ctx).Save(&SystemBackupRun{ //exhaustruct:enforce
+				BaseModel: database.BaseModel{
+					ID:        dto.ID,
+					CreatedAt: time.Time{},
+					UpdatedAt: nil,
+				},
+				Size:              dto.Size,
+				CreatedAt:         dto.CreatedAt,
+				Status:            SystemBackupStatus(dto.Status),
+				Trigger:           SystemBackupTrigger(dto.Trigger),
+				Destination:       dto.Destination,
+				LocalSnapshotID:   dto.LocalSnapshotID,
+				RemoteSnapshotID:  dto.RemoteSnapshotID,
+				S3DestinationID:   dto.S3DestinationID,
+				S3DestinationName: dto.S3DestinationName,
+				PolicyID:          dto.PolicyID,
+				Error:             dto.Error,
+			}).Error
 		},
 		FailRun: func(ctx context.Context, id, message string) error {
 			return s.db.WithContext(ctx).Model(&SystemBackupRun{}).Where("id = ?", id).Updates(map[string]any{"status": SystemBackupStatusFailed, "error": message}).Error
@@ -578,9 +557,9 @@ func (s *SystemService) backupStoreInternal(s3Destinations *s3.S3DestinationServ
 			return count, err
 		},
 		Policies: func(ctx context.Context) ([]backuptypes.SystemBackupPolicy, error) {
-			policies, err := s.backupPoliciesInternal(ctx)
-			if err != nil {
-				return nil, err
+			var policies []SystemBackupPolicy
+			if err := s.db.WithContext(ctx).Order("created_at ASC").Find(&policies).Error; err != nil {
+				return nil, fmt.Errorf("failed to load system backup policies: %w", err)
 			}
 			result := make([]backuptypes.SystemBackupPolicy, len(policies))
 			for i := range policies {
@@ -609,9 +588,9 @@ func (s *SystemService) backupStoreInternal(s3Destinations *s3.S3DestinationServ
 			unregister func(context.Context, string),
 			reschedule func(context.Context, *backuptypes.SystemBackupPolicy),
 		) error {
-			existing, err := s.backupPoliciesInternal(ctx)
-			if err != nil {
-				return err
+			var existing []SystemBackupPolicy
+			if err := s.db.WithContext(ctx).Order("created_at ASC").Find(&existing).Error; err != nil {
+				return fmt.Errorf("failed to load system backup policies: %w", err)
 			}
 			return backup.PolicyReconciliation[SystemBackupPolicy, backuptypes.UpdateSystemBackupPolicy]{
 				Domain:   "system",
@@ -625,7 +604,15 @@ func (s *SystemService) backupStoreInternal(s3Destinations *s3.S3DestinationServ
 					if buildErr := build(ctx, &dto, update); buildErr != nil {
 						return buildErr
 					}
-					policy.applyDTOInternal(dto)
+					*policy = SystemBackupPolicy{ //exhaustruct:enforce
+						BaseModel:       policy.BaseModel,
+						Enabled:         dto.Enabled,
+						Schedule:        dto.Schedule,
+						RetentionCount:  dto.RetentionCount,
+						LocalEnabled:    dto.LocalEnabled,
+						S3Enabled:       dto.S3Enabled,
+						S3DestinationID: dto.S3DestinationID,
+					}
 					return nil
 				},
 				Unregister: unregister,
@@ -650,21 +637,17 @@ func (s *SystemService) backupStoreInternal(s3Destinations *s3.S3DestinationServ
 				)
 			}
 			query = pagination.ApplyFilter(query, "type", params.Filters["type"])
-			if params.Sort == "" {
-				params.Sort = "createdAt"
-				params.Order = pagination.SortDesc
-			}
 			var history []backuptypes.HistoryEntry
-			page, err := pagination.PaginateAndSortDB(params, query, &history)
+			page, err := pagination.PaginateAndSortDB(pagination.QueryParams{
+				SearchQuery: params.SearchQuery,
+				SortParams: pagination.SortParams{
+					Sort:  cmp.Or(params.Sort, "createdAt"),
+					Order: kit.Ternary(params.Sort == "", pagination.SortDesc, params.Order),
+				},
+				Params:  params.Params,
+				Filters: params.Filters,
+			}, query, &history)
 			return history, page, err
 		},
 	}
-}
-
-func (s *SystemService) backupPoliciesInternal(ctx context.Context) ([]SystemBackupPolicy, error) {
-	var policies []SystemBackupPolicy
-	if err := s.db.WithContext(ctx).Order("created_at ASC").Find(&policies).Error; err != nil {
-		return nil, fmt.Errorf("failed to load system backup policies: %w", err)
-	}
-	return policies, nil
 }

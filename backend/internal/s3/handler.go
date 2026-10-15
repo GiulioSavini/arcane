@@ -168,15 +168,11 @@ func (h *s3DestinationHandler) test(ctx context.Context, input *testS3Destinatio
 }
 
 func (h *s3DestinationHandler) triggerRemoteSync(ctx context.Context, reason string) {
-	if h.syncRemoteDestinations == nil {
-		return
-	}
-	detachedCtx := context.WithoutCancel(ctx)
 	go func(syncCtx context.Context, syncReason string) {
 		if err := h.syncRemoteDestinations(syncCtx); err != nil {
 			slog.WarnContext(syncCtx, s3RemoteSyncFailureMessage, "reason", syncReason, "error", err.Error())
 		}
-	}(detachedCtx, reason)
+	}(context.WithoutCancel(ctx), reason)
 }
 
 func (h *s3DestinationHandler) testConfiguration(ctx context.Context, input *testS3DestinationConfigurationInput) (*handlerutil.Out[base.MessageResponse], error) {

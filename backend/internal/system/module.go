@@ -3,6 +3,7 @@
 package system
 
 import (
+	"cmp"
 	"net/http"
 
 	"github.com/danielgtaylor/huma/v2"
@@ -50,10 +51,7 @@ func (m *Module) RegisterRoutes(api huma.API, appCtx handlerutil.ActivityAppCont
 	if m == nil {
 		m = &Module{}
 	}
-	service := m.service
-	if service == nil {
-		service = &SystemService{}
-	}
+	service := cmp.Or(m.service, &SystemService{})
 
 	RegisterSystem(api, NewHandler(m.dockerService, m.service, appCtx.Context()))
 	prune.RegisterRoutes(api, prune.NewHandler(service.prune, appCtx.Context()))

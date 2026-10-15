@@ -192,8 +192,11 @@ func (session systemBackupSnapshotSession) inspectProjectSnapshot(ctx context.Co
 	if err != nil {
 		return systemBackupSnapshot{}, fmt.Errorf("inspect %s project files: %w", location.name, err)
 	}
-	snapshot.entries = projectEntriesFromSnapshot(listed, snapshot.layout, "", true)
-	return snapshot, nil
+	return systemBackupSnapshot{
+		systemBackupSnapshotLocation: snapshot.systemBackupSnapshotLocation,
+		layout:                       snapshot.layout,
+		entries:                      projectEntriesFromSnapshot(listed, snapshot.layout, "", true),
+	}, nil
 }
 
 // inspectProjectManifest opens a snapshot for project browsing;
@@ -319,12 +322,12 @@ func (session systemBackupSnapshotSession) openSafetySnapshot(
 	systemBackupSafetySnapshot,
 	error,
 ) {
-	location := source.systemBackupSnapshotLocation
-	location.name = "safety"
-	if source.destination == backuptypes.SystemBackupDestinationS3 {
-		location.snapshotID = safetyRun.RemoteSnapshotID
-	} else {
-		location.snapshotID = safetyRun.LocalSnapshotID
+	location := systemBackupSnapshotLocation{ //exhaustruct:enforce
+		name:            "safety",
+		destination:     source.destination,
+		s3DestinationID: source.s3DestinationID,
+		repository:      source.repository,
+		snapshotID:      kit.Ternary(source.destination == backuptypes.SystemBackupDestinationS3, safetyRun.RemoteSnapshotID, safetyRun.LocalSnapshotID),
 	}
 	if location.snapshotID == "" {
 		return systemBackupSafetySnapshot{}, errors.New("pre-restore system backup has no snapshot in the selected repository")
@@ -337,7 +340,11 @@ func (session systemBackupSnapshotSession) openSafetySnapshot(
 	for _, entry := range snapshot.entries {
 		paths[entry.Path] = struct{}{}
 	}
-	return systemBackupSafetySnapshot{systemBackupSnapshotLocation: location, layout: snapshot.layout, paths: paths}, nil
+	return systemBackupSafetySnapshot{
+		systemBackupSnapshotLocation: location,
+		layout:                       snapshot.layout,
+		paths:                        paths,
+	}, nil
 }
 
 func (session systemBackupSnapshotSession) restoreEntry(
@@ -437,9 +444,7 @@ func (session systemBackupSnapshotSession) restoreSelected(
 	restored := make([]backuptypes.BackupFileEntry, 0, len(selected))
 	for _, selectedEntry := range selected {
 		if err := session.restoreEntry(ctx, snapshots, selectedEntry, destination); err != nil {
-			affected := slices.Clone(restored)
-			affected = append(affected, selectedEntry)
-			rollbackErr := session.rollback(context.WithoutCancel(ctx), safety, affected, destination)
+			rollbackErr := session.rollback(context.WithoutCancel(ctx), safety, append(slices.Clone(restored), selectedEntry), destination)
 			restoreErr := fmt.Errorf("failed to restore project path %s from system backup: %w", selectedEntry.Path, err)
 			if rollbackErr != nil {
 				return errors.Join(restoreErr, fmt.Errorf("failed to roll back project files from pre-restore system backup: %w", rollbackErr))
@@ -492,12 +497,11 @@ func (s *Service) RestoreFiles(
 	// The safety backup mirrors the restore source so the rollback snapshot
 	// lives in the repository the restore is already reading from.
 	source := snapshots[0]
-	safetyRequest := backuptypes.CreateSystemBackupRequest{Destination: backuptypes.SystemBackupDestinationLocal, RecoveryKey: key}
-	if source.destination == backuptypes.SystemBackupDestinationS3 {
-		safetyRequest.Destination = backuptypes.SystemBackupDestinationS3
-		safetyRequest.S3DestinationID = source.s3DestinationID
-	}
-	safetyRun, err := createSafety(ctx, safetyRequest)
+	safetyRun, err := createSafety(ctx, backuptypes.CreateSystemBackupRequest{
+		Destination:     kit.Ternary(source.destination == backuptypes.SystemBackupDestinationS3, backuptypes.SystemBackupDestinationS3, backuptypes.SystemBackupDestinationLocal),
+		S3DestinationID: kit.Ternary(source.destination == backuptypes.SystemBackupDestinationS3, source.s3DestinationID, ""),
+		RecoveryKey:     key,
+	})
 	if err != nil {
 		return fmt.Errorf("failed to create pre-restore system backup: %w", err)
 	}
@@ -552,7 +556,12 @@ func (s *Service) PlanRollback(
 		return nil, err
 	}
 	session := s.snapshotSession(dockerClient, key)
-	safetyLocation := systemBackupSnapshotLocation{name: "safety", destination: backuptypes.SystemBackupDestinationLocal, repository: localRepository, snapshotID: localSnapshotID}
+	safetyLocation := systemBackupSnapshotLocation{
+		name:        "safety",
+		destination: backuptypes.SystemBackupDestinationLocal,
+		repository:  localRepository,
+		snapshotID:  localSnapshotID,
+	}
 	safetyLayout, err := session.readSnapshotLayout(ctx, safetyLocation)
 	if err != nil {
 		return nil, fmt.Errorf("open pre-restore system backup: %w", err)
@@ -631,36 +640,22 @@ func sourceMounts(mounts []container.MountPoint, inContainer bool, containerPath
 	if primary == nil {
 		return nil, fmt.Errorf("%s must be mounted into the Arcane container from a bind or named volume for system backups", containerPath)
 	}
-	result := append([]mount.Mount{*primary}, docker.NestedMounts(mounts, containerPath, target)...)
-	for index := range result {
-		result[index].ReadOnly = true
+	result := make([]mount.Mount, 0, 1+len(docker.NestedMounts(mounts, containerPath, target)))
+	for _, resolved := range append([]mount.Mount{*primary}, docker.NestedMounts(mounts, containerPath, target)...) {
+		result = append(result, mount.Mount{ //exhaustruct:enforce
+			Type:           resolved.Type,
+			Source:         resolved.Source,
+			Target:         resolved.Target,
+			ReadOnly:       true,
+			Consistency:    resolved.Consistency,
+			BindOptions:    resolved.BindOptions,
+			VolumeOptions:  resolved.VolumeOptions,
+			ImageOptions:   resolved.ImageOptions,
+			TmpfsOptions:   resolved.TmpfsOptions,
+			ClusterOptions: resolved.ClusterOptions,
+		})
 	}
 	return result, nil
-}
-
-// bindVolumeSubpaths rewrites volume subpath mounts as binds of the
-// subpath on daemons before API 1.45, which ignore subpaths and mount the
-// volume root instead.
-func bindVolumeSubpaths(ctx context.Context, dockerClient *client.Client, mounts []mount.Mount) error {
-	if compat.IsDockerAPIVersionAtLeast(compat.DetectDockerAPIVersion(ctx, dockerClient), "1.45") {
-		return nil
-	}
-	for index, resolved := range mounts {
-		if resolved.Type != mount.TypeVolume || resolved.VolumeOptions == nil || resolved.VolumeOptions.Subpath == "" {
-			continue
-		}
-		inspect, err := dockerClient.VolumeInspect(ctx, resolved.Source, client.VolumeInspectOptions{})
-		if err != nil {
-			return fmt.Errorf("inspect volume %s for system backup: %w", resolved.Source, err)
-		}
-		mounts[index] = mount.Mount{
-			Type:     mount.TypeBind,
-			Source:   filepath.Join(inspect.Volume.Mountpoint, resolved.VolumeOptions.Subpath),
-			Target:   resolved.Target,
-			ReadOnly: resolved.ReadOnly,
-		}
-	}
-	return nil
 }
 
 // nestedDataPath returns the data directory relative to the projects
@@ -678,14 +673,11 @@ func nestedDataPath(mounts []container.MountPoint, dataDirectory, projectsDirect
 		if resolved == nil {
 			return "", false, nil
 		}
-		source := path.Clean(filepath.ToSlash(resolved.Source))
-		if resolved.Type == mount.TypeVolume {
-			source = "volume:" + resolved.Source
-			if resolved.VolumeOptions != nil && resolved.VolumeOptions.Subpath != "" {
-				source = path.Join(source, resolved.VolumeOptions.Subpath)
-			}
-		}
-		sources = append(sources, source)
+		sources = append(sources, kit.Ternary(
+			resolved.Type == mount.TypeVolume,
+			path.Join("volume:"+resolved.Source, kit.FromPtr(resolved.VolumeOptions).Subpath),
+			path.Clean(filepath.ToSlash(resolved.Source)),
+		))
 	}
 	projectsSource, dataSource := sources[0], sources[1]
 	if !kit.FilePathMatches(dataSource, projectsSource) {
@@ -707,42 +699,54 @@ func (s *Service) backupSourceLayout(ctx context.Context, dockerClient *client.C
 	if err != nil {
 		return backupSourceLayout{}, err
 	}
-	layout := backupSourceLayout{
-		dataDirectory:     filepath.Dir(databaseFile),
-		projectsDirectory: s.projectsDirectory(ctx),
-		databaseName:      filepath.Base(databaseFile),
-		sources:           []string{snapshotDataPath},
+	dataDirectory, projectsDirectory, databaseName := filepath.Dir(databaseFile), s.projectsDirectory(ctx), filepath.Base(databaseFile)
+	excludes := []string{".arcane-snapshot-*", RecoveryRequestName}
+	for _, name := range []string{databaseName, francis.StorePath(databaseName)} {
+		for _, sidecar := range sqliteSidecars {
+			excludes = append(excludes, name+sidecar)
+		}
 	}
-	projectsPath, external, err := projectsSnapshotPath(layout.dataDirectory, layout.projectsDirectory)
+	projectsPath, external, err := projectsSnapshotPath(dataDirectory, projectsDirectory)
 	if err != nil {
 		return backupSourceLayout{}, err
 	}
-	layout.projectsPath = projectsPath
 	mounts, inContainer, err := currentMounts(ctx, dockerClient)
 	if err != nil {
 		return backupSourceLayout{}, err
 	}
-	layout.mounts, err = sourceMounts(mounts, inContainer, layout.dataDirectory, snapshotDataPath)
+	dataMounts, err := sourceMounts(mounts, inContainer, dataDirectory, snapshotDataPath)
 	if err != nil {
 		return backupSourceLayout{}, fmt.Errorf("resolve Arcane data source: %w", err)
 	}
 	if !external {
-		return layout, nil
+		return backupSourceLayout{
+			dataDirectory:     dataDirectory,
+			projectsDirectory: projectsDirectory,
+			databaseName:      databaseName,
+			projectsPath:      projectsPath,
+			mounts:            dataMounts,
+			sources:           []string{snapshotDataPath},
+			excludes:          excludes,
+		}, nil
 	}
-	projectMounts, err := sourceMounts(mounts, inContainer, layout.projectsDirectory, snapshotProjectsPath)
+	projectMounts, err := sourceMounts(mounts, inContainer, projectsDirectory, snapshotProjectsPath)
 	if err != nil {
 		return backupSourceLayout{}, fmt.Errorf("resolve projects source: %w", err)
 	}
-	layout.mounts = append(layout.mounts, projectMounts...)
-	layout.sources = append(layout.sources, snapshotProjectsPath)
-	relative, nested, err := nestedDataPath(mounts, layout.dataDirectory, layout.projectsDirectory)
+	relative, nested, err := nestedDataPath(mounts, dataDirectory, projectsDirectory)
 	if err != nil {
 		return backupSourceLayout{}, err
 	}
-	if nested {
-		layout.nestedDataPath = path.Join(snapshotProjectsPath, relative)
-	}
-	return layout, nil
+	return backupSourceLayout{
+		dataDirectory:     dataDirectory,
+		projectsDirectory: projectsDirectory,
+		databaseName:      databaseName,
+		projectsPath:      projectsPath,
+		nestedDataPath:    kit.Ternary(nested, path.Join(snapshotProjectsPath, relative), ""),
+		mounts:            append(dataMounts, projectMounts...),
+		sources:           []string{snapshotDataPath, snapshotProjectsPath},
+		excludes:          excludes,
+	}, nil
 }
 
 var (
@@ -840,16 +844,18 @@ func snapshotLayoutFromManifest(manifest recovery.Manifest, manifestRoot string)
 		if err != nil {
 			return snapshotLayout{}, err
 		}
-		layout := snapshotLayout{dataPath: manifestRoot, databaseName: path.Base(databasePath)}
 		relative, err := projectsRelativePathFromManifest(manifest)
 		if errors.Is(err, errProjectsOutsideData) {
-			return layout, nil
+			return snapshotLayout{dataPath: manifestRoot, databaseName: path.Base(databasePath)}, nil
 		}
 		if err != nil {
 			return snapshotLayout{}, fmt.Errorf("resolve projects directory: %w", err)
 		}
-		layout.projectsPath = path.Join(manifestRoot, relative)
-		return layout, nil
+		return snapshotLayout{
+			dataPath:     manifestRoot,
+			projectsPath: path.Join(manifestRoot, relative),
+			databaseName: path.Base(databasePath),
+		}, nil
 	case recovery.ManifestFormatVersion:
 		dataPath, err := kit.NormalizeRelativePath(strings.TrimPrefix(manifest.DataPath, "/"))
 		if err != nil {
@@ -955,9 +961,10 @@ func restoreTarget(mounts []container.MountPoint, containerPath, target, exclude
 	candidates := slices.DeleteFunc(slices.Clone(mounts), func(m container.MountPoint) bool {
 		return exclude != "" && kit.FilePathMatches(m.Destination, exclude)
 	})
-	result := recovery.RestoreTarget{Mounts: []mount.Mount{*enclosing}, Path: destination}
-	result.Mounts = append(result.Mounts, docker.NestedMounts(candidates, containerPath, destination)...)
-	return result, nil
+	return recovery.RestoreTarget{
+		Mounts: append([]mount.Mount{*enclosing}, docker.NestedMounts(candidates, containerPath, destination)...),
+		Path:   destination,
+	}, nil
 }
 
 // projectsRestoreDestination is the current projects directory as a
@@ -975,11 +982,17 @@ func (s *Service) projectsRestoreDestination(ctx context.Context, dockerClient *
 		return projectsRestoreDestination{}, err
 	}
 	if !inContainer {
-		hostTarget := recovery.RestoreTarget{
-			Mounts: []mount.Mount{{Type: mount.TypeBind, Source: directory, Target: selectiveProjectsRestoreTarget}},
-			Path:   selectiveProjectsRestoreTarget,
-		}
-		return projectsRestoreDestination{directory: directory, target: hostTarget}, nil
+		return projectsRestoreDestination{
+			directory: directory,
+			target: recovery.RestoreTarget{
+				Mounts: []mount.Mount{{
+					Type:   mount.TypeBind,
+					Source: directory,
+					Target: selectiveProjectsRestoreTarget,
+				}},
+				Path: selectiveProjectsRestoreTarget,
+			},
+		}, nil
 	}
 	target, err := restoreTarget(mounts, directory, selectiveProjectsRestoreTarget, "")
 	if err != nil {
@@ -989,12 +1002,15 @@ func (s *Service) projectsRestoreDestination(ctx context.Context, dockerClient *
 	if err != nil {
 		return projectsRestoreDestination{}, err
 	}
-	dataDirectory := filepath.Dir(databaseFile)
-	dataPath, _, err := nestedDataPath(mounts, dataDirectory, directory)
+	dataPath, _, err := nestedDataPath(mounts, filepath.Dir(databaseFile), directory)
 	if err != nil {
 		return projectsRestoreDestination{}, err
 	}
-	return projectsRestoreDestination{directory: directory, dataPath: dataPath, target: target}, nil
+	return projectsRestoreDestination{
+		directory: directory,
+		dataPath:  dataPath,
+		target:    target,
+	}, nil
 }
 
 // restoreStages plans the Rustic restores that put a snapshot's data
@@ -1032,8 +1048,12 @@ func restoreStages(
 			projectsDirectory, dataDirectory,
 		)
 	}
-	stages := make([]recovery.RestoreStage, 0, 2)
-	stages = append(stages, recovery.RestoreStage{Repository: repository, SnapshotID: snapshotID, SourcePath: layout.dataPath, Target: dataTarget})
+	stages := []recovery.RestoreStage{{
+		Repository: repository,
+		SnapshotID: snapshotID,
+		SourcePath: layout.dataPath,
+		Target:     dataTarget,
+	}}
 	if !separate {
 		return stages, nil
 	}
@@ -1041,7 +1061,12 @@ func restoreStages(
 	if err != nil {
 		return nil, err
 	}
-	return append(stages, recovery.RestoreStage{Repository: repository, SnapshotID: snapshotID, SourcePath: layout.projectsPath, Target: projectsTarget}), nil
+	return append(stages, recovery.RestoreStage{
+		Repository: repository,
+		SnapshotID: snapshotID,
+		SourcePath: layout.projectsPath,
+		Target:     projectsTarget,
+	}), nil
 }
 
 // Create archives a consistent system snapshot without blocking actor leases during the upload.
@@ -1091,12 +1116,6 @@ func (s *Service) Create(
 		return backup.Snapshot{}, fmt.Errorf("failed to write recovery manifest: %w", err)
 	}
 	defer func() { _ = os.Remove(manifestPath) }()
-	layout.excludes = []string{".arcane-snapshot-*", RecoveryRequestName}
-	for name := range databases {
-		for _, sidecar := range sqliteSidecars {
-			layout.excludes = append(layout.excludes, name+sidecar)
-		}
-	}
 	files, err := snapshotSourceFiles(ctx, layout)
 	if err != nil {
 		return backup.Snapshot{}, err
@@ -1106,6 +1125,7 @@ func (s *Service) Create(
 		return backup.Snapshot{}, err
 	}
 	// Mount VACUUM INTO copies over the live databases so the snapshot is consistent.
+	snapshotMounts := slices.Clone(layout.mounts)
 	for name, db := range databases {
 		stagedDatabase := filepath.Join(stage, name)
 		if stageErr := stageDatabase(ctx, db, filepath.Join(layout.dataDirectory, name), stagedDatabase); stageErr != nil {
@@ -1115,19 +1135,40 @@ func (s *Service) Create(
 		if mountErr != nil {
 			return backup.Snapshot{}, mountErr
 		}
-		layout.mounts = append(layout.mounts, stagedMounts...)
+		snapshotMounts = append(snapshotMounts, stagedMounts...)
 	}
-	if bindErr := bindVolumeSubpaths(ctx, dockerClient, layout.mounts); bindErr != nil {
-		return backup.Snapshot{}, bindErr
+	// Rewrite volume subpath mounts as binds of the
+	// subpath on daemons before API 1.45, which ignore subpaths and mount the
+	// volume root instead.
+	if !compat.IsDockerAPIVersionAtLeast(compat.DetectDockerAPIVersion(ctx, dockerClient), "1.45") {
+		for index, resolved := range snapshotMounts {
+			if resolved.Type != mount.TypeVolume || kit.FromPtr(resolved.VolumeOptions).Subpath == "" {
+				continue
+			}
+			inspect, inspectErr := dockerClient.VolumeInspect(ctx, resolved.Source, client.VolumeInspectOptions{})
+			if inspectErr != nil {
+				return backup.Snapshot{}, fmt.Errorf("inspect volume %s for system backup: %w", resolved.Source, inspectErr)
+			}
+			snapshotMounts[index] = mount.Mount{
+				Type:     mount.TypeBind,
+				Source:   filepath.Join(inspect.Volume.Mountpoint, resolved.VolumeOptions.Subpath),
+				Target:   resolved.Target,
+				ReadOnly: resolved.ReadOnly,
+			}
+		}
 	}
-	input := backup.CreateSnapshotInput{Mounts: layout.mounts, Sources: layout.sources}
+	globs := make([]string, 0, len(layout.excludes)+1)
 	for _, excluded := range layout.excludes {
-		input.Globs = append(input.Globs, "!"+snapshotDataPath+"/"+excluded)
+		globs = append(globs, "!"+snapshotDataPath+"/"+excluded)
 	}
 	if layout.nestedDataPath != "" {
-		input.Globs = append(input.Globs, "!"+layout.nestedDataPath)
+		globs = append(globs, "!"+layout.nestedDataPath)
 	}
-	snapshot, err := s.engine.CreateSnapshot(ctx, dockerClient, repository, recoveryKey, "arcane-system-recovery", input)
+	snapshot, err := s.engine.CreateSnapshot(ctx, dockerClient, repository, recoveryKey, "arcane-system-recovery", backup.CreateSnapshotInput{
+		Mounts:  snapshotMounts,
+		Sources: layout.sources,
+		Globs:   globs,
+	})
 	if err != nil {
 		return backup.Snapshot{}, err
 	}
@@ -1150,11 +1191,11 @@ func (s *Service) Create(
 		}
 	}
 	if err == nil {
-		var confirmed backup.Snapshot
-		confirmed, err = s.engine.ConfirmRunSnapshot(ctx, dockerClient, repository, recoveryKey, backupID, snapshot.ID)
-		if err == nil {
+		confirmed, confirmErr := s.engine.ConfirmRunSnapshot(ctx, dockerClient, repository, recoveryKey, backupID, snapshot.ID)
+		if confirmErr == nil {
 			return confirmed, nil
 		}
+		err = confirmErr
 	}
 	// Tagging changes the ID; only remove the original, unconfirmed snapshot.
 	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Minute)
@@ -1171,9 +1212,6 @@ func (s *Service) Create(
 // project folders hold live container data.
 func snapshotSourceFiles(ctx context.Context, layout backupSourceLayout) (map[string]os.FileInfo, error) {
 	projectsInfo, statErr := os.Stat(layout.projectsDirectory)
-	if statErr != nil {
-		projectsInfo = nil
-	}
 	actorDatabase := francis.StorePath(layout.databaseName)
 	files := make(map[string]os.FileInfo)
 	visit := func(filePath string, entry fs.DirEntry, walkErr error) error {
@@ -1207,7 +1245,7 @@ func snapshotSourceFiles(ctx context.Context, layout backupSourceLayout) (map[st
 		if err != nil {
 			return err
 		}
-		if entry.IsDir() && relative != "." && projectsInfo != nil && os.SameFile(info, projectsInfo) {
+		if entry.IsDir() && relative != "." && statErr == nil && os.SameFile(info, projectsInfo) {
 			return filepath.SkipDir
 		}
 		files[filePath] = info
