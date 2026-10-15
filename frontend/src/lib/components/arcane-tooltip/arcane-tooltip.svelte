@@ -3,7 +3,7 @@
 
 	import * as Popover from '#lib/components/ui/popover/index.js';
 	import * as Tooltip from '#lib/components/ui/tooltip/index.js';
-	import { IsTouchDevice } from '#lib/hooks/is-touch-device.svelte.js';
+	import { isTouchDevice } from '#lib/hooks/is-touch-device.svelte.js';
 
 	import { setArcaneTooltipContext } from './context.svelte.js';
 
@@ -19,7 +19,6 @@
 		children?: Snippet;
 	} = $props();
 
-	const isTouchDevice = new IsTouchDevice();
 	let isTouch = $derived(isTouchDevice.current);
 
 	setArcaneTooltipContext({
@@ -43,9 +42,7 @@
 		{@render children?.()}
 	</Popover.Root>
 {:else}
-	<Tooltip.Provider {delayDuration}>
-		<Tooltip.Root bind:open>
-			{@render children?.()}
-		</Tooltip.Root>
-	</Tooltip.Provider>
+	<Tooltip.Root bind:open {delayDuration}>
+		{@render children?.()}
+	</Tooltip.Root>
 {/if}

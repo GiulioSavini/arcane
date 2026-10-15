@@ -23,6 +23,7 @@ type proxiedWSRoute struct {
 func (h *WebSocketHandler) proxiedRoutes() []proxiedWSRoute {
 	return []proxiedWSRoute{
 		{"/projects/:projectId/logs", h.ProjectLogs, authz.PermProjectsLogs},
+		{"/containers/stats", h.ContainersStats, authz.PermContainersRead},
 		{"/containers/:containerId/logs", h.ContainerLogs, authz.PermContainersLogs},
 		{"/containers/:containerId/stats", h.ContainerStats, authz.PermContainersRead},
 		{"/containers/:containerId/terminal", h.ContainerExec, authz.PermContainersExec},

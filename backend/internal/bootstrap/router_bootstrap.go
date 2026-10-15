@@ -43,6 +43,7 @@ var (
 
 var loggerSkipPatterns = []string{
 	"POST /api/tunnel/poll",
+	"GET /api/environments/*/ws/containers/stats",
 	"GET /api/environments/*/ws/containers/*/logs",
 	"GET /api/environments/*/ws/containers/*/stats",
 	"GET /api/environments/*/ws/containers/*/terminal",

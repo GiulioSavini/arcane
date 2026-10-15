@@ -1,76 +1,34 @@
-import { SvelteMap, SvelteSet } from 'svelte/reactivity';
+import { SvelteMap } from 'svelte/reactivity';
 
-import type { ContainerStats } from '#lib/types/docker.js';
-import { calculateCPUPercent, calculateMemoryPercent, calculateMemoryUsage } from '#lib/utils/docker.js';
+import type { ContainerResourceSample, ContainerResourceSampleBatch } from '#lib/types/docker.js';
 import { parseRowKey } from '#lib/utils/environments.js';
-import { createContainerStatsWebSocket } from '#lib/utils/ws.js';
+import { createContainersStatsWebSocket } from '#lib/utils/ws.js';
 import type { ReconnectingWebSocket } from '#lib/utils/ws.js';
 
+/** The server samples at most this many containers per environment stream. */
+const MAX_SUBSCRIBED_CONTAINERS = 500;
+
+interface EnvironmentStream {
+	ws: ReconnectingWebSocket<ContainerResourceSampleBatch>;
+	/** Container ID to table row key. */
+	rowKeys: Map<string, string>;
+}
+
+/** One batched stats socket per environment; samples are keyed by table row key. */
 export class ContainerStatsManager {
-	private connections = new SvelteMap<string, ReconnectingWebSocket<ContainerStats>>();
-	private stats = new SvelteMap<string, ContainerStats>();
+	private streams = new Map<string, EnvironmentStream>();
+	private samples = new SvelteMap<string, ContainerResourceSample>();
 	private loadingStates = new SvelteMap<string, boolean>();
 	private errorStates = new SvelteMap<string, boolean>();
-	private desiredIds = new SvelteSet<string>();
-
-	/** Keyed by table row key; the row's environment is decoded only for the websocket URL. */
-	connect(containerId: string): void {
-		if (this.connections.has(containerId)) return;
-		const { id, environmentId } = parseRowKey(containerId);
-		if (!environmentId) return;
-
-		this.loadingStates.set(containerId, true);
-
-		const ws = createContainerStatsWebSocket({
-			getEnvId: () => environmentId,
-			containerId: id,
-			onMessage: (data: ContainerStats) => {
-				this.stats.set(containerId, data);
-				this.loadingStates.set(containerId, false);
-				this.errorStates.delete(containerId);
-			},
-			onError: () => {
-				this.stats.delete(containerId);
-				this.loadingStates.set(containerId, false);
-				this.errorStates.set(containerId, true);
-			},
-			shouldReconnect: () => this.connections.has(containerId)
-		});
-
-		ws.connect();
-		this.connections.set(containerId, ws);
-	}
-
-	disconnect(containerId: string): void {
-		const ws = this.connections.get(containerId);
-		if (ws) {
-			ws.close();
-			this.connections.delete(containerId);
-			this.stats.delete(containerId);
-			this.loadingStates.delete(containerId);
-			this.errorStates.delete(containerId);
-		}
-	}
 
 	getCPUPercent(containerId: string): number | undefined {
-		const stats = this.stats.get(containerId);
-		if (!stats) return undefined;
-		return calculateCPUPercent(stats);
-	}
-
-	getMemoryPercent(containerId: string): number | undefined {
-		const stats = this.stats.get(containerId);
-		if (!stats) return undefined;
-		return calculateMemoryPercent(stats);
+		return this.samples.get(containerId)?.cpuPercent;
 	}
 
 	getMemoryUsage(containerId: string): { usage: number; limit: number } | undefined {
-		const stats = this.stats.get(containerId);
-		if (!stats) return undefined;
-		return {
-			usage: calculateMemoryUsage(stats),
-			limit: stats.memory_stats?.limit || 0
-		};
+		const sample = this.samples.get(containerId);
+		if (!sample) return undefined;
+		return { usage: sample.memoryUsageBytes, limit: sample.memoryLimitBytes };
 	}
 
 	isLoading(containerId: string): boolean {
@@ -81,42 +39,109 @@ export class ContainerStatsManager {
 		return this.errorStates.get(containerId) ?? false;
 	}
 
-	hasConnection(containerId: string): boolean {
-		return this.connections.has(containerId);
-	}
-
-	getConnectedIds(): string[] {
-		return Array.from(this.connections.keys());
-	}
-
-	/** Table row keys; each container streams from its row's environment. */
+	/** Table row keys; each container is sampled on its row's environment stream. */
 	set targetIds(value: Set<string>) {
-		this.desiredIds = new SvelteSet(value);
-		this.syncConnections();
-	}
-
-	private syncConnections(): void {
-		const connectedIds = new SvelteSet(this.connections.keys());
-		for (const id of this.desiredIds) {
-			if (!connectedIds.has(id)) {
-				this.connect(id);
-			}
+		const byEnvironment = new Map<string, Map<string, string>>();
+		for (const key of value) {
+			const { id, environmentId } = parseRowKey(key);
+			if (!environmentId) continue;
+			const rowKeys = byEnvironment.get(environmentId) ?? new Map<string, string>();
+			rowKeys.set(id, key);
+			byEnvironment.set(environmentId, rowKeys);
 		}
 
-		for (const id of connectedIds) {
-			if (!this.desiredIds.has(id)) {
-				this.disconnect(id);
+		for (const [environmentId, stream] of this.streams) {
+			if (byEnvironment.has(environmentId)) continue;
+			stream.ws.close();
+			this.streams.delete(environmentId);
+			this.forget(stream.rowKeys.values());
+		}
+
+		for (const [environmentId, rowKeys] of byEnvironment) {
+			const stream = this.streams.get(environmentId);
+			if (!stream) {
+				for (const key of rowKeys.values()) this.loadingStates.set(key, true);
+				this.open(environmentId, rowKeys);
+				continue;
 			}
+			const unchanged = stream.rowKeys.size === rowKeys.size && [...rowKeys.keys()].every((id) => stream.rowKeys.has(id));
+			if (unchanged) continue;
+
+			this.forget([...stream.rowKeys].filter(([id]) => !rowKeys.has(id)).map(([, key]) => key));
+			for (const [id, key] of rowKeys) {
+				if (!stream.rowKeys.has(id)) this.loadingStates.set(key, true);
+			}
+			stream.rowKeys = rowKeys;
+			this.subscribe(stream);
 		}
 	}
 
 	destroy(): void {
-		for (const ws of this.connections.values()) {
-			ws.close();
-		}
-		this.connections.clear();
-		this.stats.clear();
+		for (const stream of this.streams.values()) stream.ws.close();
+		this.streams.clear();
+		this.samples.clear();
 		this.loadingStates.clear();
 		this.errorStates.clear();
+	}
+
+	private open(environmentId: string, rowKeys: Map<string, string>): void {
+		const ws = createContainersStatsWebSocket({
+			envId: environmentId,
+			onOpen: () => {
+				const stream = this.streams.get(environmentId);
+				if (stream?.ws === ws) this.subscribe(stream);
+			},
+			onMessage: (batch) => {
+				const stream = this.streams.get(environmentId);
+				if (stream?.ws === ws) this.apply(stream, batch);
+			},
+			onError: () => {
+				const stream = this.streams.get(environmentId);
+				if (stream?.ws === ws) this.markUnavailable(stream);
+			},
+			shouldReconnect: () => this.streams.get(environmentId)?.ws === ws
+		});
+		this.streams.set(environmentId, { ws, rowKeys });
+		void ws.connect();
+	}
+
+	/** Sends the stream's container set; a closed socket resends it from onOpen. */
+	private subscribe(stream: EnvironmentStream): void {
+		const containerIds = [...stream.rowKeys.keys()].slice(0, MAX_SUBSCRIBED_CONTAINERS);
+		stream.ws.send(JSON.stringify({ containerIds }));
+	}
+
+	/** Writes one batch in a single synchronous pass so it flushes as one update. */
+	private apply(stream: EnvironmentStream, batch: ContainerResourceSampleBatch): void {
+		if (batch.error) {
+			this.markUnavailable(stream);
+			return;
+		}
+		for (const [id, key] of stream.rowKeys) {
+			const sample = batch.samples?.[id];
+			if (sample) {
+				this.samples.set(key, sample);
+				this.errorStates.delete(key);
+			} else {
+				this.samples.delete(key);
+			}
+			this.loadingStates.set(key, false);
+		}
+	}
+
+	private markUnavailable(stream: EnvironmentStream): void {
+		for (const key of stream.rowKeys.values()) {
+			this.samples.delete(key);
+			this.loadingStates.set(key, false);
+			this.errorStates.set(key, true);
+		}
+	}
+
+	private forget(keys: Iterable<string>): void {
+		for (const key of keys) {
+			this.samples.delete(key);
+			this.loadingStates.delete(key);
+			this.errorStates.delete(key);
+		}
 	}
 }

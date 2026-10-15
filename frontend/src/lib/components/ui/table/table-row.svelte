@@ -20,7 +20,7 @@
 	data-slot="table-row"
 	class={cn(
 		'group/row cursor-pointer border-b border-border/40 bg-background transition-colors duration-150',
-		'hover:bg-primary/[0.06] data-expanded:bg-muted/30 data-[state=selected]:bg-primary/[0.12] data-[state=selected]:hover:bg-primary/[0.15]',
+		'hover:bg-row-hover data-expanded:bg-row-expanded data-[state=selected]:bg-row-selected data-[state=selected]:hover:bg-row-selected-hover',
 		variant === 'detail' && 'bg-muted/10 hover:bg-muted/10',
 		variant === 'static' && 'bg-transparent hover:bg-transparent',
 		className

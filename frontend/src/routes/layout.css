@@ -218,6 +218,10 @@ html.reduce-effects *::after {
 	--radius-4xl: calc(var(--radius) * 2.6);
 
 	--color-background: var(--background);
+	--color-row-hover: color-mix(in oklab, var(--primary) 6%, var(--background));
+	--color-row-selected: color-mix(in oklab, var(--primary) 12%, var(--background));
+	--color-row-selected-hover: color-mix(in oklab, var(--primary) 15%, var(--background));
+	--color-row-expanded: color-mix(in oklab, var(--muted) 30%, var(--background));
 	--color-foreground: var(--foreground);
 	--color-muted: var(--muted);
 	--color-muted-foreground: var(--muted-foreground);
@@ -566,4 +570,8 @@ input:autofill:active {
 
 @utility rounded-inherit {
 	border-radius: inherit;
+}
+
+@utility transition-stroke-dashoffset {
+	transition-property: stroke-dashoffset;
 }

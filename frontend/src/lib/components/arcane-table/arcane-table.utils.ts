@@ -147,7 +147,7 @@ export function getTableDisplayEntries<T extends RowData & { id: string }>(
 	const entries: TableDisplayEntry<T>[] = [];
 	const appendRows = (groupRows: ArcaneRow<T>[], groupName?: string) => {
 		for (const row of groupRows) {
-			const key = JSON.stringify([groupName ?? null, row.id]);
+			const key = `${groupName ?? ''}\u0000${row.id}`;
 			entries.push({ kind: 'row', key: `row:${key}`, row, grouped: groupName !== undefined });
 			if (expanded?.has(row.id)) {
 				entries.push({ kind: 'detail', key: `detail:${key}`, row, grouped: groupName !== undefined });

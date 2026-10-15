@@ -836,6 +836,34 @@ type ResourceSample struct {
 	SampleTime time.Time `json:"sampleTime"`
 }
 
+// ResourceSampleSubscription is the client frame on the batched container stats
+// stream naming the containers to sample. Each frame replaces the previous set.
+type ResourceSampleSubscription struct {
+	// ContainerIDs are the containers to sample.
+	//
+	// Required: true
+	ContainerIDs []string `json:"containerIds"`
+}
+
+// ResourceSampleBatch is one server frame on the batched container stats stream.
+type ResourceSampleBatch struct {
+	// Samples maps container ID to its sample. Stopped, unknown and unsampled
+	// containers are omitted.
+	//
+	// Required: true
+	Samples map[string]*ResourceSample `json:"samples"`
+
+	// Error describes why this round could not be sampled.
+	//
+	// Required: false
+	Error string `json:"error,omitempty"`
+
+	// Timestamp is when the batch was sent.
+	//
+	// Required: true
+	Timestamp time.Time `json:"timestamp"`
+}
+
 // Summary represents a container summary.
 type Summary struct {
 	base.EnvironmentTag

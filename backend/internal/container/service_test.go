@@ -8,11 +8,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
 	"net/url"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1118,7 +1120,7 @@ func TestResourceSortCoalescesConcurrentFetches(t *testing.T) {
 	errs := make([]error, callers)
 	for i := range callers {
 		wg.Go(func() {
-			_, err := svc.stats.Collect(t.Context(), []containertypes.Summary{{ID: "web", State: "running"}})
+			_, err := svc.stats.Collect(t.Context(), []containertypes.Summary{{ID: "web", State: "running"}}, stats.ContainerResourceSampleTTL)
 			errs[i] = err
 		})
 	}
@@ -1187,6 +1189,65 @@ func TestResourceSortCancelledContextFailsRequest(t *testing.T) {
 
 	_, err := svc.ListContainersPaginated(ctx, resourceSortParamsInternal(containertypes.SortMemoryUsage, "desc", 0, 20), true, true, true, "")
 	require.Error(t, err)
+}
+
+func TestSampleResourcesFiltersRequestedIDs(t *testing.T) {
+	capped := make([]string, containerResourceSampleLimit+1)
+	for i := range capped {
+		capped[i] = fmt.Sprintf("c%03d", i)
+	}
+	tests := []struct {
+		name    string
+		running []string
+		stopped []string
+		request []string
+		want    []string
+	}{
+		{
+			name:    "stopped, unknown and blank ids are omitted",
+			running: []string{"web"},
+			stopped: []string{"db"},
+			request: []string{"web", "db", "ghost", "", " "},
+			want:    []string{"web"},
+		},
+		{
+			name:    "only exact requested ids are sampled",
+			running: []string{"web", "web2"},
+			request: []string{"web"},
+			want:    []string{"web"},
+		},
+		{
+			name:    "ids past the limit are ignored",
+			running: capped,
+			request: capped,
+			want:    capped[:containerResourceSampleLimit],
+		},
+		{
+			name:    "no ids samples nothing",
+			running: []string{"web"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fixture := newResourceStatsServerInternal()
+			for _, id := range tt.running {
+				fixture.addContainer(id, id, "running")
+				fixture.setStats(id, 10, 100, 1000)
+			}
+			for _, id := range tt.stopped {
+				fixture.addContainer(id, id, "exited")
+				fixture.setStats(id, 10, 100, 1000)
+			}
+			svc := newResourceSortServiceInternal(t, fixture)
+
+			samples, err := svc.SampleResources(t.Context(), tt.request, stats.ContainerResourceSampleTTL)
+			require.NoError(t, err)
+			require.ElementsMatch(t, tt.want, slices.Collect(maps.Keys(samples)))
+			for _, id := range tt.stopped {
+				require.Zero(t, fixture.callsFor(id), "stopped containers must not trigger stats collection")
+			}
+		})
+	}
 }
 
 func newLogsTestServiceInternal(t *testing.T, tty bool, logsBody []byte, gotQuery *url.Values) *ContainerService {

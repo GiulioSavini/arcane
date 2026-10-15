@@ -8,6 +8,7 @@ import type {
 	LogEntry,
 	PprofProfile
 } from '#lib/types/diagnostics.js';
+import type { ContainerResourceSampleBatch } from '#lib/types/docker.js';
 import type { SystemStats } from '#lib/types/shared.js';
 import { downloadBlob } from '#lib/utils/browser-download.js';
 import { tryCatch } from '#lib/utils/try-catch.js';
@@ -255,6 +256,29 @@ export function createContainerStatsWebSocket(opts: {
 		onError: opts.onError,
 		maxBackoff: opts.maxBackoff,
 		autoConnect: false,
+		shouldReconnect: opts.shouldReconnect
+	});
+}
+
+/** One stream per environment sampling the containers named by the latest subscription frame. */
+export function createContainersStatsWebSocket(opts: {
+	envId: string;
+	onMessage: (data: ContainerResourceSampleBatch) => void;
+	onOpen?: () => void;
+	onError?: (err: Event | Error) => void;
+	shouldReconnect?: () => boolean;
+}) {
+	const buildUrl = () => {
+		const protocol = location.protocol === 'https:' ? 'wss' : 'ws';
+		return `${protocol}://${location.host}/api/environments/${opts.envId}/ws/containers/stats`;
+	};
+
+	return new ReconnectingWebSocket<ContainerResourceSampleBatch>({
+		buildUrl,
+		parseMessage: (evt) => JSON.parse(evt.data as string) as ContainerResourceSampleBatch,
+		onMessage: opts.onMessage,
+		onOpen: opts.onOpen,
+		onError: opts.onError,
 		shouldReconnect: opts.shouldReconnect
 	});
 }

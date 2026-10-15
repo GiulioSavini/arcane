@@ -1,9 +1,17 @@
 package stats
 
 import (
+	"context"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/getarcaneapp/arcane/types/v2/container"
+	"github.com/moby/moby/client"
 	"github.com/stretchr/testify/require"
 
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/authz"
@@ -37,4 +45,50 @@ func TestResourceSortComparatorKeepsUnavailableLast(t *testing.T) {
 	zero := container.Summary{ID: "z", Names: []string{"z"}, ResourceSample: &container.ResourceSample{MemoryUsageBytes: 0}}
 	require.Equal(t, -1, asc(zero, unsampled), "zero is a valid value, not unavailable")
 	require.Equal(t, -1, asc(zero, sampled))
+}
+
+func TestCollectMaxAge(t *testing.T) {
+	tests := []struct {
+		name      string
+		maxAge    time.Duration
+		wantCalls int32
+	}{
+		{name: "TTL reuses the cached sample", maxAge: ContainerResourceSampleTTL, wantCalls: 1},
+		{name: "maxAge older than the cached sample refetches", maxAge: time.Nanosecond, wantCalls: 2},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var calls atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if !strings.HasSuffix(r.URL.Path, "/containers/web/stats") {
+					http.NotFound(w, r)
+					return
+				}
+				calls.Add(1)
+				_, _ = io.WriteString(w, `{"read":"2026-01-01T00:00:00Z","memory_stats":{"usage":100,"limit":1000}}`)
+			}))
+			t.Cleanup(server.Close)
+			dockerClient, err := client.New(
+				client.WithHost(server.URL),
+				client.WithAPIVersion("1.41"),
+				client.WithHTTPClient(server.Client()),
+			)
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = dockerClient.Close() })
+
+			svc := New(
+				func(context.Context) (*client.Client, error) { return dockerClient, nil },
+				func() string { return "test" },
+				ContainerResourceSampleTTL,
+				0,
+				0,
+			)
+			for range 2 {
+				samples, collectErr := svc.Collect(t.Context(), []container.Summary{{ID: "web", State: "running"}}, tt.maxAge)
+				require.NoError(t, collectErr)
+				require.Contains(t, samples, "web")
+			}
+			require.Equal(t, tt.wantCalls, calls.Load())
+		})
+	}
 }

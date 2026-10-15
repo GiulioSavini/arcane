@@ -12,7 +12,7 @@
 		children,
 		...restProps
 	}: WithElementRef<HTMLTdAttributes> & {
-		/** Sticky, opaque column at the row's right edge that mirrors the row's hover/selected tints. */
+		/** Sticky column at the row's right edge that inherits the row's opaque background. */
 		pinned?: boolean;
 		/** `checkbox` and `expander` size narrow control columns; `flush` drops padding for full-width panels. */
 		variant?: 'default' | 'checkbox' | 'expander' | 'flush';
@@ -31,8 +31,7 @@
 		variant === 'expander' && 'w-8 px-2',
 		variant === 'flush' && 'p-0',
 		indent && 'pl-10',
-		pinned &&
-			'sticky right-0 z-(--arcane-z-sticky) bg-background p-0 whitespace-nowrap group-hover/row:bg-primary/6 group-data-[expanded]/row:bg-muted/30 group-data-[state=selected]/row:bg-primary/12',
+		pinned && 'sticky right-0 z-(--arcane-z-sticky) bg-inherit p-0 whitespace-nowrap',
 		className
 	)}
 	{...restProps}

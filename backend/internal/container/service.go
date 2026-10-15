@@ -10,6 +10,7 @@ import (
 	"maps"
 	"net/netip"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -1620,6 +1621,32 @@ func (s *ContainerService) StreamStats(ctx context.Context, containerID string, 
 	return s.stats.Stream(ctx, containerID, statsChan)
 }
 
+// containerResourceSampleLimit caps how many requested containers one SampleResources call reads.
+const containerResourceSampleLimit = 500
+
+// SampleResources samples the running containers among the first containerResourceSampleLimit ids,
+// refetching samples older than maxAge. Blank, stopped and unknown IDs are omitted.
+func (s *ContainerService) SampleResources(ctx context.Context, ids []string, maxAge time.Duration) (map[string]*containertypes.ResourceSample, error) {
+	requested := slices.DeleteFunc(slices.Clone(ids[:min(len(ids), containerResourceSampleLimit)]), func(id string) bool {
+		return strings.TrimSpace(id) == ""
+	})
+	if len(requested) == 0 {
+		return map[string]*containertypes.ResourceSample{}, nil
+	}
+
+	dockerContainers, err := s.dockerService.ListContainers(ctx)
+	if err != nil {
+		return nil, err
+	}
+	matched := make([]containertypes.Summary, 0, len(requested))
+	for _, dc := range dockerContainers {
+		if dc.State == container.StateRunning && slices.Contains(requested, dc.ID) {
+			matched = append(matched, containertypes.Summary{ID: dc.ID, State: string(dc.State)})
+		}
+	}
+	return s.stats.Collect(ctx, matched, maxAge)
+}
+
 func (s *ContainerService) ListContainersPaginated(
 	ctx context.Context,
 	params pagination.QueryParams,
@@ -1704,7 +1731,7 @@ func (s *ContainerService) listContainersByResourceInternal(
 		}
 	}
 
-	samples, err := s.stats.Collect(ctx, filtered)
+	samples, err := s.stats.Collect(ctx, filtered, stats.ContainerResourceSampleTTL)
 	if err != nil {
 		return ContainerListResult{}, err
 	}

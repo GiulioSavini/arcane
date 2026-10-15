@@ -32,8 +32,7 @@
 		variant === 'expander' && 'w-8 px-2',
 		variant === 'flush' && 'p-0',
 		indent && 'pl-10',
-		pinned &&
-			'sticky right-0 z-(--arcane-z-page-floating) bg-background p-0 whitespace-nowrap group-hover/row:bg-primary/6 group-data-[expanded]/row:bg-muted/30 group-data-[state=selected]/row:bg-primary/12',
+		pinned && 'sticky right-0 z-(--arcane-z-page-floating) bg-background p-0 whitespace-nowrap',
 		className
 	)}
 	{...restProps}

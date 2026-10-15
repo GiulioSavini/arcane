@@ -284,6 +284,7 @@ format target="all" check="":
 [group('checks')]
 _lint_frontend:
     vp -C frontend run check
+    vp -C frontend run lint
 
 # Type check Playwright tests
 [group('checks')]

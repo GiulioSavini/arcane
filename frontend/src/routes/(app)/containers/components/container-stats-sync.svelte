@@ -1,4 +1,6 @@
 <script lang="ts">
+	import { untrack } from 'svelte';
+
 	import type { ContainerStatsManager } from './container-stats-manager.svelte';
 
 	let {
@@ -9,7 +11,11 @@
 		targetIds: Set<string>;
 	} = $props();
 
+	// Only targetIds is tracked; the manager's own state reads and writes stay out of this effect.
 	$effect(() => {
-		statsManager.targetIds = targetIds;
+		const ids = targetIds;
+		untrack(() => {
+			statsManager.targetIds = ids;
+		});
 	});
 </script>

@@ -46,11 +46,17 @@ type Service struct {
 	getClient     func(context.Context) (*client.Client, error)
 	dockerHost    func() string
 	history       stats.Store
-	cache         *hot.HotCache[string, container.StatsResponse]
+	cache         *hot.HotCache[string, cachedStats]
 	inspectCache  *hot.HotCache[string, container.InspectResponse]
 	flight        singleflight.Group
 	sampleTimeout time.Duration
 	batchTimeout  time.Duration
+}
+
+// cachedStats records when Arcane fetched a sample, so freshness checks don't depend on the daemon's clock.
+type cachedStats struct {
+	stats     container.StatsResponse
+	fetchedAt time.Time
 }
 
 // New builds a stats service. Non-positive timeouts fall back to defaults.
@@ -64,7 +70,7 @@ func New(getClient func(context.Context) (*client.Client, error), dockerHost fun
 	return &Service{
 		getClient:  getClient,
 		dockerHost: dockerHost,
-		cache: hot.NewHotCache[string, container.StatsResponse](hot.LRU, ContainerResourceSampleCacheSize).
+		cache: hot.NewHotCache[string, cachedStats](hot.LRU, ContainerResourceSampleCacheSize).
 			WithTTL(cacheTTL).
 			WithJanitor().
 			Build(),
@@ -130,16 +136,19 @@ func (s *Service) Stream(ctx context.Context, containerID string, statsChan chan
 	}
 }
 
-// Collect fetches one sample per running container. Individual failures leave the container
-// unsampled; a batch timeout or cancellation fails so partial lists never sort as global.
-func (s *Service) Collect(ctx context.Context, items []containertypes.Summary) (map[string]*containertypes.ResourceSample, error) {
+// Collect fetches one sample per running container, reusing cached samples younger than maxAge.
+// Individual failures leave the container unsampled; a batch timeout or cancellation fails so partial
+// lists never sort as global.
+func (s *Service) Collect(ctx context.Context, items []containertypes.Summary, maxAge time.Duration) (map[string]*containertypes.ResourceSample, error) {
 	ids := make([]string, 0, len(items))
 	for i := range items {
 		if items[i].State == string(container.StateRunning) {
 			ids = append(ids, items[i].ID)
 		}
 	}
-	raw, err := collect(ctx, s.batchTimeout, ids, s.fetch)
+	raw, err := collect(ctx, s.batchTimeout, ids, func(ctx context.Context, id string) (container.StatsResponse, error) {
+		return s.fetch(ctx, id, maxAge)
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to collect container resource samples: %w", err)
 	}
@@ -185,12 +194,12 @@ func collect[T any](ctx context.Context, timeout time.Duration, ids []string, fe
 	return results, g.Wait()
 }
 
-// fetch returns a cached stats sample when fresh and coalesces concurrent fetches per daemon and
-// container. IncludePreviousSample gives the CPU delta a valid previous sample.
-func (s *Service) fetch(ctx context.Context, containerID string) (container.StatsResponse, error) {
+// fetch returns a cached stats sample younger than maxAge and coalesces concurrent fetches per daemon
+// and container. IncludePreviousSample gives the CPU delta a valid previous sample.
+func (s *Service) fetch(ctx context.Context, containerID string, maxAge time.Duration) (container.StatsResponse, error) {
 	key := s.dockerHost() + "\x00" + containerID
-	if sample, ok, _ := s.cache.Get(key); ok {
-		return sample, nil
+	if cached, ok, _ := s.cache.Get(key); ok && time.Since(cached.fetchedAt) < maxAge {
+		return cached.stats, nil
 	}
 
 	ch := s.flight.DoChan(key, func() (any, error) {
@@ -214,7 +223,7 @@ func (s *Service) fetch(ctx context.Context, containerID string) (container.Stat
 		if statsData.Read.IsZero() {
 			statsData.Read = time.Now()
 		}
-		s.cache.Set(key, statsData)
+		s.cache.Set(key, cachedStats{stats: statsData, fetchedAt: time.Now()})
 		return statsData, nil
 	})
 
@@ -289,7 +298,7 @@ func (s *Service) ObserveResources(meter metric.Meter, list func(context.Context
 			}
 		}
 		samples, err := collect(ctx, ContainerMetricsCollectTimeout, slices.Collect(maps.Keys(running)), func(ctx context.Context, id string) (resourceSample, error) {
-			statsData, fetchErr := s.fetch(ctx, id)
+			statsData, fetchErr := s.fetch(ctx, id, ContainerResourceSampleTTL)
 			if fetchErr != nil {
 				return resourceSample{}, fetchErr
 			}

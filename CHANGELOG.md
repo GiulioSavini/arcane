@@ -59,6 +59,7 @@
 - store auth config in a seperate auth.json file ([\#4379](https://github.com/getarcaneapp/arcane/pull/4379) by @kmendell)
 
 **Full Changelog**: https://github.com/getarcaneapp/arcane/compare/v2.15.1...v2.16.0
+
 ## v2.15.1
 
 ### Bug fixes

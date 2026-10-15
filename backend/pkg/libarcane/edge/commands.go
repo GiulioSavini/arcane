@@ -271,6 +271,7 @@ var commandRoutes = []commandRoute{
 	{Method: http.MethodDelete, PathPattern: "/api/environments/{id}/swarm/secrets/{secretId}", CommandName: "swarm.secret.delete"},
 
 	{PathPattern: "/api/environments/{id}/ws/projects/{projectId}/logs", CommandName: "project.logs.stream", Stream: true},
+	{PathPattern: "/api/environments/{id}/ws/containers/stats", CommandName: "container.stats.batch.stream", Stream: true},
 	{PathPattern: "/api/environments/{id}/ws/containers/{containerId}/logs", CommandName: "container.logs.stream", Stream: true},
 	{PathPattern: "/api/environments/{id}/ws/containers/{containerId}/stats", CommandName: "container.stats.stream", Stream: true},
 	{PathPattern: "/api/environments/{id}/ws/containers/{containerId}/terminal", CommandName: "container.exec.stream", Stream: true},

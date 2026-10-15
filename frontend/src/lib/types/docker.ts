@@ -174,6 +174,18 @@ export interface ContainerResourceSample {
 	sampleTime: string;
 }
 
+/** Client frame on the batched container stats stream; each frame replaces the previous set. */
+export interface ContainerResourceSampleSubscription {
+	containerIds: string[];
+}
+
+/** Server frame on the batched container stats stream. Stopped, unknown and unsampled containers are omitted. */
+export interface ContainerResourceSampleBatch {
+	samples: Record<string, ContainerResourceSample>;
+	error?: string;
+	timestamp: string;
+}
+
 export interface ContainerSummaryDto extends BaseContainer {
 	updateStrategy?: string;
 	ports: ContainerPorts[];
