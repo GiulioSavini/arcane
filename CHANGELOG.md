@@ -1,3 +1,37 @@
+## v2.16.1
+
+### Bug fixes
+
+- bind-mount volume subpaths on daemons older than API 1.45 ([\#4399](https://github.com/getarcaneapp/arcane/pull/4399) by @kmendell)
+- only send request checksums when required for gcs compatibility ([\#4401](https://github.com/getarcaneapp/arcane/pull/4401) by @kmendell)
+- report down when the francis host exits and extend its health check deadline ([\#4402](https://github.com/getarcaneapp/arcane/pull/4402) by @kmendell)
+- name the absolute path and uid in project directory permission errors ([\#4404](https://github.com/getarcaneapp/arcane/pull/4404) by @kmendell)
+- keep build image refs when compose fails to load and document the update-check label ([\#4406](https://github.com/getarcaneapp/arcane/pull/4406) by @kmendell)
+- exclude swarm task containers from the standalone filter ([\#4405](https://github.com/getarcaneapp/arcane/pull/4405) by @kmendell)
+- write s3-only system backups directly to s3 without a local repository ([\#4400](https://github.com/getarcaneapp/arcane/pull/4400) by @kmendell)
+- restrict ssh host key algorithms to known_hosts entries ([\#4403](https://github.com/getarcaneapp/arcane/pull/4403) by @kmendell)
+- lock virtualized table column widths in pixels so cells are not clipped ([\#4407](https://github.com/getarcaneapp/arcane/pull/4407) by @kmendell)
+- localize settings backup cards and role presets and fix long label overflow ([\#4408](https://github.com/getarcaneapp/arcane/pull/4408) by @kmendell)
+- drop the digest name a frozen pull leaves behind after tagging ([\#4409](https://github.com/getarcaneapp/arcane/pull/4409) by @kmendell)
+- stop re-sending image update pushes on every poll ([cd7c39c](https://github.com/getarcaneapp/arcane/commit/cd7c39cfcb6c364751d4b55bab887c11b5ebd859) by @kmendell)
+- reset invalid cron settings to defaults at startup ([\#4425](https://github.com/getarcaneapp/arcane/pull/4425) by @kmendell)
+- clear caches on workspace refresh ([\#4427](https://github.com/getarcaneapp/arcane/pull/4427) by @kmendell)
+- treat TLS handshake timeouts as retryable digest errors ([\#4428](https://github.com/getarcaneapp/arcane/pull/4428) by @kmendell)
+- match email lookups case-insensitively ([\#4429](https://github.com/getarcaneapp/arcane/pull/4429) by @kmendell)
+- allow manual updates for updater-disabled services ([\#4430](https://github.com/getarcaneapp/arcane/pull/4430) by @kmendell)
+
+### Performance improvements
+
+- batch live stats per environment and cut table render cost ([3330f4e](https://github.com/getarcaneapp/arcane/commit/3330f4e0f53bb152cc4720be8ae724cdb1bd8cbb) by @kmendell)
+
+### Other
+
+- merge all-environments reosurce lists on the server ([\#4419](https://github.com/getarcaneapp/arcane/pull/4419) by @kmendell)
+- use composite literals and inline helpers ([00daf44](https://github.com/getarcaneapp/arcane/commit/00daf4441a6724cc9ff991f2927d73dcd61f4b89) by @kmendell)
+- use composite literals, merge duplicates, drop DI nil checks ([a432f2c](https://github.com/getarcaneapp/arcane/commit/a432f2c80c44017d1cba7042cf971bb03a63c410) by @kmendell)
+- use composite literals, drop DI nil checks and mappers ([cdfe49e](https://github.com/getarcaneapp/arcane/commit/cdfe49e8cbe0110e60e582aba3a4ce93c8fdb962) by @kmendell)
+
+**Full Changelog**: https://github.com/getarcaneapp/arcane/compare/v2.16.0...v2.16.1
 ## v2.16.0
 
 ### New features
