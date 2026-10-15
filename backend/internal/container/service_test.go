@@ -39,6 +39,7 @@ import (
 	"github.com/getarcaneapp/arcane/backend/v2/internal/database"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/docker"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/event"
+	imagedomain "github.com/getarcaneapp/arcane/backend/v2/internal/image"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/imageupdate"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/project"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/settings"
@@ -46,6 +47,19 @@ import (
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/projects"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/utils/httpx"
 )
+
+type resourceStatsServer struct {
+	mu          sync.Mutex
+	containers  []container.Summary
+	stats       map[string]container.StatsResponse
+	statsStatus map[string]int
+	statsCalls  map[string]int
+	delay       time.Duration
+	slowIDs     map[string]bool
+
+	current atomic.Int32
+	maxSeen atomic.Int32
+}
 
 func TestPaginateContainerProjectGroupsKeepsProjectWhole(t *testing.T) {
 	items := []containertypes.Summary{
@@ -127,7 +141,10 @@ func TestPaginateContainerProjectGroupsSelectsRequestedPage(t *testing.T) {
 }
 
 func TestContainerSummaryIconsAppliedAfterGrouping(t *testing.T) {
-	service := &ContainerService{}
+	db := setupProjectTestDB(t)
+	settingsService, err := settings.NewSettingsService(t.Context(), db)
+	require.NoError(t, err)
+	service := NewContainerService(nil, nil, nil, settingsService, project.NewProjectService(db, settingsService, nil, nil, nil, nil, nil, nil, nil, nil, nil))
 	dockerContainers := []container.Summary{
 		{ID: "app", Names: []string{"/app"}, Labels: map[string]string{
 			"com.docker.compose.project": "media",
@@ -151,7 +168,7 @@ func TestContainerSummaryIconsAppliedAfterGrouping(t *testing.T) {
 	for gi := range groups {
 		service.ApplySummaryIcons(t.Context(), groups[gi].Items, map[string]projects.ArcaneComposeMetadata{})
 	}
-	flattened := flattenContainerProjectGroupsInternal(groups)
+	flattened := flattenContainerProjectGroups(groups)
 
 	require.Len(t, groups, 1)
 	require.NotEmpty(t, groups[0].Items[0].IconLightURL)
@@ -181,8 +198,6 @@ func TestGroupContainersByProjectUsesNoProjectBucket(t *testing.T) {
 	require.Len(t, groups[0].Items, 1)
 	require.Equal(t, containerNoProjectGroup, groups[1].GroupName)
 	require.Len(t, groups[1].Items, 2)
-	require.Equal(t, containerNoProjectGroup, getContainerProjectNameInternal(groups[1].Items[0]))
-	require.Equal(t, containerNoProjectGroup, getContainerProjectNameInternal(groups[1].Items[1]))
 }
 
 func TestBuildContainerFilterAccessors_FiltersStandaloneContainers(t *testing.T) {
@@ -194,7 +209,7 @@ func TestBuildContainerFilterAccessors_FiltersStandaloneContainers(t *testing.T)
 		{ID: "swarm-task", Labels: map[string]string{"com.docker.swarm.service.name": "web"}, UpdateInfo: updateInfo},
 	}
 
-	result := pagination.Config[containertypes.Summary]{FilterAccessors: service.buildContainerFilterAccessors()}.SearchOrderAndPaginate(
+	result := pagination.Config[containertypes.Summary]{FilterAccessors: service.buildContainerPaginationConfig().FilterAccessors}.SearchOrderAndPaginate(
 		items,
 		pagination.QueryParams{Filters: map[string]string{"standalone": "true", "updates": "has_update"}},
 	)
@@ -211,7 +226,7 @@ func TestBuildContainerFilterAccessors_FiltersByLabel(t *testing.T) {
 		{ID: "other", Labels: map[string]string{"heal": "false"}},
 		{ID: "bare", Labels: map[string]string{}},
 	}
-	config := pagination.Config[containertypes.Summary]{FilterAccessors: service.buildContainerFilterAccessors()}
+	config := pagination.Config[containertypes.Summary]{FilterAccessors: service.buildContainerPaginationConfig().FilterAccessors}
 
 	tests := []struct {
 		name   string
@@ -236,7 +251,7 @@ func TestBuildContainerFilterAccessors_FiltersByLabel(t *testing.T) {
 	}
 }
 
-func TestBuildCleanNetworkingConfigInternalPreservesEndpointSettings(t *testing.T) {
+func TestBuildCleanNetworkingConfigPreservesEndpointSettings(t *testing.T) {
 	containerInspect := container.InspectResponse{
 		NetworkSettings: &container.NetworkSettings{
 			Networks: map[string]*network.EndpointSettings{
@@ -249,7 +264,7 @@ func TestBuildCleanNetworkingConfigInternalPreservesEndpointSettings(t *testing.
 		},
 	}
 
-	out := buildCleanNetworkingConfigInternal(containerInspect, "1.44")
+	out := buildCleanNetworkingConfig(containerInspect, "1.44")
 	require.NotNil(t, out)
 	require.Contains(t, out.EndpointsConfig, "bridge")
 	require.Equal(t, []string{"svc"}, out.EndpointsConfig["bridge"].Aliases)
@@ -273,16 +288,21 @@ func TestCompareContainerPortsForSortDesc_KeepsContainersWithoutPortsLast(t *tes
 		Names: []string{"/none"},
 	}
 
-	require.Equal(t, -1, compareContainerPortsForSortDescInternal(withPublished, withPrivateOnly))
-	require.Equal(t, -1, compareContainerPortsForSortDescInternal(withPrivateOnly, withoutPorts))
-	require.Equal(t, 1, compareContainerPortsForSortDescInternal(withoutPorts, withPublished))
+	sortBindings := (&ContainerService{}).buildContainerPaginationConfig().SortBindings
+	comparePortsDesc := sortBindings[slices.IndexFunc(sortBindings, func(binding pagination.SortBinding[containertypes.Summary]) bool {
+		return binding.Key == "ports"
+	})].DescFn
+
+	require.Equal(t, -1, comparePortsDesc(withPublished, withPrivateOnly))
+	require.Equal(t, -1, comparePortsDesc(withPrivateOnly, withoutPorts))
+	require.Equal(t, 1, comparePortsDesc(withoutPorts, withPublished))
 }
 
-func TestContainerServiceCommitContainerCallsDockerAPIInternal(t *testing.T) {
-	db := setupProjectTestDBInternal(t)
+func TestContainerServiceCommitContainerCallsDockerAPI(t *testing.T) {
+	db := setupProjectTestDB(t)
 	var gotRequest map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost || dockerTestPathInternal(r.URL.Path) != "/commit" {
+		if r.Method != http.MethodPost || dockerTestPath(r.URL.Path) != "/commit" {
 			http.NotFound(w, r)
 			return
 		}
@@ -299,7 +319,7 @@ func TestContainerServiceCommitContainerCallsDockerAPIInternal(t *testing.T) {
 
 	svc := NewContainerService(
 		event.NewEventService(db, nil, nil),
-		docker.NewDockerClientService(t.Context(), nil, nil, nil).WithClient(newTestDockerClientInternal(t, server)),
+		docker.NewDockerClientService(t.Context(), nil, nil, nil).WithClient(newTestDockerClient(t, server)),
 		nil,
 		nil,
 		nil,
@@ -327,11 +347,11 @@ func TestContainerServiceCommitContainerCallsDockerAPIInternal(t *testing.T) {
 	require.Equal(t, "container-1", *evt.ResourceID)
 }
 
-func TestContainerServiceCommitContainerOmitsReferenceWhenRepositoryEmptyInternal(t *testing.T) {
-	db := setupProjectTestDBInternal(t)
+func TestContainerServiceCommitContainerOmitsReferenceWhenRepositoryEmpty(t *testing.T) {
+	db := setupProjectTestDB(t)
 	var gotRequest map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost || dockerTestPathInternal(r.URL.Path) != "/commit" {
+		if r.Method != http.MethodPost || dockerTestPath(r.URL.Path) != "/commit" {
 			http.NotFound(w, r)
 			return
 		}
@@ -346,7 +366,7 @@ func TestContainerServiceCommitContainerOmitsReferenceWhenRepositoryEmptyInterna
 
 	svc := NewContainerService(
 		event.NewEventService(db, nil, nil),
-		docker.NewDockerClientService(t.Context(), nil, nil, nil).WithClient(newTestDockerClientInternal(t, server)),
+		docker.NewDockerClientService(t.Context(), nil, nil, nil).WithClient(newTestDockerClient(t, server)),
 		nil,
 		nil,
 		nil,
@@ -377,14 +397,14 @@ func newGroupedContainerSummary(name, localProject string) containertypes.Summar
 	}
 }
 
-// dockerTestPathInternal strips the /v1.NN version prefix Docker clients prepend, so
+// dockerTestPath strips the /v1.NN version prefix Docker clients prepend, so
 // fake Docker servers can match on the bare path.
-func dockerTestPathInternal(path string) string {
-	return dockerAPIVersionPrefixInternal.ReplaceAllString(path, "")
+func dockerTestPath(path string) string {
+	return dockerAPIVersionPrefix.ReplaceAllString(path, "")
 }
 
-// newTestDockerClientInternal builds a Docker client pointed at a fake Docker HTTP server.
-func newTestDockerClientInternal(t *testing.T, server *httptest.Server) *client.Client {
+// newTestDockerClient builds a Docker client pointed at a fake Docker HTTP server.
+func newTestDockerClient(t *testing.T, server *httptest.Server) *client.Client {
 	t.Helper()
 
 	httpClient := server.Client()
@@ -402,8 +422,8 @@ func newTestDockerClientInternal(t *testing.T, server *httptest.Server) *client.
 	return cli
 }
 
-// setupProjectTestDBInternal builds an in-memory DB migrated for project-related tests.
-func setupProjectTestDBInternal(t *testing.T) *database.DB {
+// setupProjectTestDB builds an in-memory DB migrated for project-related tests.
+func setupProjectTestDB(t *testing.T) *database.DB {
 	t.Helper()
 	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
 	require.NoError(t, err)
@@ -411,9 +431,9 @@ func setupProjectTestDBInternal(t *testing.T) *database.DB {
 	return &database.DB{DB: db}
 }
 
-var dockerAPIVersionPrefixInternal = regexp.MustCompile(`^/v\d+\.\d+`)
+var dockerAPIVersionPrefix = regexp.MustCompile(`^/v\d+\.\d+`)
 
-func TestApplyEditPreservesUnmanagedSettingsInternal(t *testing.T) {
+func TestApplyEditPreservesUnmanagedSettings(t *testing.T) {
 	cfg := container.Config{
 		Image:        "nginx:1.25",
 		Env:          []string{"OLD=1"},
@@ -432,8 +452,9 @@ func TestApplyEditPreservesUnmanagedSettingsInternal(t *testing.T) {
 	env := []string{"NEW=1"}
 	req := containertypes.Edit{Environment: &env}
 
-	require.NoError(t, applyEditToContainerConfigInternal(&cfg, hc.PortBindings, req))
-	require.NoError(t, applyEditToHostConfigInternal(&hc, req))
+	cfg, err := applyEditToContainerConfig(cfg, hc.PortBindings, req)
+	require.NoError(t, err)
+	require.NoError(t, applyEditToHostConfig(&hc, req))
 
 	require.Equal(t, []string{"NEW=1"}, cfg.Env)
 	require.Equal(t, "SIGQUIT", cfg.StopSignal)
@@ -444,7 +465,7 @@ func TestApplyEditPreservesUnmanagedSettingsInternal(t *testing.T) {
 	require.Contains(t, cfg.ExposedPorts, network.MustParsePort("80/tcp"))
 }
 
-func TestMergeEditMountsPreservesMountOptionsInternal(t *testing.T) {
+func TestMergeEditMountsPreservesMountOptions(t *testing.T) {
 	existing := []mount.Mount{
 		{
 			Type:          mount.TypeVolume,
@@ -458,14 +479,14 @@ func TestMergeEditMountsPreservesMountOptionsInternal(t *testing.T) {
 	// Round-trip the volume mount (toggling read-only) and drop the tmpfs one.
 	requested := []containertypes.MountCreate{{Type: "volume", Source: "data", Target: "/data", ReadOnly: true}}
 
-	out := mergeEditMountsInternal(existing, requested)
+	out := mergeEditMounts(existing, requested)
 	require.Len(t, out, 1)
 	require.True(t, out[0].ReadOnly)
 	require.NotNil(t, out[0].VolumeOptions)
 	require.Equal(t, map[string]string{"keep": "me"}, out[0].VolumeOptions.Labels)
 }
 
-func TestMergeEditMountsAppliesSourceChangeInternal(t *testing.T) {
+func TestMergeEditMountsAppliesSourceChange(t *testing.T) {
 	existing := []mount.Mount{
 		{
 			Type:          mount.TypeVolume,
@@ -488,7 +509,7 @@ func TestMergeEditMountsAppliesSourceChangeInternal(t *testing.T) {
 		{Type: "bind", Source: "/new/path", Target: "/config", ReadOnly: true},
 	}
 
-	out := mergeEditMountsInternal(existing, requested)
+	out := mergeEditMounts(existing, requested)
 	require.Len(t, out, 2)
 	require.Equal(t, "new-volume", out[0].Source)
 	require.NotNil(t, out[0].VolumeOptions)
@@ -499,7 +520,7 @@ func TestMergeEditMountsAppliesSourceChangeInternal(t *testing.T) {
 	require.Equal(t, mount.PropagationRPrivate, out[1].BindOptions.Propagation)
 }
 
-func TestApplyEditRecomputesExposedPortsInternal(t *testing.T) {
+func TestApplyEditRecomputesExposedPorts(t *testing.T) {
 	cfg := container.Config{
 		ExposedPorts: network.PortSet{
 			network.MustParsePort("80/tcp"):   {},
@@ -513,8 +534,9 @@ func TestApplyEditRecomputesExposedPortsInternal(t *testing.T) {
 	newBindings := map[string][]containertypes.PortBindingCreate{"443/tcp": {{HostPort: "8443"}}}
 	req := containertypes.Edit{HostConfig: &containertypes.HostConfigEdit{PortBindings: &newBindings}}
 
-	require.NoError(t, applyEditToContainerConfigInternal(&cfg, hc.PortBindings, req))
-	require.NoError(t, applyEditToHostConfigInternal(&hc, req))
+	cfg, err := applyEditToContainerConfig(cfg, hc.PortBindings, req)
+	require.NoError(t, err)
+	require.NoError(t, applyEditToHostConfig(&hc, req))
 
 	// new binding key + previously-exposed-but-unbound port survive; the old bound port is gone
 	require.Contains(t, cfg.ExposedPorts, network.MustParsePort("443/tcp"))
@@ -523,7 +545,7 @@ func TestApplyEditRecomputesExposedPortsInternal(t *testing.T) {
 	require.Contains(t, hc.PortBindings, network.MustParsePort("443/tcp"))
 }
 
-func TestBuildEditNetworkingConfigInternal(t *testing.T) {
+func TestBuildEditNetworkingConfig(t *testing.T) {
 	containerInspect := container.InspectResponse{
 		HostConfig: &container.HostConfig{NetworkMode: "my-net"},
 		NetworkSettings: &container.NetworkSettings{
@@ -534,7 +556,7 @@ func TestBuildEditNetworkingConfigInternal(t *testing.T) {
 	}
 
 	// nil request preserves existing attachments
-	out, err := buildEditNetworkingConfigInternal(containerInspect, nil, "1.44")
+	out, err := buildEditNetworkingConfig(containerInspect, nil, "1.44")
 	require.NoError(t, err)
 	require.NotNil(t, out)
 	require.Contains(t, out.EndpointsConfig, "my-net")
@@ -546,7 +568,7 @@ func TestBuildEditNetworkingConfigInternal(t *testing.T) {
 			"other-net": {},
 		},
 	}
-	out, err = buildEditNetworkingConfigInternal(containerInspect, req, "1.44")
+	out, err = buildEditNetworkingConfig(containerInspect, req, "1.44")
 	require.NoError(t, err)
 	require.Len(t, out.EndpointsConfig, 2)
 	require.Equal(t, []string{"renamed"}, out.EndpointsConfig["my-net"].Aliases)
@@ -555,17 +577,17 @@ func TestBuildEditNetworkingConfigInternal(t *testing.T) {
 
 	// host network mode: endpoint edits are skipped entirely
 	hostModeInspect := container.InspectResponse{HostConfig: &container.HostConfig{NetworkMode: "host"}}
-	out, err = buildEditNetworkingConfigInternal(hostModeInspect, req, "1.44")
+	out, err = buildEditNetworkingConfig(hostModeInspect, req, "1.44")
 	require.NoError(t, err)
 	require.Nil(t, out)
 }
 
-func TestRecreateContainerDaemonCorrelationInternal(t *testing.T) {
-	db := setupProjectTestDBInternal(t)
+func TestRecreateContainerDaemonCorrelation(t *testing.T) {
+	db := setupProjectTestDB(t)
 	events := event.NewEventService(db, nil, nil)
 	observed := make(chan string, 8)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		path := dockerTestPathInternal(r.URL.Path)
+		path := dockerTestPath(r.URL.Path)
 		id, name := "old-id", "web"
 		if path == "/containers/create" {
 			id = ""
@@ -591,7 +613,7 @@ func TestRecreateContainerDaemonCorrelationInternal(t *testing.T) {
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	t.Cleanup(server.Close)
-	dockerClient := newTestDockerClientInternal(t, server)
+	dockerClient := newTestDockerClient(t, server)
 	svc := NewContainerService(events, nil, nil, nil, nil)
 	info := container.InspectResponse{
 		ID:         "old-id",
@@ -600,7 +622,7 @@ func TestRecreateContainerDaemonCorrelationInternal(t *testing.T) {
 		Config:     &container.Config{Image: "app:latest"},
 		HostConfig: &container.HostConfig{},
 	}
-	id, err := svc.recreateContainerInternal(
+	id, err := svc.recreateContainer(
 		t.Context(),
 		dockerClient,
 		info,
@@ -638,7 +660,9 @@ func TestRecreateContainerDaemonCorrelationInternal(t *testing.T) {
 }
 
 func TestBuildSummariesUsesContainerTagPolicyUpdates(t *testing.T) {
-	service := &ContainerService{}
+	settingsService, err := settings.NewSettingsService(t.Context(), setupProjectTestDB(t))
+	require.NoError(t, err)
+	service := NewContainerService(nil, nil, nil, settingsService, nil)
 	strategyLabel := "com.getarcaneapp.arcane.updater.strategy"
 	containers := []container.Summary{
 		{ID: "first", Image: "app:3.1.0", ImageID: "shared-image"},
@@ -674,7 +698,7 @@ func TestBuildSummariesUsesContainerTagPolicyUpdates(t *testing.T) {
 	require.Contains(t, string(encoded), `"autoUpdateEnabled":false`, "false status must stay serialized")
 }
 
-func TestContainerServiceGetContainerProcessesInternal(t *testing.T) {
+func TestContainerServiceGetContainerProcesses(t *testing.T) {
 	tests := []struct {
 		name     string
 		status   int
@@ -732,7 +756,7 @@ func TestContainerServiceGetContainerProcessesInternal(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			var gotArgs []string
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.Method != http.MethodGet || dockerTestPathInternal(r.URL.Path) != "/containers/container-1/top" {
+				if r.Method != http.MethodGet || dockerTestPath(r.URL.Path) != "/containers/container-1/top" {
 					http.NotFound(w, r)
 					return
 				}
@@ -748,7 +772,9 @@ func TestContainerServiceGetContainerProcessesInternal(t *testing.T) {
 				}
 			}))
 			t.Cleanup(server.Close)
-			svc := NewContainerService(nil, docker.NewDockerClientService(t.Context(), nil, nil, nil).WithClient(newTestDockerClientInternal(t, server)), nil, nil, nil)
+			settingsService, err := settings.NewSettingsService(t.Context(), setupProjectTestDB(t))
+			require.NoError(t, err)
+			svc := NewContainerService(nil, docker.NewDockerClientService(t.Context(), nil, nil, nil).WithClient(newTestDockerClient(t, server)), nil, settingsService, nil)
 
 			processes, err := svc.GetContainerProcesses(t.Context(), "container-1")
 			wantArgs := []string{strings.Join(containerProcessesPsArgs[0], " ")}
@@ -767,18 +793,20 @@ func TestContainerServiceGetContainerProcessesInternal(t *testing.T) {
 	}
 }
 
-func TestContainerServiceGetContainerProcessesPropagatesContextInternal(t *testing.T) {
+func TestContainerServiceGetContainerProcessesPropagatesContext(t *testing.T) {
 	requestDone := make(chan struct{})
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		<-r.Context().Done()
 		close(requestDone)
 	}))
 	t.Cleanup(server.Close)
-	svc := NewContainerService(nil, docker.NewDockerClientService(t.Context(), nil, nil, nil).WithClient(newTestDockerClientInternal(t, server)), nil, nil, nil)
+	settingsService, err := settings.NewSettingsService(t.Context(), setupProjectTestDB(t))
+	require.NoError(t, err)
+	svc := NewContainerService(nil, docker.NewDockerClientService(t.Context(), nil, nil, nil).WithClient(newTestDockerClient(t, server)), nil, settingsService, nil)
 
 	ctx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
 	defer cancel()
-	_, err := svc.GetContainerProcesses(ctx, "container-1")
+	_, err = svc.GetContainerProcesses(ctx, "container-1")
 	require.ErrorIs(t, err, context.DeadlineExceeded)
 	select {
 	case <-requestDone:
@@ -787,21 +815,8 @@ func TestContainerServiceGetContainerProcessesPropagatesContextInternal(t *testi
 	}
 }
 
-type resourceStatsServerInternal struct {
-	mu          sync.Mutex
-	containers  []container.Summary
-	stats       map[string]container.StatsResponse
-	statsStatus map[string]int
-	statsCalls  map[string]int
-	delay       time.Duration
-	slowIDs     map[string]bool
-
-	current atomic.Int32
-	maxSeen atomic.Int32
-}
-
-func newResourceStatsServerInternal() *resourceStatsServerInternal {
-	return &resourceStatsServerInternal{
+func newResourceStatsServer() *resourceStatsServer {
+	return &resourceStatsServer{
 		stats:       map[string]container.StatsResponse{},
 		statsStatus: map[string]int{},
 		statsCalls:  map[string]int{},
@@ -809,7 +824,7 @@ func newResourceStatsServerInternal() *resourceStatsServerInternal {
 	}
 }
 
-func (f *resourceStatsServerInternal) addContainer(id, name, state string, labels ...map[string]string) {
+func (f *resourceStatsServer) addContainer(id, name, state string, labels ...map[string]string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	var l map[string]string
@@ -819,7 +834,7 @@ func (f *resourceStatsServerInternal) addContainer(id, name, state string, label
 	f.containers = append(f.containers, container.Summary{ID: id, Names: []string{"/" + name}, State: container.ContainerState(state), Image: "img:latest", Labels: l})
 }
 
-func (f *resourceStatsServerInternal) setStats(id string, cpuPercent float64, memoryUsage, memoryLimit uint64) {
+func (f *resourceStatsServer) setStats(id string, cpuPercent float64, memoryUsage, memoryLimit uint64) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	// cpuPercent maps to cpuDelta/systemDelta*100 with a fixed systemDelta of 1000.
@@ -840,15 +855,15 @@ func (f *resourceStatsServerInternal) setStats(id string, cpuPercent float64, me
 	}
 }
 
-func (f *resourceStatsServerInternal) callsFor(id string) int {
+func (f *resourceStatsServer) callsFor(id string) int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.statsCalls[id]
 }
 
-func (f *resourceStatsServerInternal) handler() http.Handler {
+func (f *resourceStatsServer) handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		path := dockerTestPathInternal(r.URL.Path)
+		path := dockerTestPath(r.URL.Path)
 		switch {
 		case path == "/containers/json":
 			f.mu.Lock()
@@ -920,29 +935,35 @@ func (f *resourceStatsServerInternal) handler() http.Handler {
 	})
 }
 
-func newResourceSortServiceInternal(t *testing.T, fixture *resourceStatsServerInternal) *ContainerService {
+func newResourceSortService(t *testing.T, fixture *resourceStatsServer) *ContainerService {
 	t.Helper()
 	server := httptest.NewServer(fixture.handler())
 	t.Cleanup(server.Close)
 
+	db := setupProjectTestDB(t)
+	settingsService, err := settings.NewSettingsService(t.Context(), db)
+	require.NoError(t, err)
+	dockerService := docker.NewDockerClientService(t.Context(), nil, nil, nil).WithClient(newTestDockerClient(t, server))
 	return NewContainerService(
 		nil,
-		docker.NewDockerClientService(t.Context(), nil, nil, nil).WithClient(newTestDockerClientInternal(t, server)),
-		nil,
-		nil,
+		dockerService,
+		imagedomain.NewImageService(db, dockerService, nil, nil, nil, nil, settingsService, nil),
+		settingsService,
 		nil,
 	)
 }
 
-func resourceSortParamsInternal(sort, order string, start, limit int) pagination.QueryParams {
+func resourceSortParams(sort, order string, start, limit int) pagination.QueryParams {
 	return pagination.QueryParams{
-		Sort: sort, Order: pagination.SortOrder(order),
-		Start: start, Limit: limit,
+		Sort:    sort,
+		Order:   pagination.SortOrder(order),
+		Start:   start,
+		Limit:   limit,
 		Filters: map[string]string{},
 	}
 }
 
-func summaryIDsInternal(items []containertypes.Summary) []string {
+func summaryIDs(items []containertypes.Summary) []string {
 	ids := make([]string, 0, len(items))
 	for _, item := range items {
 		ids = append(ids, item.ID)
@@ -950,7 +971,7 @@ func summaryIDsInternal(items []containertypes.Summary) []string {
 	return ids
 }
 
-func listResourceSortedInternal(t *testing.T, svc *ContainerService, params pagination.QueryParams) ContainerListResult {
+func listResourceSorted(t *testing.T, svc *ContainerService, params pagination.QueryParams) ContainerListResult {
 	t.Helper()
 	result, err := svc.ListContainersPaginated(t.Context(), params, true, true, true, "")
 	require.NoError(t, err)
@@ -958,7 +979,7 @@ func listResourceSortedInternal(t *testing.T, svc *ContainerService, params pagi
 }
 
 func TestResourceSortRanksMemoryByBytesNotPercent(t *testing.T) {
-	fixture := newResourceStatsServerInternal()
+	fixture := newResourceStatsServer()
 	// high-percent: 800 of 1000 bytes (80%); high-bytes: 900 of 10000 (9%).
 	fixture.addContainer("high-percent", "high-percent", "running")
 	fixture.setStats("high-percent", 10, 800, 1000)
@@ -966,19 +987,19 @@ func TestResourceSortRanksMemoryByBytesNotPercent(t *testing.T) {
 	fixture.setStats("high-bytes", 10, 900, 10000)
 	fixture.addContainer("opted-out", "opted-out", "running", map[string]string{"com.getarcaneapp.arcane.updater": "false"})
 	fixture.setStats("opted-out", 10, 100, 10000)
-	svc := newResourceSortServiceInternal(t, fixture)
+	svc := newResourceSortService(t, fixture)
 
-	result := listResourceSortedInternal(t, svc, resourceSortParamsInternal(containertypes.SortMemoryUsage, "desc", 0, 20))
-	require.Equal(t, []string{"high-bytes", "high-percent", "opted-out"}, summaryIDsInternal(result.Items))
+	result := listResourceSorted(t, svc, resourceSortParams(containertypes.SortMemoryUsage, "desc", 0, 20))
+	require.Equal(t, []string{"high-bytes", "high-percent", "opted-out"}, summaryIDs(result.Items))
 	require.True(t, result.Items[0].AutoUpdateEnabled)
 	require.False(t, result.Items[2].AutoUpdateEnabled)
 
-	result = listResourceSortedInternal(t, svc, resourceSortParamsInternal(containertypes.SortMemoryUsage, "asc", 0, 20))
-	require.Equal(t, []string{"opted-out", "high-percent", "high-bytes"}, summaryIDsInternal(result.Items))
+	result = listResourceSorted(t, svc, resourceSortParams(containertypes.SortMemoryUsage, "asc", 0, 20))
+	require.Equal(t, []string{"opted-out", "high-percent", "high-bytes"}, summaryIDs(result.Items))
 
-	flat, err := svc.ListContainersPaginated(t.Context(), resourceSortParamsInternal("name", "asc", 0, 20), true, true, true, "")
+	flat, err := svc.ListContainersPaginated(t.Context(), resourceSortParams("name", "asc", 0, 20), true, true, true, "")
 	require.NoError(t, err)
-	require.Equal(t, []string{"high-bytes", "high-percent", "opted-out"}, summaryIDsInternal(flat.Items))
+	require.Equal(t, []string{"high-bytes", "high-percent", "opted-out"}, summaryIDs(flat.Items))
 	require.True(t, flat.Items[0].AutoUpdateEnabled)
 	require.False(t, flat.Items[2].AutoUpdateEnabled)
 
@@ -991,13 +1012,13 @@ func TestResourceSortRanksMemoryByBytesNotPercent(t *testing.T) {
 }
 
 func TestResourceSortOrdersAcrossPages(t *testing.T) {
-	fixture := newResourceStatsServerInternal()
+	fixture := newResourceStatsServer()
 	memoryByID := map[string]uint64{"c1": 100, "c2": 200, "c3": 300, "c4": 400, "c5": 500}
 	for id, memory := range memoryByID {
 		fixture.addContainer(id, id, "running")
 		fixture.setStats(id, 0, memory, 10000)
 	}
-	svc := newResourceSortServiceInternal(t, fixture)
+	svc := newResourceSortService(t, fixture)
 
 	tests := []struct {
 		name  string
@@ -1013,51 +1034,51 @@ func TestResourceSortOrdersAcrossPages(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := listResourceSortedInternal(t, svc, resourceSortParamsInternal(containertypes.SortMemoryUsage, tt.order, tt.start, 2))
-			require.Equal(t, tt.want, summaryIDsInternal(result.Items))
+			result := listResourceSorted(t, svc, resourceSortParams(containertypes.SortMemoryUsage, tt.order, tt.start, 2))
+			require.Equal(t, tt.want, summaryIDs(result.Items))
 			require.Equal(t, int64(5), result.Pagination.TotalItems)
 		})
 	}
 }
 
 func TestResourceSortOrdersByCPUPercent(t *testing.T) {
-	fixture := newResourceStatsServerInternal()
+	fixture := newResourceStatsServer()
 	fixture.addContainer("busy", "busy", "running")
 	fixture.setStats("busy", 90, 100, 1000)
 	fixture.addContainer("idle", "idle", "running")
 	fixture.setStats("idle", 5, 100, 1000)
-	svc := newResourceSortServiceInternal(t, fixture)
+	svc := newResourceSortService(t, fixture)
 
-	result := listResourceSortedInternal(t, svc, resourceSortParamsInternal(containertypes.SortCPUUsage, "desc", 0, 20))
-	require.Equal(t, []string{"busy", "idle"}, summaryIDsInternal(result.Items))
+	result := listResourceSorted(t, svc, resourceSortParams(containertypes.SortCPUUsage, "desc", 0, 20))
+	require.Equal(t, []string{"busy", "idle"}, summaryIDs(result.Items))
 	require.InDelta(t, 90, result.Items[0].ResourceSample.CPUPercent, 0.2)
 	require.InDelta(t, 5, result.Items[1].ResourceSample.CPUPercent, 0.2)
 }
 
 func TestResourceSortAppliesSearchAndFiltersBeforeCollectingStats(t *testing.T) {
-	fixture := newResourceStatsServerInternal()
+	fixture := newResourceStatsServer()
 	fixture.addContainer("web", "web", "running", map[string]string{"team": "backend"})
 	fixture.setStats("web", 10, 100, 1000)
 	fixture.addContainer("db", "db", "running")
 	fixture.setStats("db", 20, 200, 1000)
-	svc := newResourceSortServiceInternal(t, fixture)
+	svc := newResourceSortService(t, fixture)
 
-	params := resourceSortParamsInternal(containertypes.SortMemoryUsage, "desc", 0, 20)
+	params := resourceSortParams(containertypes.SortMemoryUsage, "desc", 0, 20)
 	params.Search = "web"
-	result := listResourceSortedInternal(t, svc, params)
-	require.Equal(t, []string{"web"}, summaryIDsInternal(result.Items))
+	result := listResourceSorted(t, svc, params)
+	require.Equal(t, []string{"web"}, summaryIDs(result.Items))
 	require.Equal(t, 1, fixture.callsFor("web"))
 	require.Equal(t, 0, fixture.callsFor("db"), "filtered-out containers must not trigger stats collection")
 
-	params = resourceSortParamsInternal(containertypes.SortMemoryUsage, "desc", 0, 20)
+	params = resourceSortParams(containertypes.SortMemoryUsage, "desc", 0, 20)
 	params.Filters["label"] = "team=backend"
-	result = listResourceSortedInternal(t, svc, params)
-	require.Equal(t, []string{"web"}, summaryIDsInternal(result.Items))
+	result = listResourceSorted(t, svc, params)
+	require.Equal(t, []string{"web"}, summaryIDs(result.Items))
 	require.Equal(t, 0, fixture.callsFor("db"))
 }
 
 func TestResourceSortHandlesZeroUnavailableStoppedAndTies(t *testing.T) {
-	fixture := newResourceStatsServerInternal()
+	fixture := newResourceStatsServer()
 	fixture.addContainer("zero", "zero", "running")
 	fixture.setStats("zero", 0, 0, 1000)
 	fixture.addContainer("tie-b", "alpha", "running")
@@ -1067,53 +1088,53 @@ func TestResourceSortHandlesZeroUnavailableStoppedAndTies(t *testing.T) {
 	fixture.addContainer("broken", "broken", "running")
 	fixture.statsStatus["broken"] = http.StatusInternalServerError
 	fixture.addContainer("stopped", "stopped", "exited")
-	svc := newResourceSortServiceInternal(t, fixture)
+	svc := newResourceSortService(t, fixture)
 
-	asc := listResourceSortedInternal(t, svc, resourceSortParamsInternal(containertypes.SortMemoryUsage, "asc", 0, 20))
-	require.Equal(t, []string{"zero", "tie-a", "tie-b", "broken", "stopped"}, summaryIDsInternal(asc.Items),
+	asc := listResourceSorted(t, svc, resourceSortParams(containertypes.SortMemoryUsage, "asc", 0, 20))
+	require.Equal(t, []string{"zero", "tie-a", "tie-b", "broken", "stopped"}, summaryIDs(asc.Items),
 		"zeros first, unavailable and stopped last, ties by name then ID")
 	require.NotNil(t, asc.Items[0].ResourceSample, "zero usage is a valid sample, not unavailable")
 	require.Nil(t, asc.Items[3].ResourceSample)
 	require.Nil(t, asc.Items[4].ResourceSample)
 
-	desc := listResourceSortedInternal(t, svc, resourceSortParamsInternal(containertypes.SortMemoryUsage, "desc", 0, 20))
-	require.Equal(t, []string{"tie-a", "tie-b", "zero", "broken", "stopped"}, summaryIDsInternal(desc.Items),
+	desc := listResourceSorted(t, svc, resourceSortParams(containertypes.SortMemoryUsage, "desc", 0, 20))
+	require.Equal(t, []string{"tie-a", "tie-b", "zero", "broken", "stopped"}, summaryIDs(desc.Items),
 		"unavailable stays last in descending order too")
 
 	require.Equal(t, 0, fixture.callsFor("stopped"), "stopped containers must not trigger stats collection")
 }
 
 func TestResourceSortCachesSamples(t *testing.T) {
-	fixture := newResourceStatsServerInternal()
+	fixture := newResourceStatsServer()
 	fixture.addContainer("web", "web", "running")
 	fixture.setStats("web", 10, 100, 1000)
-	svc := newResourceSortServiceInternal(t, fixture)
+	svc := newResourceSortService(t, fixture)
 
 	for range 2 {
-		listResourceSortedInternal(t, svc, resourceSortParamsInternal(containertypes.SortMemoryUsage, "desc", 0, 20))
+		listResourceSorted(t, svc, resourceSortParams(containertypes.SortMemoryUsage, "desc", 0, 20))
 	}
 	require.Equal(t, 1, fixture.callsFor("web"), "second list within the TTL must reuse the cached sample")
 }
 
 func TestResourceSortCacheExpires(t *testing.T) {
-	fixture := newResourceStatsServerInternal()
+	fixture := newResourceStatsServer()
 	fixture.addContainer("web", "web", "running")
 	fixture.setStats("web", 10, 100, 1000)
-	svc := newResourceSortServiceInternal(t, fixture)
+	svc := newResourceSortService(t, fixture)
 	svc.stats = stats.New(svc.dockerService.GetClient, svc.dockerService.DockerHost, 50*time.Millisecond, 0, 0)
 
-	listResourceSortedInternal(t, svc, resourceSortParamsInternal(containertypes.SortMemoryUsage, "desc", 0, 20))
+	listResourceSorted(t, svc, resourceSortParams(containertypes.SortMemoryUsage, "desc", 0, 20))
 	time.Sleep(100 * time.Millisecond)
-	listResourceSortedInternal(t, svc, resourceSortParamsInternal(containertypes.SortMemoryUsage, "desc", 0, 20))
+	listResourceSorted(t, svc, resourceSortParams(containertypes.SortMemoryUsage, "desc", 0, 20))
 	require.Equal(t, 2, fixture.callsFor("web"), "expired entries must be refetched")
 }
 
 func TestResourceSortCoalescesConcurrentFetches(t *testing.T) {
-	fixture := newResourceStatsServerInternal()
+	fixture := newResourceStatsServer()
 	fixture.addContainer("web", "web", "running")
 	fixture.setStats("web", 10, 100, 1000)
 	fixture.delay = 100 * time.Millisecond
-	svc := newResourceSortServiceInternal(t, fixture)
+	svc := newResourceSortService(t, fixture)
 
 	const callers = 8
 	var wg sync.WaitGroup
@@ -1132,54 +1153,54 @@ func TestResourceSortCoalescesConcurrentFetches(t *testing.T) {
 }
 
 func TestResourceSortBoundsCollectionConcurrency(t *testing.T) {
-	fixture := newResourceStatsServerInternal()
+	fixture := newResourceStatsServer()
 	fixture.delay = 50 * time.Millisecond
 	for i := range 32 {
 		id := fmt.Sprintf("c%02d", i)
 		fixture.addContainer(id, id, "running")
 		fixture.setStats(id, 0, uint64(i), 10000)
 	}
-	svc := newResourceSortServiceInternal(t, fixture)
+	svc := newResourceSortService(t, fixture)
 
-	result := listResourceSortedInternal(t, svc, resourceSortParamsInternal(containertypes.SortMemoryUsage, "desc", 0, 40))
+	result := listResourceSorted(t, svc, resourceSortParams(containertypes.SortMemoryUsage, "desc", 0, 40))
 	require.Len(t, result.Items, 32)
 	require.LessOrEqual(t, fixture.maxSeen.Load(), int32(stats.ContainerResourceCollectConcurrency))
 }
 
 func TestResourceSortBatchTimeoutFailsRequest(t *testing.T) {
-	fixture := newResourceStatsServerInternal()
+	fixture := newResourceStatsServer()
 	fixture.addContainer("slow", "slow", "running")
 	fixture.setStats("slow", 10, 100, 1000)
 	fixture.delay = time.Second
-	svc := newResourceSortServiceInternal(t, fixture)
+	svc := newResourceSortService(t, fixture)
 	svc.stats = stats.New(svc.dockerService.GetClient, svc.dockerService.DockerHost, stats.ContainerResourceSampleTTL, 0, 50*time.Millisecond)
 
-	_, err := svc.ListContainersPaginated(t.Context(), resourceSortParamsInternal(containertypes.SortMemoryUsage, "desc", 0, 20), true, true, true, "")
+	_, err := svc.ListContainersPaginated(t.Context(), resourceSortParams(containertypes.SortMemoryUsage, "desc", 0, 20), true, true, true, "")
 	require.Error(t, err, "batch timeout must fail the refresh instead of presenting a partial sort")
 }
 
 func TestResourceSortPerContainerTimeoutMarksUnavailable(t *testing.T) {
-	fixture := newResourceStatsServerInternal()
+	fixture := newResourceStatsServer()
 	fixture.addContainer("fast", "fast", "running")
 	fixture.setStats("fast", 10, 100, 1000)
 	fixture.addContainer("slow", "slow", "running")
 	fixture.setStats("slow", 10, 200, 1000)
 	fixture.slowIDs["slow"] = true
-	svc := newResourceSortServiceInternal(t, fixture)
+	svc := newResourceSortService(t, fixture)
 	svc.stats = stats.New(svc.dockerService.GetClient, svc.dockerService.DockerHost, stats.ContainerResourceSampleTTL, 50*time.Millisecond, 0)
 
-	result := listResourceSortedInternal(t, svc, resourceSortParamsInternal(containertypes.SortMemoryUsage, "desc", 0, 20))
-	require.Equal(t, []string{"fast", "slow"}, summaryIDsInternal(result.Items))
+	result := listResourceSorted(t, svc, resourceSortParams(containertypes.SortMemoryUsage, "desc", 0, 20))
+	require.Equal(t, []string{"fast", "slow"}, summaryIDs(result.Items))
 	require.NotNil(t, result.Items[0].ResourceSample)
 	require.Nil(t, result.Items[1].ResourceSample, "per-container timeout leaves the sample unavailable")
 }
 
 func TestResourceSortCancelledContextFailsRequest(t *testing.T) {
-	fixture := newResourceStatsServerInternal()
+	fixture := newResourceStatsServer()
 	fixture.addContainer("web", "web", "running")
 	fixture.setStats("web", 10, 100, 1000)
 	fixture.delay = time.Second
-	svc := newResourceSortServiceInternal(t, fixture)
+	svc := newResourceSortService(t, fixture)
 
 	ctx, cancel := context.WithCancel(t.Context())
 	go func() {
@@ -1187,7 +1208,7 @@ func TestResourceSortCancelledContextFailsRequest(t *testing.T) {
 		cancel()
 	}()
 
-	_, err := svc.ListContainersPaginated(ctx, resourceSortParamsInternal(containertypes.SortMemoryUsage, "desc", 0, 20), true, true, true, "")
+	_, err := svc.ListContainersPaginated(ctx, resourceSortParams(containertypes.SortMemoryUsage, "desc", 0, 20), true, true, true, "")
 	require.Error(t, err)
 }
 
@@ -1229,7 +1250,7 @@ func TestSampleResourcesFiltersRequestedIDs(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			fixture := newResourceStatsServerInternal()
+			fixture := newResourceStatsServer()
 			for _, id := range tt.running {
 				fixture.addContainer(id, id, "running")
 				fixture.setStats(id, 10, 100, 1000)
@@ -1238,7 +1259,7 @@ func TestSampleResourcesFiltersRequestedIDs(t *testing.T) {
 				fixture.addContainer(id, id, "exited")
 				fixture.setStats(id, 10, 100, 1000)
 			}
-			svc := newResourceSortServiceInternal(t, fixture)
+			svc := newResourceSortService(t, fixture)
 
 			samples, err := svc.SampleResources(t.Context(), tt.request, stats.ContainerResourceSampleTTL)
 			require.NoError(t, err)
@@ -1250,10 +1271,10 @@ func TestSampleResourcesFiltersRequestedIDs(t *testing.T) {
 	}
 }
 
-func newLogsTestServiceInternal(t *testing.T, tty bool, logsBody []byte, gotQuery *url.Values) *ContainerService {
+func newLogsTestService(t *testing.T, tty bool, logsBody []byte, gotQuery *url.Values) *ContainerService {
 	t.Helper()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch dockerTestPathInternal(r.URL.Path) {
+		switch dockerTestPath(r.URL.Path) {
 		case "/containers/container-1/json":
 			ttyJSON := kit.Ternary(tty, "true", "false")
 			_, _ = io.WriteString(w, `{"Id":"0123456789abcdef0123456789abcdef","Config":{"Tty":`+ttyJSON+`}}`)
@@ -1267,15 +1288,15 @@ func newLogsTestServiceInternal(t *testing.T, tty bool, logsBody []byte, gotQuer
 	t.Cleanup(server.Close)
 
 	return NewContainerService(
-		event.NewEventService(setupProjectTestDBInternal(t), nil, nil),
-		docker.NewDockerClientService(t.Context(), nil, nil, nil).WithClient(newTestDockerClientInternal(t, server)),
+		event.NewEventService(setupProjectTestDB(t), nil, nil),
+		docker.NewDockerClientService(t.Context(), nil, nil, nil).WithClient(newTestDockerClient(t, server)),
 		nil,
 		nil,
 		nil,
 	)
 }
 
-func TestContainerServiceDownloadLogsDemultiplexesNonTTYInternal(t *testing.T) {
+func TestContainerServiceDownloadLogsDemultiplexesNonTTY(t *testing.T) {
 	var frames bytes.Buffer
 	longLine := strings.Repeat("x", 70*1024) + "\n"
 	for _, frame := range []struct {
@@ -1296,7 +1317,7 @@ func TestContainerServiceDownloadLogsDemultiplexesNonTTYInternal(t *testing.T) {
 	}
 
 	var gotQuery url.Values
-	svc := newLogsTestServiceInternal(t, false, frames.Bytes(), &gotQuery)
+	svc := newLogsTestService(t, false, frames.Bytes(), &gotQuery)
 
 	reader, filename, err := svc.DownloadLogs(t.Context(), "container-1")
 	require.NoError(t, err)
@@ -1316,9 +1337,9 @@ func TestContainerServiceDownloadLogsDemultiplexesNonTTYInternal(t *testing.T) {
 	require.Empty(t, gotQuery.Get("since"))
 }
 
-func TestContainerServiceDownloadLogsPassesTTYOutputThroughInternal(t *testing.T) {
+func TestContainerServiceDownloadLogsPassesTTYOutputThrough(t *testing.T) {
 	var gotQuery url.Values
-	svc := newLogsTestServiceInternal(t, true, []byte("raw tty line\r\nno trailing newline"), &gotQuery)
+	svc := newLogsTestService(t, true, []byte("raw tty line\r\nno trailing newline"), &gotQuery)
 
 	reader, filename, err := svc.DownloadLogs(t.Context(), "container-1")
 	require.NoError(t, err)

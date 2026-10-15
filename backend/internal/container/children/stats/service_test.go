@@ -34,7 +34,11 @@ func TestResourceSortPermissionCheck(t *testing.T) {
 func TestResourceSortComparatorKeepsUnavailableLast(t *testing.T) {
 	asc := ContainerResourceSampleSort(container.SortMemoryUsage, false)
 	desc := ContainerResourceSampleSort(container.SortMemoryUsage, true)
-	sampled := container.Summary{ID: "b", Names: []string{"b"}, ResourceSample: &container.ResourceSample{MemoryUsageBytes: 1}}
+	sampled := container.Summary{
+		ID:             "b",
+		Names:          []string{"b"},
+		ResourceSample: &container.ResourceSample{MemoryUsageBytes: 1},
+	}
 	unsampled := container.Summary{ID: "a", Names: []string{"a"}}
 
 	require.Equal(t, 1, asc(unsampled, sampled))
@@ -42,7 +46,11 @@ func TestResourceSortComparatorKeepsUnavailableLast(t *testing.T) {
 	require.Equal(t, 1, desc(unsampled, sampled))
 	require.Equal(t, -1, desc(sampled, unsampled))
 
-	zero := container.Summary{ID: "z", Names: []string{"z"}, ResourceSample: &container.ResourceSample{MemoryUsageBytes: 0}}
+	zero := container.Summary{
+		ID:             "z",
+		Names:          []string{"z"},
+		ResourceSample: &container.ResourceSample{MemoryUsageBytes: 0},
+	}
 	require.Equal(t, -1, asc(zero, unsampled), "zero is a valid value, not unavailable")
 	require.Equal(t, -1, asc(zero, sampled))
 }

@@ -31,20 +31,49 @@ func New(httpClient *http.Client, dockerService *docker.DockerClientService) *Se
 // API URL always probes directly over HTTP.
 func (s *Service) Probe(ctx context.Context, id, apiURL string, isEdge, customURL bool) (string, error) {
 	if id == "0" && !customURL {
-		return s.probeLocalDockerInternal(ctx)
+		reqCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+
+		dockerClient, err := s.dockerService.GetClient(ctx)
+		if err != nil {
+			return "offline", fmt.Errorf("failed to connect to Docker: %w", err)
+		}
+		if _, pingErr := dockerClient.Ping(reqCtx, client.PingOptions{}); pingErr != nil {
+			return "offline", fmt.Errorf("docker ping failed: %w", pingErr)
+		}
+		return "online", nil
 	}
 	if isEdge && !customURL {
-		return probeEdgeInternal(ctx, id)
+		// The probe is standing tunnel demand, keeping idle poll-mode tunnels
+		// open across check cycles instead of letting them flap.
+		edge.TouchTunnelDemand(id, edge.DefaultTunnelDemandTTL)
+		if !edge.HasActiveTunnel(id) {
+			if _, ok := edge.RequestTunnelAndWait(ctx, id, edge.DefaultTunnelDemandTTL, edge.DefaultTunnelAcquireTimeout()).Get(); !ok {
+				return "offline", errors.New("edge agent is not connected")
+			}
+		}
+
+		reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+
+		statusCode, _, err := edge.DoRequest(reqCtx, id, http.MethodGet, "/api/health", nil)
+		if err != nil {
+			return "offline", fmt.Errorf("health check via tunnel failed: %w", err)
+		}
+		if statusCode == http.StatusOK {
+			return "online", nil
+		}
+		return "error", fmt.Errorf("unexpected status code: %d", statusCode)
 	}
 
-	healthURL, err := buildEndpointURLInternal(apiURL, "/api/health")
+	baseURL, err := httpx.NormalizeBaseURL(apiURL)
 	if err != nil {
 		return "offline", fmt.Errorf("invalid environment API URL: %w", err)
 	}
 
 	reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, healthURL, http.NoBody)
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, strings.TrimRight(baseURL, "/")+"/api/health", http.NoBody)
 	if err != nil {
 		return "offline", fmt.Errorf("failed to create request: %w", err)
 	}
@@ -58,51 +87,4 @@ func (s *Service) Probe(ctx context.Context, id, apiURL string, isEdge, customUR
 		return "online", nil
 	}
 	return "error", fmt.Errorf("unexpected status code: %d", resp.StatusCode)
-}
-
-// probeEdgeInternal checks an edge agent through its tunnel. The probe itself
-// is standing demand for the tunnel, which keeps idle poll-mode tunnels open
-// across check cycles instead of letting them flap between checks.
-func probeEdgeInternal(ctx context.Context, id string) (string, error) {
-	edge.TouchTunnelDemand(id, edge.DefaultTunnelDemandTTL)
-	if !edge.HasActiveTunnel(id) {
-		if _, ok := edge.RequestTunnelAndWait(ctx, id, edge.DefaultTunnelDemandTTL, edge.DefaultTunnelAcquireTimeout()).Get(); !ok {
-			return "offline", errors.New("edge agent is not connected")
-		}
-	}
-
-	reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-
-	statusCode, _, err := edge.DoRequest(reqCtx, id, http.MethodGet, "/api/health", nil)
-	if err != nil {
-		return "offline", fmt.Errorf("health check via tunnel failed: %w", err)
-	}
-	if statusCode == http.StatusOK {
-		return "online", nil
-	}
-	return "error", fmt.Errorf("unexpected status code: %d", statusCode)
-}
-
-func (s *Service) probeLocalDockerInternal(ctx context.Context) (string, error) {
-	reqCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-
-	dockerClient, err := s.dockerService.GetClient(ctx)
-	if err != nil {
-		return "offline", fmt.Errorf("failed to connect to Docker: %w", err)
-	}
-	if _, pingErr := dockerClient.Ping(reqCtx, client.PingOptions{}); pingErr != nil {
-		return "offline", fmt.Errorf("docker ping failed: %w", pingErr)
-	}
-	return "online", nil
-}
-
-func buildEndpointURLInternal(apiURL, endpointPath string) (string, error) {
-	baseURL, err := httpx.NormalizeBaseURL(apiURL)
-	if err != nil {
-		return "", err
-	}
-
-	return strings.TrimRight(baseURL, "/") + endpointPath, nil
 }

@@ -3,6 +3,7 @@
 package swarm
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -10,6 +11,8 @@ import (
 	"strings"
 
 	"github.com/getarcaneapp/arcane/types/v2/environment"
+	"github.com/samber/mo"
+	kit "go.getarcane.app/kit/pkg"
 
 	"github.com/getarcaneapp/arcane/backend/v2/internal/apikey"
 )
@@ -31,7 +34,7 @@ func (s *Service) AgentIdentity(parentEnvironmentID, nodeID, hostname string) (s
 	if strings.TrimSpace(nodeID) == "" {
 		return "", "", errors.New("swarm node ID is required")
 	}
-	return buildAgentNameInternal(hostname, nodeID), buildAgentURLInternal(nodeID), nil
+	return cmp.Or(strings.TrimSpace(hostname), "Swarm Node "+nodeID[:min(len(nodeID), 12)]), "edge://swarm-node-" + nodeID[:min(len(nodeID), 12)], nil
 }
 
 // AuthorizeBinding rejects bindings that would silently move an environment or
@@ -50,9 +53,8 @@ func (s *Service) AuthorizeBinding(
 		return errors.New("disabled environments cannot be attached to swarm nodes")
 	}
 
-	boundElsewhere := candidate.ParentEnvironmentID != nil && candidate.SwarmNodeID != nil &&
-		(strings.TrimSpace(*candidate.ParentEnvironmentID) != parentEnvironmentID || strings.TrimSpace(*candidate.SwarmNodeID) != nodeID)
-	if boundElsewhere && !rebind {
+	if candidate.ParentEnvironmentID != nil && candidate.SwarmNodeID != nil && !rebind &&
+		(strings.TrimSpace(*candidate.ParentEnvironmentID) != parentEnvironmentID || strings.TrimSpace(*candidate.SwarmNodeID) != nodeID) {
 		return errors.New("environment is already bound to another swarm node; explicit rebinding is required")
 	}
 
@@ -75,12 +77,8 @@ func (s *Service) EnsureApiKey(
 	rotate bool,
 	link func(ctx context.Context, apiKeyID, apiKey string) error,
 ) (string, error) {
-	if !rotate && accessToken != nil && strings.TrimSpace(*accessToken) != "" {
+	if !rotate && strings.TrimSpace(kit.FromPtr(accessToken)) != "" {
 		return strings.TrimSpace(*accessToken), nil
-	}
-
-	if s.apiKeys == nil {
-		return "", errors.New("api key service not configured")
 	}
 
 	apiKeyDto, err := s.apiKeys.CreateEnvironmentApiKey(ctx, environmentID)
@@ -102,7 +100,7 @@ func (s *Service) EnsureApiKey(
 	// rejected. Failure is non-fatal for the rotation itself, but the old key
 	// remains a valid credential until deleted, so log it as an error; the key
 	// stays visible and deletable on the API Keys page.
-	if previousApiKeyID != nil && *previousApiKeyID != apiKeyDto.ID {
+	if mo.PointerToOption(previousApiKeyID).OrElse(apiKeyDto.ID) != apiKeyDto.ID {
 		if deleteApiKeyErr := s.apiKeys.DeleteApiKey(ctx, *previousApiKeyID); deleteApiKeyErr != nil && !errors.Is(deleteApiKeyErr, apikey.ErrApiKeyNotFound) {
 			slog.ErrorContext(ctx, "Failed to delete previous environment API key; the old key remains valid until deleted manually", "environmentId", environmentID, "error", deleteApiKeyErr.Error())
 		}

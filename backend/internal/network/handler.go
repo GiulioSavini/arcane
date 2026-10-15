@@ -3,8 +3,7 @@ package network
 import (
 	"cmp"
 	"context"
-	"errors"
-	"sort"
+	"slices"
 	"strings"
 
 	"github.com/danielgtaylor/huma/v2"
@@ -147,7 +146,7 @@ func (h *NetworkHandler) CreateNetwork(ctx context.Context, input *CreateNetwork
 		return nil, huma.Error400BadRequest("Invalid network options: " + err.Error())
 	}
 	if !input.Body.Options.EnableIPv6 {
-		dockerOptions.EnableIPv6 = nil
+		dockerOptions.EnableIPv6 = nil // keep: mapped options need nil to omit IPv6
 	}
 
 	var response *network.CreateResponse
@@ -179,7 +178,7 @@ func (h *NetworkHandler) CreateNetwork(ctx context.Context, input *CreateNetwork
 	if err != nil {
 		return nil, huma.Error500InternalServerError("Failed to map network: " + err.Error())
 	}
-	out.ActivityID = mo.EmptyableToOption(strings.TrimSpace(activityID)).ToPointer()
+	out.ActivityID = mo.EmptyableToOption(strings.TrimSpace(activityID)).ToPointer() // keep: enriches the mapped DTO
 
 	return &handlerutil.Out[networktypes.CreateResponse]{
 		Body: base.ApiResponse[networktypes.CreateResponse]{
@@ -201,49 +200,31 @@ func (h *NetworkHandler) GetNetwork(ctx context.Context, input *GetNetworkInput)
 	}
 
 	// Ensure ID is mapped correctly
-	if out.ID == "" {
-		out.ID = networkInspect.ID
-	}
+	out.ID = cmp.Or(out.ID, networkInspect.ID) // keep: enriches the mapped DTO
 
 	// Populate ContainersList
-	out.ContainersList = make([]networktypes.ContainerEndpoint, 0, len(out.Containers))
+	containers := make([]networktypes.ContainerEndpoint, 0, len(out.Containers))
 	for id, container := range out.Containers {
-		ipv4Address := ""
-		if container.IPv4Address.IsValid() {
-			ipv4Address = container.IPv4Address.String()
-		}
-		ipv6Address := ""
-		if container.IPv6Address.IsValid() {
-			ipv6Address = container.IPv6Address.String()
-		}
-		out.ContainersList = append(out.ContainersList, networktypes.ContainerEndpoint{
+		containers = append(containers, networktypes.ContainerEndpoint{
 			ID:          id,
 			Name:        container.Name,
 			EndpointID:  container.EndpointID,
-			IPv4Address: ipv4Address,
-			IPv6Address: ipv6Address,
+			IPv4Address: kit.Ternary(container.IPv4Address.IsValid(), container.IPv4Address.String(), ""),
+			IPv6Address: kit.Ternary(container.IPv6Address.IsValid(), container.IPv6Address.String(), ""),
 			MacAddress:  container.MacAddress.String(),
 		})
 	}
 
 	// Sort ContainersList
-	sort.Slice(out.ContainersList, func(i, j int) bool {
-		a, b := out.ContainersList[i], out.ContainersList[j]
-
+	slices.SortFunc(containers, func(a, b networktypes.ContainerEndpoint) int {
 		if input.Sort == "ip" {
-			valA := cmp.Or(a.IPv4Address, a.IPv6Address)
-			valB := cmp.Or(b.IPv4Address, b.IPv6Address)
-
-			localCmp := kit.CompareAddresses(valA, valB)
-			return kit.Ternary(input.Order == "desc", localCmp > 0, localCmp < 0)
+			return kit.Ternary(input.Order == "desc", -1, 1) * kit.CompareAddresses(cmp.Or(a.IPv4Address, a.IPv6Address), cmp.Or(b.IPv4Address, b.IPv6Address))
 		}
 
 		// Default to Name
-		if input.Order == "desc" {
-			return strings.ToLower(a.Name) > strings.ToLower(b.Name)
-		}
-		return strings.ToLower(a.Name) < strings.ToLower(b.Name)
+		return kit.Ternary(input.Order == "desc", -1, 1) * strings.Compare(strings.ToLower(a.Name), strings.ToLower(b.Name))
 	})
+	out.ContainersList = containers // keep: enriches the mapped DTO
 
 	return &handlerutil.Out[networktypes.Inspect]{
 		Body: base.ApiResponse[networktypes.Inspect]{
@@ -322,10 +303,8 @@ func (h *NetworkHandler) ConnectContainer(ctx context.Context, input *ConnectCon
 		return h.networkService.ConnectContainer(runtimeCtx, input.NetworkID, input.Body, *user)
 	})
 	if err != nil {
-		if errors.Is(err, common.ErrValidation) {
-			return nil, huma.Error400BadRequest(err.Error())
-		}
-		return nil, huma.Error500InternalServerError("Failed to connect container to network: " + err.Error())
+		apiErr := common.ToAPIError(err)
+		return nil, huma.NewError(apiErr.HTTPStatus(), apiErr.Message)
 	}
 
 	return handlerutil.MessageOutput("Container connected successfully", activityID), nil
@@ -387,7 +366,7 @@ func (h *NetworkHandler) PruneNetworks(ctx context.Context, input *PruneNetworks
 	if err != nil {
 		return nil, huma.Error500InternalServerError("Failed to map network: " + err.Error())
 	}
-	out.ActivityID = mo.EmptyableToOption(strings.TrimSpace(activityID)).ToPointer()
+	out.ActivityID = mo.EmptyableToOption(strings.TrimSpace(activityID)).ToPointer() // keep: enriches the mapped DTO
 
 	return &handlerutil.Out[networktypes.PruneReport]{
 		Body: base.ApiResponse[networktypes.PruneReport]{

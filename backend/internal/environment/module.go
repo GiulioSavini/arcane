@@ -57,8 +57,17 @@ func (m *Module) RegisterRoutes(api huma.API, appCtx handlerutil.ActivityAppCont
 		RegisterEnvironments(api, NewHandler(nil, nil, nil, nil, nil, nil))
 		return
 	}
-	m.handler.appCtx = appCtx.Context()
-	m.handler.localVersion = localVersion
+	*m.handler = EnvironmentHandler{ //exhaustruct:enforce
+		environmentService: m.handler.environmentService,
+		settingsService:    m.handler.settingsService,
+		apiKeyService:      m.handler.apiKeyService,
+		eventService:       m.handler.eventService,
+		cfg:                m.handler.cfg,
+		streamHub:          m.handler.streamHub,
+		activityService:    m.handler.activityService,
+		appCtx:             appCtx.Context(),
+		localVersion:       localVersion,
+	}
 	RegisterEnvironments(api, m.handler)
 }
 

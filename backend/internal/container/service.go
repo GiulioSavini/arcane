@@ -26,10 +26,11 @@ import (
 	"github.com/moby/moby/api/types/network"
 	"github.com/moby/moby/client"
 	"github.com/samber/hot"
+	"github.com/samber/mo"
 	"go.getarcane.app/docker"
 	"go.getarcane.app/docker/compat"
 	"go.getarcane.app/docker/types"
-	"go.getarcane.app/kit/pkg"
+	kit "go.getarcane.app/kit/pkg"
 	"go.getarcane.app/sys/cgroup"
 	"go.getarcane.app/updater"
 	"go.getarcane.app/updater/labels"
@@ -52,6 +53,12 @@ import (
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/utils/iconcatalog"
 )
 
+const (
+	containerGroupByProject  = "project"
+	containerNoProjectGroup  = "No Project"
+	containerIconMetadataTTL = 5 * time.Second
+)
+
 type ContainerService struct {
 	dockerService   *dockerInternal.DockerClientService
 	eventService    *event.EventService
@@ -62,17 +69,34 @@ type ContainerService struct {
 	stats           *stats.Service
 }
 
-const (
-	containerGroupByProject  = "project"
-	containerNoProjectGroup  = "No Project"
-	containerIconMetadataTTL = 5 * time.Second
-)
-
 type ContainerListResult struct {
 	Items      []containertypes.Summary
 	Groups     []containertypes.SummaryGroup
 	Pagination pagination.Response
 	Counts     containertypes.StatusCounts
+}
+
+type containerLifecycleAction struct {
+	action             string
+	eventType          event.EventType
+	metadata           database.JSON
+	warnOnLogError     bool
+	runContainerAction func(*client.Client) error
+}
+
+type ExecSession struct {
+	execID       string
+	containerID  string
+	hijackedResp client.HijackedResponse
+	dockerClient *client.Client
+	closeOnce    sync.Once
+}
+
+type demuxedLogs struct {
+	io.Reader
+
+	pipe *io.PipeReader
+	logs io.ReadCloser
 }
 
 func NewContainerService(
@@ -96,20 +120,35 @@ func NewContainerService(
 	}
 }
 
-func buildCleanNetworkingConfigInternal(containerInspect container.InspectResponse, apiVersion string) *network.NetworkingConfig {
-	if containerInspect.NetworkSettings == nil || len(containerInspect.NetworkSettings.Networks) == 0 {
+func buildCleanNetworkingConfig(containerInspect container.InspectResponse, apiVersion string) *network.NetworkingConfig {
+	if len(kit.FromPtr(containerInspect.NetworkSettings).Networks) == 0 {
 		return nil
 	}
 
-	endpointsConfig := compat.SanitizeContainerCreateEndpointSettingsForDockerAPI(containerInspect.NetworkSettings.Networks, apiVersion)
-	for networkName, endpoint := range endpointsConfig {
+	endpointsConfig := map[string]*network.EndpointSettings{}
+	for networkName, endpoint := range compat.SanitizeContainerCreateEndpointSettingsForDockerAPI(containerInspect.NetworkSettings.Networks, apiVersion) {
 		if endpoint == nil {
+			endpointsConfig[networkName] = nil
 			continue
 		}
 
-		endpointCopy := *endpoint
-		endpointCopy.IPAMConfig = nil
-		endpointsConfig[networkName] = &endpointCopy
+		endpointsConfig[networkName] = &network.EndpointSettings{ //exhaustruct:enforce
+			IPAMConfig:          nil,
+			Links:               endpoint.Links,
+			Aliases:             endpoint.Aliases,
+			DriverOpts:          endpoint.DriverOpts,
+			GwPriority:          endpoint.GwPriority,
+			NetworkID:           endpoint.NetworkID,
+			EndpointID:          endpoint.EndpointID,
+			Gateway:             endpoint.Gateway,
+			IPAddress:           endpoint.IPAddress,
+			MacAddress:          endpoint.MacAddress,
+			IPPrefixLen:         endpoint.IPPrefixLen,
+			IPv6Gateway:         endpoint.IPv6Gateway,
+			GlobalIPv6Address:   endpoint.GlobalIPv6Address,
+			GlobalIPv6PrefixLen: endpoint.GlobalIPv6PrefixLen,
+			DNSNames:            endpoint.DNSNames,
+		}
 	}
 
 	if len(endpointsConfig) == 0 {
@@ -121,45 +160,14 @@ func buildCleanNetworkingConfigInternal(containerInspect container.InspectRespon
 	}
 }
 
-func buildRedeployBackupNameInternal(containerName, containerID string) string {
-	backupName := containerName
-	if backupName == "" {
-		backupName = "arcane-redeploy"
-		if len(containerID) >= 12 {
-			backupName = fmt.Sprintf("%s-%s", backupName, containerID[:12])
-		}
-	}
-
-	return fmt.Sprintf("%s-arcane-redeploy-%d", backupName, time.Now().Unix())
-}
-
-func shouldStartRedeployedContainerInternal(containerInfo container.InspectResponse, wasRunning bool) bool {
-	if !wasRunning && containerInfo.HostConfig == nil {
-		return false
-	}
-
-	shouldStart := wasRunning
-	if containerInfo.HostConfig != nil {
-		rp := containerInfo.HostConfig.RestartPolicy.Name
-		if rp == "always" || rp == "unless-stopped" || rp == "on-failure" {
-			shouldStart = true
-		}
-	}
-
-	return shouldStart
-}
-
-func (
-	s *ContainerService,
-) pullRedeployImageInternal(
+func (s *ContainerService) pullRedeployImage(
 	ctx context.Context,
 	dockerClient *client.Client,
 	imageName, containerID, containerName, action string,
 	credentials []containerregistry.Credential,
 	user usertypes.Actor,
 ) error {
-	localSettings := s.settingsService.GetSettingsConfig()
-	pullCtx, pullCancel := context.WithTimeout(ctx, timeouts.GetDuration(localSettings.DockerImagePullTimeout.AsInt(), timeouts.DefaultDockerImagePull))
+	pullCtx, pullCancel := context.WithTimeout(ctx, timeouts.GetDuration(s.settingsService.GetSettingsConfig().DockerImagePullTimeout.AsInt(), timeouts.DefaultDockerImagePull))
 	defer pullCancel()
 
 	pullOptions, authErr := s.imageService.PullOptionsWithAuth(ctx, imageName, credentials)
@@ -219,9 +227,7 @@ func (
 	return nil
 }
 
-func (
-	s *ContainerService,
-) prepareContainerForRedeployInternal(
+func (s *ContainerService) prepareContainerForRedeploy(
 	ctx context.Context,
 	dockerClient *client.Client,
 	containerID, containerName, backupName string,
@@ -265,9 +271,7 @@ func (
 	return fmt.Errorf("failed to stop container: %w", err)
 }
 
-func (
-	s *ContainerService,
-) restoreContainerAfterRedeployFailureInternal(
+func (s *ContainerService) restoreContainerAfterRedeployFailure(
 	ctx context.Context,
 	dockerClient *client.Client,
 	containerID, containerName, backupName, failedStep string,
@@ -298,112 +302,7 @@ func (
 	}
 }
 
-// restoreAutoRemoveContainerAfterStartFailureInternal recreates and starts the
-// original container when a deferred-stop auto-remove recreate fails to start
-// the replacement. Stopping the original already made the daemon delete it, so
-// the only rollback left is rebuilding from the inspected configuration. The
-// failed replacement must be removed first so the original name is free again.
-// A returned error means the original container is gone and could not be
-// restored; the caller must surface it alongside the replacement failure.
-func (
-	s *ContainerService,
-) restoreAutoRemoveContainerAfterStartFailureInternal(
-	ctx context.Context,
-	dockerClient *client.Client,
-	containerInfo container.InspectResponse,
-	apiVersion string,
-	user usertypes.Actor,
-) error {
-	containerID := containerInfo.ID
-	containerName := strings.TrimPrefix(containerInfo.Name, "/")
-
-	originalConfig := *containerInfo.Config
-	if len(containerID) >= 12 && originalConfig.Hostname == containerID[:12] {
-		originalConfig.Hostname = ""
-	}
-
-	defer s.eventService.BeginDockerResourceSuppressionWindow("container", "", containerName)()
-	createResp, err := compat.ContainerCreateWithCompatibilityForAPIVersion(ctx, dockerClient, client.ContainerCreateOptions{
-		Config:           &originalConfig,
-		HostConfig:       containerInfo.HostConfig,
-		NetworkingConfig: buildCleanNetworkingConfigInternal(containerInfo, apiVersion),
-		Name:             containerName,
-	}, apiVersion)
-	if err != nil {
-		s.eventService.LogErrorEvent(ctx, event.EventTypeContainerError, "container", containerID, containerName, user.ID, user.Username, "0", err, database.JSON{
-			"action": "redeploy",
-			"step":   "restore_create_original",
-		})
-		return fmt.Errorf("failed to recreate original auto-remove container: %w", err)
-	}
-
-	defer s.eventService.BeginDockerResourceSuppressionWindow("container", createResp.ID, containerName)()
-	if _, containerStartErr := dockerClient.ContainerStart(ctx, createResp.ID, client.ContainerStartOptions{}); containerStartErr != nil {
-		s.eventService.LogErrorEvent(ctx, event.EventTypeContainerError, "container", createResp.ID, containerName, user.ID, user.Username, "0", containerStartErr, database.JSON{
-			"action": "redeploy",
-			"step":   "restore_start_original",
-		})
-		return fmt.Errorf("failed to restart original auto-remove container: %w", containerStartErr)
-	}
-
-	slog.InfoContext(
-		ctx, "restored auto-remove container after failed recreate",
-		"oldContainerId", containerID,
-		"restoredContainerId", createResp.ID,
-		"containerName", containerName,
-	)
-	return nil
-}
-
-// rollbackFailedReplacementStartInternal removes the replacement that failed
-// to start and rolls back to the original container. For a deferred-stop
-// auto-remove original the rollback rebuilds it from the inspected
-// configuration; a failed restore is combined into the start error so the
-// caller learns the workload is down, not just that the replacement failed.
-func (
-	s *ContainerService,
-) rollbackFailedReplacementStartInternal(
-	ctx context.Context,
-	dockerClient *client.Client,
-	containerInfo container.InspectResponse,
-	replacementID, action, backupName string,
-	stopAfterCreate, wasRunning bool,
-	apiVersion string,
-	startErr error,
-	user usertypes.Actor,
-) error {
-	containerName := strings.TrimPrefix(containerInfo.Name, "/")
-
-	s.eventService.MarkDockerExpectation("container", replacementID, containerName)
-	var cleanupErr error
-	if _, removeErr := dockerClient.ContainerRemove(ctx, replacementID, client.ContainerRemoveOptions{Force: true}); removeErr != nil {
-		cleanupErr = fmt.Errorf("failed to remove replacement container: %w", removeErr)
-		s.eventService.LogErrorEvent(ctx, event.EventTypeContainerError, "container", replacementID, containerName, user.ID, user.Username, "0", removeErr, database.JSON{
-			"action": action,
-			"step":   "cleanup_failed_start",
-		})
-	}
-
-	if stopAfterCreate {
-		if restoreErr := s.restoreAutoRemoveContainerAfterStartFailureInternal(ctx, dockerClient, containerInfo, apiVersion, user); restoreErr != nil {
-			return errors.Join(startErr, cleanupErr, restoreErr)
-		}
-		return startErr
-	}
-
-	s.restoreContainerAfterRedeployFailureInternal(ctx, dockerClient, containerInfo.ID, containerName, backupName, "start", wasRunning, user)
-	return startErr
-}
-
-type containerLifecycleActionInternal struct {
-	action             string
-	eventType          event.EventType
-	metadata           database.JSON
-	warnOnLogError     bool
-	runContainerAction func(*client.Client) error
-}
-
-func (s *ContainerService) runContainerLifecycleActionInternal(ctx context.Context, containerID string, user usertypes.Actor, cfg containerLifecycleActionInternal) error {
+func (s *ContainerService) runContainerLifecycleAction(ctx context.Context, containerID string, user usertypes.Actor, cfg containerLifecycleAction) error {
 	dockerClient, err := s.dockerService.GetClient(ctx)
 	if err != nil {
 		s.eventService.LogErrorEvent(ctx, event.EventTypeContainerError, "container", containerID, "", user.ID, user.Username, "0", err, database.JSON{"action": cfg.action})
@@ -433,7 +332,7 @@ func (s *ContainerService) runContainerLifecycleActionInternal(ctx context.Conte
 }
 
 func (s *ContainerService) StartContainer(ctx context.Context, containerID string, user usertypes.Actor) error {
-	return s.runContainerLifecycleActionInternal(ctx, containerID, user, containerLifecycleActionInternal{
+	return s.runContainerLifecycleAction(ctx, containerID, user, containerLifecycleAction{
 		action:         "start",
 		eventType:      event.EventTypeContainerStart,
 		warnOnLogError: true,
@@ -445,7 +344,7 @@ func (s *ContainerService) StartContainer(ctx context.Context, containerID strin
 }
 
 func (s *ContainerService) StopContainer(ctx context.Context, containerID string, user usertypes.Actor) error {
-	return s.runContainerLifecycleActionInternal(ctx, containerID, user, containerLifecycleActionInternal{
+	return s.runContainerLifecycleAction(ctx, containerID, user, containerLifecycleAction{
 		action:    "stop",
 		eventType: event.EventTypeContainerStop,
 		runContainerAction: func(dockerClient *client.Client) error {
@@ -456,7 +355,7 @@ func (s *ContainerService) StopContainer(ctx context.Context, containerID string
 }
 
 func (s *ContainerService) RestartContainer(ctx context.Context, containerID string, user usertypes.Actor) error {
-	return s.runContainerLifecycleActionInternal(ctx, containerID, user, containerLifecycleActionInternal{
+	return s.runContainerLifecycleAction(ctx, containerID, user, containerLifecycleAction{
 		action:    "restart",
 		eventType: event.EventTypeContainerRestart,
 		runContainerAction: func(dockerClient *client.Client) error {
@@ -469,7 +368,7 @@ func (s *ContainerService) RestartContainer(ctx context.Context, containerID str
 // KillContainer sends a signal to the container's main process (default SIGKILL
 // when signal is empty) without removing the container.
 func (s *ContainerService) KillContainer(ctx context.Context, containerID, signal string, user usertypes.Actor) error {
-	return s.runContainerLifecycleActionInternal(ctx, containerID, user, containerLifecycleActionInternal{
+	return s.runContainerLifecycleAction(ctx, containerID, user, containerLifecycleAction{
 		action:         "kill",
 		eventType:      event.EventTypeContainerKill,
 		metadata:       database.JSON{"signal": signal},
@@ -483,7 +382,7 @@ func (s *ContainerService) KillContainer(ctx context.Context, containerID, signa
 
 // PauseContainer suspends all processes in the container.
 func (s *ContainerService) PauseContainer(ctx context.Context, containerID string, user usertypes.Actor) error {
-	return s.runContainerLifecycleActionInternal(ctx, containerID, user, containerLifecycleActionInternal{
+	return s.runContainerLifecycleAction(ctx, containerID, user, containerLifecycleAction{
 		action:         "pause",
 		eventType:      event.EventTypeContainerPause,
 		warnOnLogError: true,
@@ -496,7 +395,7 @@ func (s *ContainerService) PauseContainer(ctx context.Context, containerID strin
 
 // UnpauseContainer resumes a previously paused container.
 func (s *ContainerService) UnpauseContainer(ctx context.Context, containerID string, user usertypes.Actor) error {
-	return s.runContainerLifecycleActionInternal(ctx, containerID, user, containerLifecycleActionInternal{
+	return s.runContainerLifecycleAction(ctx, containerID, user, containerLifecycleAction{
 		action:         "unpause",
 		eventType:      event.EventTypeContainerUnpause,
 		warnOnLogError: true,
@@ -536,7 +435,7 @@ func (s *ContainerService) CommitContainer(ctx context.Context, containerID stri
 		return nil, fmt.Errorf("failed to commit container: %w", err)
 	}
 
-	metadata := database.JSON{
+	if logErr := s.eventService.LogImageEvent(ctx, event.EventTypeImageCommit, containerID, reference, user.ID, user.Username, "0", database.JSON{
 		"action":      "commit",
 		"containerId": containerID,
 		"imageId":     result.ID,
@@ -544,119 +443,11 @@ func (s *ContainerService) CommitContainer(ctx context.Context, containerID stri
 		"tag":         tag,
 		"reference":   reference,
 		"noPause":     req.NoPause,
-	}
-	if logErr := s.eventService.LogImageEvent(ctx, event.EventTypeImageCommit, containerID, reference, user.ID, user.Username, "0", metadata); logErr != nil {
+	}); logErr != nil {
 		slog.WarnContext(ctx, "could not log container commit action", "container", containerID, "image", result.ID, "error", logErr)
 	}
 
 	return &containertypes.CommitResult{ID: result.ID}, nil
-}
-
-// tryRedeployViaComposeProjectInternal attempts to redeploy a compose-managed
-// container by delegating to project.ProjectService.UpdateProjectServices, which loads
-// the compose project with full project_directory / env-file / include context
-// and runs pull/stop/up for just the target service.
-//
-// Return semantics:
-//   - handled=false: this container is not eligible for the compose path (no
-//     labels, project not registered in Arcane's DB, etc.). The caller should
-//     fall back to the standalone Docker-API redeploy.
-//   - handled=true, err==nil: compose path ran successfully; newContainerID is
-//     the ID of the recreated container (or the original ID if it couldn't be
-//     re-located by labels).
-//   - handled=true, err!=nil: compose path was attempted and failed. The
-//     caller MUST surface the error and MUST NOT fall back to the standalone
-//     path, which would clobber whatever partial state ComposeUp left behind.
-func (
-	s *ContainerService,
-) tryRedeployViaComposeProjectInternal(
-	ctx context.Context,
-	containerInfo container.InspectResponse,
-	containerID, containerName string,
-	user usertypes.Actor,
-) (
-	string,
-	bool,
-	error,
-) {
-	if s.projectService == nil || containerInfo.Config == nil {
-		return "", false, nil
-	}
-	containerLabels := containerInfo.Config.Labels
-	projectName := docker.ComposeProjectLabel(containerLabels)
-	serviceName := docker.ComposeServiceLabel(containerLabels)
-	if projectName == "" || serviceName == "" {
-		return "", false, nil
-	}
-
-	proj, err := s.projectService.GetProjectByComposeName(ctx, projectName)
-	if err != nil {
-		// Distinguish "not found" (safe to fall back to standalone) from real DB
-		// errors (should surface so a transient failure doesn't silently recreate
-		// the container from stale cached config).
-		if errors.Is(err, common.ErrNotFound) {
-			slog.WarnContext(
-				ctx, "RedeployContainer: compose project not registered, falling back to standalone redeploy",
-				"containerId", containerID,
-				"project", projectName,
-				"service", serviceName,
-			)
-			return "", false, nil
-		}
-		return "", true, fmt.Errorf("failed to look up compose project %s: %w", projectName, err)
-	}
-	if proj == nil {
-		slog.WarnContext(
-			ctx, "RedeployContainer: compose project not registered, falling back to standalone redeploy",
-			"containerId", containerID,
-			"project", projectName,
-			"service", serviceName,
-		)
-		return "", false, nil
-	}
-
-	slog.InfoContext(
-		ctx, "RedeployContainer: detected compose container, using project-based redeploy",
-		"containerId", containerID,
-		"project", projectName,
-		"service", serviceName,
-	)
-
-	if updateProjectServicesErr := s.projectService.UpdateProjectServices(ctx, proj.ID, []string{serviceName}, user, false); updateProjectServicesErr != nil {
-		s.eventService.LogErrorEvent(ctx, event.EventTypeContainerError, "container", containerID, containerName, user.ID, user.Username, "0", updateProjectServicesErr, database.JSON{
-			"action":      "redeploy",
-			"step":        "compose_update_services",
-			"project":     projectName,
-			"service":     serviceName,
-			"projectId":   proj.ID,
-			"projectName": proj.Name,
-		})
-		return "", true, fmt.Errorf("compose redeploy failed for %s/%s: %w", projectName, serviceName, updateProjectServicesErr)
-	}
-
-	newID, lookupErr := projects.FindComposeServiceContainerID(ctx, s.dockerService.DockerHost(), projectName, serviceName)
-	if lookupErr != nil {
-		slog.WarnContext(ctx, "failed to resolve container via compose ps after redeploy", "project", projectName, "service", serviceName, "err", lookupErr)
-	}
-	if newID == "" {
-		// Recreated successfully but couldn't locate the new container; return the
-		// original ID so the handler can degrade gracefully.
-		newID = containerID
-	}
-
-	if logErr := s.eventService.LogContainerEvent(ctx, event.EventTypeContainerDeploy, newID, containerName, user.ID, user.Username, "0", database.JSON{
-		"action":        "redeploy",
-		"containerId":   newID,
-		"containerName": containerName,
-		"project":       projectName,
-		"service":       serviceName,
-		"projectId":     proj.ID,
-		"via":           "compose",
-	}); logErr != nil {
-		slog.WarnContext(ctx, "failed to log compose redeploy event", "err", logErr)
-	}
-
-	return newID, true, nil
 }
 
 func (s *ContainerService) RedeployContainer(ctx context.Context, containerID string, user usertypes.Actor) (string, error) {
@@ -689,7 +480,6 @@ func (s *ContainerService) RedeployContainer(ctx context.Context, containerID st
 	}
 
 	containerName := strings.TrimPrefix(containerInfo.Name, "/")
-	imageName := containerInfo.Config.Image
 	apiVersion := compat.DetectDockerAPIVersion(ctx, dockerClient)
 
 	currentContainerID, currentContainerErr := cgroup.CurrentContainerID()
@@ -702,48 +492,87 @@ func (s *ContainerService) RedeployContainer(ctx context.Context, containerID st
 		return "", err
 	}
 
-	// If this container belongs to a known compose project, redeploy through the
-	// compose-aware path so that compose file changes (healthchecks, env, etc.) and
-	// the project's include/project_directory/env-file context are honored. The
-	// standalone Docker-API path below only clones the existing container config
-	// from the daemon and would silently ignore any compose edits.
-	if newID, handled, composeErr := s.tryRedeployViaComposeProjectInternal(ctx, containerInfo, containerID, containerName, user); handled {
-		if composeErr != nil {
-			return "", composeErr
+	// A container in a known compose project redeploys through project.ProjectService.UpdateProjectServices so compose
+	// edits and include/env-file context are honored; the standalone path below only clones the daemon's config.
+	if projectName, serviceName := docker.ComposeProjectLabel(containerInfo.Config.Labels), docker.ComposeServiceLabel(containerInfo.Config.Labels); projectName != "" && serviceName != "" {
+		proj, projectErr := s.projectService.GetProjectByComposeName(ctx, projectName)
+		// Real DB errors surface so a transient failure doesn't silently recreate from stale cached config.
+		if projectErr != nil && !errors.Is(projectErr, common.ErrNotFound) {
+			return "", fmt.Errorf("failed to look up compose project %s: %w", projectName, projectErr)
 		}
-		return newID, nil
+		if projectErr == nil {
+			slog.InfoContext(
+				ctx, "RedeployContainer: detected compose container, using project-based redeploy",
+				"containerId", containerID,
+				"project", projectName,
+				"service", serviceName,
+			)
+
+			if updateProjectServicesErr := s.projectService.UpdateProjectServices(ctx, proj.ID, []string{serviceName}, user, false); updateProjectServicesErr != nil {
+				s.eventService.LogErrorEvent(ctx, event.EventTypeContainerError, "container", containerID, containerName, user.ID, user.Username, "0", updateProjectServicesErr, database.JSON{
+					"action":      "redeploy",
+					"step":        "compose_update_services",
+					"project":     projectName,
+					"service":     serviceName,
+					"projectId":   proj.ID,
+					"projectName": proj.Name,
+				})
+				return "", fmt.Errorf("compose redeploy failed for %s/%s: %w", projectName, serviceName, updateProjectServicesErr)
+			}
+
+			newID, lookupErr := projects.FindComposeServiceContainerID(ctx, s.dockerService.DockerHost(), projectName, serviceName)
+			if lookupErr != nil {
+				slog.WarnContext(ctx, "failed to resolve container via compose ps after redeploy", "project", projectName, "service", serviceName, "err", lookupErr)
+			}
+
+			// An unlocated replacement falls back to the original ID so the handler can degrade gracefully.
+			if logErr := s.eventService.LogContainerEvent(ctx, event.EventTypeContainerDeploy, cmp.Or(newID, containerID), containerName, user.ID, user.Username, "0", database.JSON{
+				"action":        "redeploy",
+				"containerId":   cmp.Or(newID, containerID),
+				"containerName": containerName,
+				"project":       projectName,
+				"service":       serviceName,
+				"projectId":     proj.ID,
+				"via":           "compose",
+			}); logErr != nil {
+				slog.WarnContext(ctx, "failed to log compose redeploy event", "err", logErr)
+			}
+
+			return cmp.Or(newID, containerID), nil
+		}
+
+		slog.WarnContext(
+			ctx, "RedeployContainer: compose project not registered, falling back to standalone redeploy",
+			"containerId", containerID,
+			"project", projectName,
+			"service", serviceName,
+		)
 	}
 
-	if imageName != "" {
-		if pullRedeployImageErr := s.pullRedeployImageInternal(ctx, dockerClient, imageName, containerID, containerName, "redeploy", nil, user); pullRedeployImageErr != nil {
+	if containerInfo.Config.Image != "" {
+		if pullRedeployImageErr := s.pullRedeployImage(ctx, dockerClient, containerInfo.Config.Image, containerID, containerName, "redeploy", nil, user); pullRedeployImageErr != nil {
 			return "", pullRedeployImageErr
 		}
 	}
 
-	networkingConfig := buildCleanNetworkingConfigInternal(containerInfo, apiVersion)
-	newConfig := *containerInfo.Config
-
-	return s.recreateContainerInternal(
+	return s.recreateContainer(
 		ctx,
 		dockerClient,
 		containerInfo,
 		"redeploy",
 		containerName,
-		&newConfig,
+		new(*containerInfo.Config),
 		containerInfo.HostConfig,
-		networkingConfig,
+		buildCleanNetworkingConfig(containerInfo, apiVersion),
 		apiVersion,
 		event.EventTypeContainerDeploy,
 		user,
 	)
 }
 
-// recreateContainerInternal replaces an existing container with one created
-// from the supplied config, using rename-as-backup so the original can be
-// restored when create or start fails. Shared by redeploy and edit.
-func (
-	s *ContainerService,
-) recreateContainerInternal(
+// recreateContainer replaces an existing container with one created from the supplied config, using
+// rename-as-backup so the original can be restored when create or start fails. Shared by redeploy and edit.
+func (s *ContainerService) recreateContainer(
 	ctx context.Context,
 	dockerClient *client.Client,
 	containerInfo container.InspectResponse,
@@ -758,26 +587,68 @@ func (
 	string,
 	error,
 ) {
-	containerID := containerInfo.ID
 	containerName := strings.TrimPrefix(containerInfo.Name, "/")
-	wasRunning := containerInfo.State != nil && containerInfo.State.Running
-	imageName := newConfig.Image
+	wasRunning := kit.FromPtr(containerInfo.State).Running
 
-	// A running auto-remove container is deleted by the daemon the moment it
-	// stops, which would make rollback impossible. For that case the stop is
-	// deferred until the replacement has been created: the rename alone frees
-	// the name, and a create failure rolls back to the untouched, still-running
-	// original. Only a start failure can still lose the original.
-	stopAfterCreate := wasRunning && containerInfo.HostConfig != nil && containerInfo.HostConfig.AutoRemove
+	// A running auto-remove container is deleted by the daemon the moment it stops, so its stop is
+	// deferred until the replacement exists; only a start failure can still lose the original.
+	stopAfterCreate := wasRunning && kit.FromPtr(containerInfo.HostConfig).AutoRemove
 
-	defer s.eventService.BeginDockerResourceSuppressionWindow("container", containerID, containerName)()
-	backupName := buildRedeployBackupNameInternal(containerName, containerID)
-	if err := s.prepareContainerForRedeployInternal(ctx, dockerClient, containerID, containerName, backupName, wasRunning && !stopAfterCreate, user); err != nil {
+	defer s.eventService.BeginDockerResourceSuppressionWindow("container", containerInfo.ID, containerName)()
+	backupName := fmt.Sprintf("%s-arcane-redeploy-%d", cmp.Or(containerName, func() string {
+		if len(containerInfo.ID) < 12 {
+			return "arcane-redeploy"
+		}
+		return "arcane-redeploy-" + containerInfo.ID[:12]
+	}()), time.Now().Unix())
+
+	// Stopping the original made the daemon delete it, so rebuild it from the inspected config.
+	// A returned error means the workload is down and is joined into the start error.
+	restoreAutoRemoveOriginal := func() error {
+		originalConfig := *containerInfo.Config
+		if len(containerInfo.ID) >= 12 && originalConfig.Hostname == containerInfo.ID[:12] {
+			originalConfig.Hostname = "" // keep: copying Docker's 24-field container.Config to clear one field is unreadable
+		}
+
+		defer s.eventService.BeginDockerResourceSuppressionWindow("container", "", containerName)()
+		restoreResp, restoreCreateErr := compat.ContainerCreateWithCompatibilityForAPIVersion(ctx, dockerClient, client.ContainerCreateOptions{
+			Config:           &originalConfig,
+			HostConfig:       containerInfo.HostConfig,
+			NetworkingConfig: buildCleanNetworkingConfig(containerInfo, apiVersion),
+			Name:             containerName,
+		}, apiVersion)
+		if restoreCreateErr != nil {
+			s.eventService.LogErrorEvent(ctx, event.EventTypeContainerError, "container", containerInfo.ID, containerName, user.ID, user.Username, "0", restoreCreateErr, database.JSON{
+				"action": "redeploy",
+				"step":   "restore_create_original",
+			})
+			return fmt.Errorf("failed to recreate original auto-remove container: %w", restoreCreateErr)
+		}
+
+		defer s.eventService.BeginDockerResourceSuppressionWindow("container", restoreResp.ID, containerName)()
+		if _, restoreStartErr := dockerClient.ContainerStart(ctx, restoreResp.ID, client.ContainerStartOptions{}); restoreStartErr != nil {
+			s.eventService.LogErrorEvent(ctx, event.EventTypeContainerError, "container", restoreResp.ID, containerName, user.ID, user.Username, "0", restoreStartErr, database.JSON{
+				"action": "redeploy",
+				"step":   "restore_start_original",
+			})
+			return fmt.Errorf("failed to restart original auto-remove container: %w", restoreStartErr)
+		}
+
+		slog.InfoContext(
+			ctx, "restored auto-remove container after failed recreate",
+			"oldContainerId", containerInfo.ID,
+			"restoredContainerId", restoreResp.ID,
+			"containerName", containerName,
+		)
+		return nil
+	}
+
+	if err := s.prepareContainerForRedeploy(ctx, dockerClient, containerInfo.ID, containerName, backupName, wasRunning && !stopAfterCreate, user); err != nil {
 		return "", err
 	}
 
-	if len(containerID) >= 12 && newConfig.Hostname == containerID[:12] {
-		newConfig.Hostname = ""
+	if len(containerInfo.ID) >= 12 && newConfig.Hostname == containerInfo.ID[:12] {
+		newConfig.Hostname = "" // keep: copying Docker's 24-field container.Config to clear one field is unreadable
 	}
 
 	defer s.eventService.BeginDockerResourceSuppressionWindow("container", "", newName)()
@@ -788,11 +659,11 @@ func (
 		Name:             newName,
 	}, apiVersion)
 	if err != nil {
-		s.restoreContainerAfterRedeployFailureInternal(ctx, dockerClient, containerID, containerName, backupName, "create", wasRunning && !stopAfterCreate, user)
-		s.eventService.LogErrorEvent(ctx, event.EventTypeContainerError, "container", containerID, containerName, user.ID, user.Username, "0", err, database.JSON{
+		s.restoreContainerAfterRedeployFailure(ctx, dockerClient, containerInfo.ID, containerName, backupName, "create", wasRunning && !stopAfterCreate, user)
+		s.eventService.LogErrorEvent(ctx, event.EventTypeContainerError, "container", containerInfo.ID, containerName, user.ID, user.Username, "0", err, database.JSON{
 			"action": action,
 			"step":   "create",
-			"image":  imageName,
+			"image":  newConfig.Image,
 		})
 		return "", fmt.Errorf("failed to recreate container: %w", err)
 	}
@@ -800,15 +671,15 @@ func (
 	defer s.eventService.BeginDockerResourceSuppressionWindow("container", createResp.ID, newName)()
 
 	if stopAfterCreate {
-		if _, containerStopErr := dockerClient.ContainerStop(ctx, containerID, client.ContainerStopOptions{Timeout: new(30)}); containerStopErr != nil {
+		if _, containerStopErr := dockerClient.ContainerStop(ctx, containerInfo.ID, client.ContainerStopOptions{Timeout: new(30)}); containerStopErr != nil {
 			if _, removeErr := dockerClient.ContainerRemove(ctx, createResp.ID, client.ContainerRemoveOptions{Force: true}); removeErr != nil {
 				s.eventService.LogErrorEvent(ctx, event.EventTypeContainerError, "container", createResp.ID, containerName, user.ID, user.Username, "0", removeErr, database.JSON{
 					"action": action,
 					"step":   "cleanup_failed_stop",
 				})
 			}
-			s.restoreContainerAfterRedeployFailureInternal(ctx, dockerClient, containerID, containerName, backupName, "stop", false, user)
-			s.eventService.LogErrorEvent(ctx, event.EventTypeContainerError, "container", containerID, containerName, user.ID, user.Username, "0", containerStopErr, database.JSON{
+			s.restoreContainerAfterRedeployFailure(ctx, dockerClient, containerInfo.ID, containerName, backupName, "stop", false, user)
+			s.eventService.LogErrorEvent(ctx, event.EventTypeContainerError, "container", containerInfo.ID, containerName, user.ID, user.Username, "0", containerStopErr, database.JSON{
 				"action": action,
 				"step":   "stop",
 			})
@@ -816,14 +687,30 @@ func (
 		}
 	}
 
-	if shouldStartRedeployedContainerInternal(containerInfo, wasRunning) {
-		_, err = dockerClient.ContainerStart(ctx, createResp.ID, client.ContainerStartOptions{})
-		if err != nil {
-			err = s.rollbackFailedReplacementStartInternal(ctx, dockerClient, containerInfo, createResp.ID, action, backupName, stopAfterCreate, wasRunning, apiVersion, err, user)
+	restartPolicies := []container.RestartPolicyMode{container.RestartPolicyAlways, container.RestartPolicyUnlessStopped, container.RestartPolicyOnFailure}
+	if wasRunning || slices.Contains(restartPolicies, kit.FromPtr(containerInfo.HostConfig).RestartPolicy.Name) {
+		if _, err = dockerClient.ContainerStart(ctx, createResp.ID, client.ContainerStartOptions{}); err != nil {
+			// Remove the replacement and roll back to the original. A deferred-stop auto-remove original
+			// is rebuilt from its inspected config; a failed restore joins the start error.
+			s.eventService.MarkDockerExpectation("container", createResp.ID, containerName)
+			_, removeErr := dockerClient.ContainerRemove(ctx, createResp.ID, client.ContainerRemoveOptions{Force: true})
+			if removeErr != nil {
+				s.eventService.LogErrorEvent(ctx, event.EventTypeContainerError, "container", createResp.ID, containerName, user.ID, user.Username, "0", removeErr, database.JSON{
+					"action": action,
+					"step":   "cleanup_failed_start",
+				})
+			}
+			if stopAfterCreate {
+				if restoreErr := restoreAutoRemoveOriginal(); restoreErr != nil {
+					err = errors.Join(err, kit.Ternary(removeErr != nil, fmt.Errorf("failed to remove replacement container: %w", removeErr), nil), restoreErr)
+				}
+			} else {
+				s.restoreContainerAfterRedeployFailure(ctx, dockerClient, containerInfo.ID, containerName, backupName, "start", wasRunning, user)
+			}
 			s.eventService.LogErrorEvent(ctx, event.EventTypeContainerError, "container", createResp.ID, containerName, user.ID, user.Username, "0", err, database.JSON{
 				"action": action,
 				"step":   "start",
-				"image":  imageName,
+				"image":  newConfig.Image,
 			})
 			return "", fmt.Errorf("failed to start new container: %w", err)
 		}
@@ -832,42 +719,41 @@ func (
 	slog.InfoContext(
 		ctx, "container recreated successfully",
 		"action", action,
-		"oldContainerId", containerID,
+		"oldContainerId", containerInfo.ID,
 		"newContainerId", createResp.ID,
 		"containerName", newName,
-		"image", imageName,
+		"image", newConfig.Image,
 	)
 
 	// After a deferred stop the daemon has already auto-removed the original.
 	if !stopAfterCreate {
-		if _, containerRemoveErr := dockerClient.ContainerRemove(ctx, containerID, client.ContainerRemoveOptions{
+		if _, containerRemoveErr := dockerClient.ContainerRemove(ctx, containerInfo.ID, client.ContainerRemoveOptions{
 			Force:         true,
 			RemoveVolumes: false,
 			RemoveLinks:   false,
 		}); containerRemoveErr != nil {
 			slog.WarnContext(
 				ctx, "failed to remove old container after successful recreate",
-				"containerId", containerID,
+				"containerId", containerInfo.ID,
 				"backupName", backupName,
 				"error", containerRemoveErr,
 			)
 		}
 	}
 
-	metadata := database.JSON{
+	if logErr := s.eventService.LogContainerEvent(ctx, eventType, createResp.ID, newName, user.ID, user.Username, "0", database.JSON{
 		"action":        action,
-		"containerId":   containerID,
+		"containerId":   containerInfo.ID,
 		"containerName": newName,
-		"image":         imageName,
-	}
-	if logErr := s.eventService.LogContainerEvent(ctx, eventType, createResp.ID, newName, user.ID, user.Username, "0", metadata); logErr != nil {
+		"image":         newConfig.Image,
+	}); logErr != nil {
 		slog.WarnContext(ctx, "failed to log recreate event", "err", logErr)
 	}
 
 	return createResp.ID, nil
 }
 
-func healthConfigFromCreateInternal(hc *containertypes.HealthcheckCreate) *container.HealthConfig {
+func healthConfigFromCreate(hc *containertypes.HealthcheckCreate) *container.HealthConfig {
 	if hc == nil {
 		return nil
 	}
@@ -882,247 +768,187 @@ func healthConfigFromCreateInternal(hc *containertypes.HealthcheckCreate) *conta
 	}
 }
 
-// mergeEditMountsInternal builds the desired mount set for an edit. The edit
-// form only carries the reduced {type, source, target, readOnly} view, so a
-// requested mount that matches an existing one by type and target keeps the
-// full original spec (bind/volume/tmpfs options, consistency, ...) with the
-// source and read-only flag applied from the request; unmatched entries are
-// new mounts built from the request.
-func mergeEditMountsInternal(existing []mount.Mount, requested []containertypes.MountCreate) []mount.Mount {
+// mergeEditMounts builds the desired mount set for an edit. A requested mount matching an existing one by type
+// and target keeps its full original spec with the request's source and read-only flag; others are built fresh.
+func mergeEditMounts(existing []mount.Mount, requested []containertypes.MountCreate) []mount.Mount {
+	priorByKey := make(map[string]mount.Mount, len(existing))
+	for _, prior := range existing {
+		if _, seen := priorByKey[string(prior.Type)+"\x00"+prior.Target]; !seen {
+			priorByKey[string(prior.Type)+"\x00"+prior.Target] = prior
+		}
+	}
+
 	out := make([]mount.Mount, 0, len(requested))
 	for _, req := range requested {
-		merged := mount.Mount{
-			Type:     mount.Type(req.Type),
-			Source:   req.Source,
-			Target:   req.Target,
-			ReadOnly: req.ReadOnly,
-		}
-		for _, prior := range existing {
-			if string(prior.Type) == req.Type && prior.Target == req.Target {
-				merged = prior
-				merged.Source = req.Source
-				merged.ReadOnly = req.ReadOnly
-				break
-			}
-		}
-		out = append(out, merged)
-	}
-	return out
-}
-
-func mountsFromCreateInternal(mounts []containertypes.MountCreate) []mount.Mount {
-	out := make([]mount.Mount, 0, len(mounts))
-	for _, m := range mounts {
-		out = append(out, mount.Mount{
-			Type:     mount.Type(m.Type),
-			Source:   m.Source,
-			Target:   m.Target,
-			ReadOnly: m.ReadOnly,
+		prior := priorByKey[req.Type+"\x00"+req.Target]
+		out = append(out, mount.Mount{ //exhaustruct:enforce
+			Type:           mount.Type(req.Type),
+			Source:         req.Source,
+			Target:         req.Target,
+			ReadOnly:       req.ReadOnly,
+			Consistency:    prior.Consistency,
+			BindOptions:    prior.BindOptions,
+			VolumeOptions:  prior.VolumeOptions,
+			ImageOptions:   prior.ImageOptions,
+			TmpfsOptions:   prior.TmpfsOptions,
+			ClusterOptions: prior.ClusterOptions,
 		})
 	}
 	return out
 }
 
-func portMapFromCreateInternal(bindings map[string][]containertypes.PortBindingCreate) (network.PortMap, error) {
+func portMapFromCreate(bindings map[string][]containertypes.PortBindingCreate) (network.PortMap, error) {
 	out := network.PortMap{}
 	for portSpec, bindingList := range bindings {
-		port, err := parsePortSpec(portSpec)
+		port, err := network.ParsePort(kit.Ternary(strings.Contains(portSpec, "/"), portSpec, portSpec+"/tcp"))
 		if err != nil {
 			return nil, fmt.Errorf("invalid port %s: %w", portSpec, err)
 		}
 		mapped := make([]network.PortBinding, 0, len(bindingList))
 		for _, binding := range bindingList {
-			pb := network.PortBinding{HostPort: binding.HostPort}
-			if hostIP := strings.TrimSpace(binding.HostIP); hostIP != "" {
-				parsedIP, parseAddrErr := netip.ParseAddr(hostIP)
-				if parseAddrErr != nil {
-					return nil, fmt.Errorf("invalid host IP %s: %w", hostIP, parseAddrErr)
-				}
-				pb.HostIP = parsedIP
+			hostIP, parseAddrErr := netip.ParseAddr(strings.TrimSpace(binding.HostIP))
+			if parseAddrErr != nil && strings.TrimSpace(binding.HostIP) != "" {
+				return nil, fmt.Errorf("invalid host IP %s: %w", strings.TrimSpace(binding.HostIP), parseAddrErr)
 			}
-			mapped = append(mapped, pb)
+			mapped = append(mapped, network.PortBinding{HostIP: hostIP, HostPort: binding.HostPort})
 		}
 		out[port] = mapped
 	}
 	return out, nil
 }
 
-func endpointIPAMFromCreateInternal(ep containertypes.EndpointSettingsCreate) (*network.EndpointIPAMConfig, error) {
-	ipv4 := strings.TrimSpace(ep.IPv4Address)
-	ipv6 := strings.TrimSpace(ep.IPv6Address)
-	if ipv4 == "" && ipv6 == "" {
+func endpointIPAMFromCreate(ep containertypes.EndpointSettingsCreate) (*network.EndpointIPAMConfig, error) {
+	if strings.TrimSpace(ep.IPv4Address) == "" && strings.TrimSpace(ep.IPv6Address) == "" {
 		return nil, nil
 	}
 
-	cfg := &network.EndpointIPAMConfig{}
-	if ipv4 != "" {
-		addr, err := netip.ParseAddr(ipv4)
-		if err != nil {
-			return nil, fmt.Errorf("invalid IPv4 address %s: %w", ipv4, err)
-		}
-		cfg.IPv4Address = addr
+	ipv4, ipv4Err := netip.ParseAddr(strings.TrimSpace(ep.IPv4Address))
+	if ipv4Err != nil && strings.TrimSpace(ep.IPv4Address) != "" {
+		return nil, fmt.Errorf("invalid IPv4 address %s: %w", strings.TrimSpace(ep.IPv4Address), ipv4Err)
 	}
-	if ipv6 != "" {
-		addr, err := netip.ParseAddr(ipv6)
-		if err != nil {
-			return nil, fmt.Errorf("invalid IPv6 address %s: %w", ipv6, err)
-		}
-		cfg.IPv6Address = addr
+	ipv6, ipv6Err := netip.ParseAddr(strings.TrimSpace(ep.IPv6Address))
+	if ipv6Err != nil && strings.TrimSpace(ep.IPv6Address) != "" {
+		return nil, fmt.Errorf("invalid IPv6 address %s: %w", strings.TrimSpace(ep.IPv6Address), ipv6Err)
 	}
-	return cfg, nil
+	return &network.EndpointIPAMConfig{IPv4Address: ipv4, IPv6Address: ipv6}, nil
 }
 
-// applyEditToContainerConfigInternal overwrites the non-nil form-owned Config
-// sections of an edit request onto cfg. Settings the form does not own are
-// left untouched. When port bindings are replaced, ExposedPorts is recomputed
-// as the new binding keys plus any previously-exposed-but-unbound ports (image
-// EXPOSE entries survive).
-func applyEditToContainerConfigInternal(cfg *container.Config, previousBindings network.PortMap, req containertypes.Edit) error {
-	if req.Image != nil && strings.TrimSpace(*req.Image) != "" {
-		cfg.Image = strings.TrimSpace(*req.Image)
+// applyEditToContainerConfig returns cfg with the non-nil form-owned sections of an edit applied. Replaced port
+// bindings recompute ExposedPorts as the new keys plus previously exposed but unbound ports (image EXPOSE entries).
+func applyEditToContainerConfig(cfg container.Config, previousBindings network.PortMap, req containertypes.Edit) (container.Config, error) {
+	newBindings, err := portMapFromCreate(kit.FromPtr(kit.FromPtr(req.HostConfig).PortBindings))
+	if err != nil {
+		return container.Config{}, err
 	}
-	if req.WorkingDir != nil {
-		cfg.WorkingDir = *req.WorkingDir
+	exposed := network.PortSet{}
+	for port := range newBindings {
+		exposed[port] = struct{}{}
 	}
-	if req.User != nil {
-		cfg.User = *req.User
-	}
-	if req.Command != nil {
-		cfg.Cmd = append([]string{}, *req.Command...)
-	}
-	if req.Entrypoint != nil {
-		cfg.Entrypoint = append([]string{}, *req.Entrypoint...)
-	}
-	if req.Environment != nil {
-		cfg.Env = append([]string{}, *req.Environment...)
-	}
-	if req.Labels != nil {
-		cfg.Labels = maps.Clone(*req.Labels)
-	}
-
-	switch {
-	case req.ClearHealthcheck:
-		cfg.Healthcheck = nil
-	case req.Healthcheck != nil:
-		cfg.Healthcheck = healthConfigFromCreateInternal(req.Healthcheck)
-	}
-
-	if req.HostConfig != nil && req.HostConfig.PortBindings != nil {
-		newBindings, err := portMapFromCreateInternal(*req.HostConfig.PortBindings)
-		if err != nil {
-			return err
-		}
-		exposed := network.PortSet{}
-		for port := range newBindings {
+	for port := range cfg.ExposedPorts {
+		if _, wasBound := previousBindings[port]; !wasBound {
 			exposed[port] = struct{}{}
 		}
-		for port := range cfg.ExposedPorts {
-			if _, wasBound := previousBindings[port]; !wasBound {
-				exposed[port] = struct{}{}
-			}
-		}
-		cfg.ExposedPorts = exposed
 	}
 
-	return nil
+	return container.Config{ //exhaustruct:enforce
+		Hostname:        cfg.Hostname,
+		Domainname:      cfg.Domainname,
+		User:            mo.PointerToOption(req.User).OrElse(cfg.User),
+		AttachStdin:     cfg.AttachStdin,
+		AttachStdout:    cfg.AttachStdout,
+		AttachStderr:    cfg.AttachStderr,
+		ExposedPorts:    kit.Ternary(kit.FromPtr(req.HostConfig).PortBindings != nil, exposed, cfg.ExposedPorts),
+		Tty:             cfg.Tty,
+		OpenStdin:       cfg.OpenStdin,
+		StdinOnce:       cfg.StdinOnce,
+		Env:             kit.Ternary(req.Environment != nil, append([]string{}, kit.FromPtr(req.Environment)...), cfg.Env),
+		Cmd:             kit.Ternary(req.Command != nil, append([]string{}, kit.FromPtr(req.Command)...), cfg.Cmd),
+		Healthcheck:     kit.Ternary(req.ClearHealthcheck, nil, cmp.Or(healthConfigFromCreate(req.Healthcheck), cfg.Healthcheck)),
+		ArgsEscaped:     cfg.ArgsEscaped,
+		Image:           cmp.Or(strings.TrimSpace(kit.FromPtr(req.Image)), cfg.Image),
+		Volumes:         cfg.Volumes,
+		WorkingDir:      mo.PointerToOption(req.WorkingDir).OrElse(cfg.WorkingDir),
+		Entrypoint:      kit.Ternary(req.Entrypoint != nil, append([]string{}, kit.FromPtr(req.Entrypoint)...), cfg.Entrypoint),
+		NetworkDisabled: cfg.NetworkDisabled,
+		OnBuild:         cfg.OnBuild,
+		Labels:          kit.Ternary(req.Labels != nil, maps.Clone(kit.FromPtr(req.Labels)), cfg.Labels),
+		StopSignal:      cfg.StopSignal,
+		StopTimeout:     cfg.StopTimeout,
+		Shell:           cfg.Shell,
+	}, nil
 }
 
-// applyEditToHostConfigInternal overwrites the non-nil form-owned HostConfig
-// sections of an edit request onto hc. Everything else (sysctls, ulimits, log
-// drivers, devices, tmpfs, DNS, ...) carries over unchanged.
-func applyEditToHostConfigInternal(hc *container.HostConfig, req containertypes.Edit) error {
-	edit := req.HostConfig
-	if edit == nil {
+// applyEditToHostConfig overwrites the non-nil form-owned HostConfig sections of an edit request onto hc.
+// Everything else (sysctls, ulimits, log drivers, devices, tmpfs, DNS, ...) carries over unchanged.
+func applyEditToHostConfig(hc *container.HostConfig, req containertypes.Edit) error {
+	if req.HostConfig == nil {
 		return nil
 	}
 
-	if edit.Binds != nil {
-		hc.Binds = append([]string{}, *edit.Binds...)
+	newBindings, err := portMapFromCreate(kit.FromPtr(req.HostConfig.PortBindings))
+	if err != nil {
+		return err
 	}
-	if edit.Mounts != nil {
-		hc.Mounts = mergeEditMountsInternal(hc.Mounts, *edit.Mounts)
-	}
-	if edit.PortBindings != nil {
-		newBindings, err := portMapFromCreateInternal(*edit.PortBindings)
-		if err != nil {
-			return err
-		}
-		hc.PortBindings = newBindings
-	}
-	if edit.RestartPolicy != nil {
-		hc.RestartPolicy = container.RestartPolicy{
-			Name:              container.RestartPolicyMode(edit.RestartPolicy.Name),
-			MaximumRetryCount: edit.RestartPolicy.MaximumRetryCount,
+
+	if req.HostConfig.RestartPolicy != nil {
+		hc.RestartPolicy = container.RestartPolicy{ // keep: Docker's ~70-field container.HostConfig is unreadable as a literal
+			Name:              container.RestartPolicyMode(req.HostConfig.RestartPolicy.Name),
+			MaximumRetryCount: req.HostConfig.RestartPolicy.MaximumRetryCount,
 		}
 	}
-	if edit.Privileged != nil {
-		hc.Privileged = *edit.Privileged
-	}
-	if edit.CapAdd != nil {
-		hc.CapAdd = append([]string{}, *edit.CapAdd...)
-	}
-	if edit.CapDrop != nil {
-		hc.CapDrop = append([]string{}, *edit.CapDrop...)
-	}
-	if edit.AutoRemove != nil {
-		hc.AutoRemove = *edit.AutoRemove
-	}
-	if edit.ReadonlyRootfs != nil {
-		hc.ReadonlyRootfs = *edit.ReadonlyRootfs
-	}
-	if edit.Memory != nil {
-		hc.Memory = *edit.Memory
-	}
-	if edit.MemorySwap != nil {
-		hc.MemorySwap = *edit.MemorySwap
-	}
-	if edit.NanoCPUs != nil {
-		hc.NanoCPUs = *edit.NanoCPUs
-	}
-	if edit.CPUShares != nil {
-		hc.CPUShares = *edit.CPUShares
-	}
+	hc.Binds = kit.Ternary(req.HostConfig.Binds != nil, append([]string{}, kit.FromPtr(req.HostConfig.Binds)...), hc.Binds)          // keep: ~70-field HostConfig
+	hc.Mounts = kit.Ternary(req.HostConfig.Mounts != nil, mergeEditMounts(hc.Mounts, kit.FromPtr(req.HostConfig.Mounts)), hc.Mounts) // keep: ~70-field HostConfig
+	hc.PortBindings = kit.Ternary(req.HostConfig.PortBindings != nil, newBindings, hc.PortBindings)                                  // keep: ~70-field HostConfig
+	hc.Privileged = mo.PointerToOption(req.HostConfig.Privileged).OrElse(hc.Privileged)                                              // keep: ~70-field HostConfig
+	hc.CapAdd = kit.Ternary(req.HostConfig.CapAdd != nil, append([]string{}, kit.FromPtr(req.HostConfig.CapAdd)...), hc.CapAdd)      // keep: ~70-field HostConfig
+	hc.CapDrop = kit.Ternary(req.HostConfig.CapDrop != nil, append([]string{}, kit.FromPtr(req.HostConfig.CapDrop)...), hc.CapDrop)  // keep: ~70-field HostConfig
+	hc.AutoRemove = mo.PointerToOption(req.HostConfig.AutoRemove).OrElse(hc.AutoRemove)                                              // keep: ~70-field HostConfig
+	hc.ReadonlyRootfs = mo.PointerToOption(req.HostConfig.ReadonlyRootfs).OrElse(hc.ReadonlyRootfs)                                  // keep: ~70-field HostConfig
+	hc.Memory = mo.PointerToOption(req.HostConfig.Memory).OrElse(hc.Memory)                                                          // keep: ~70-field HostConfig
+	hc.MemorySwap = mo.PointerToOption(req.HostConfig.MemorySwap).OrElse(hc.MemorySwap)                                              // keep: ~70-field HostConfig
+	hc.NanoCPUs = mo.PointerToOption(req.HostConfig.NanoCPUs).OrElse(hc.NanoCPUs)                                                    // keep: ~70-field HostConfig
+	hc.CPUShares = mo.PointerToOption(req.HostConfig.CPUShares).OrElse(hc.CPUShares)                                                 // keep: ~70-field HostConfig
 
 	return nil
 }
 
-// buildEditNetworkingConfigInternal builds the networking config for an edit
-// recreate. A nil request preserves the existing attachments (same behavior as
-// redeploy); otherwise the request is the full desired endpoint set, keeping
-// the sanitized settings of endpoints that stay attached. Containers using
-// host/none/container: network modes never get endpoint edits.
-func buildEditNetworkingConfigInternal(containerInspect container.InspectResponse, req *containertypes.NetworkingConfigCreate, apiVersion string) (*network.NetworkingConfig, error) {
-	if containerInspect.HostConfig != nil {
-		mode := containerInspect.HostConfig.NetworkMode
-		if mode.IsHost() || mode.IsNone() || mode.IsContainer() {
-			return nil, nil
-		}
+// buildEditNetworkingConfig builds the networking config for an edit recreate. A nil request preserves the existing
+// attachments like redeploy; otherwise it is the full desired endpoint set, keeping settings of endpoints that stay.
+// Containers using host/none/container: network modes never get endpoint edits.
+func buildEditNetworkingConfig(containerInspect container.InspectResponse, req *containertypes.NetworkingConfigCreate, apiVersion string) (*network.NetworkingConfig, error) {
+	if mode := kit.FromPtr(containerInspect.HostConfig).NetworkMode; mode.IsHost() || mode.IsNone() || mode.IsContainer() {
+		return nil, nil
 	}
 
 	if req == nil {
-		return buildCleanNetworkingConfigInternal(containerInspect, apiVersion), nil
+		return buildCleanNetworkingConfig(containerInspect, apiVersion), nil
 	}
 
-	var existing map[string]*network.EndpointSettings
-	if containerInspect.NetworkSettings != nil {
-		existing = compat.SanitizeContainerCreateEndpointSettingsForDockerAPI(containerInspect.NetworkSettings.Networks, apiVersion)
-	}
-
+	existing := kit.FromPtr(buildCleanNetworkingConfig(containerInspect, apiVersion)).EndpointsConfig
 	endpoints := make(map[string]*network.EndpointSettings, len(req.EndpointsConfig))
 	for name, epReq := range req.EndpointsConfig {
-		endpoint := &network.EndpointSettings{}
-		if prior := existing[name]; prior != nil {
-			priorCopy := *prior
-			priorCopy.IPAMConfig = nil
-			endpoint = &priorCopy
-		}
-		endpoint.Aliases = append([]string{}, epReq.Aliases...)
-		ipam, err := endpointIPAMFromCreateInternal(epReq)
+		ipam, err := endpointIPAMFromCreate(epReq)
 		if err != nil {
 			return nil, err
 		}
-		endpoint.IPAMConfig = ipam
-		endpoints[name] = endpoint
+		prior := kit.FromPtr(existing[name])
+		endpoints[name] = &network.EndpointSettings{ //exhaustruct:enforce
+			IPAMConfig:          ipam,
+			Links:               prior.Links,
+			Aliases:             append([]string{}, epReq.Aliases...),
+			DriverOpts:          prior.DriverOpts,
+			GwPriority:          prior.GwPriority,
+			NetworkID:           prior.NetworkID,
+			EndpointID:          prior.EndpointID,
+			Gateway:             prior.Gateway,
+			IPAddress:           prior.IPAddress,
+			MacAddress:          prior.MacAddress,
+			IPPrefixLen:         prior.IPPrefixLen,
+			IPv6Gateway:         prior.IPv6Gateway,
+			GlobalIPv6Address:   prior.GlobalIPv6Address,
+			GlobalIPv6PrefixLen: prior.GlobalIPv6PrefixLen,
+			DNSNames:            prior.DNSNames,
+		}
 	}
 
 	if len(endpoints) == 0 {
@@ -1144,17 +970,12 @@ func (s *ContainerService) GetContainerEditConfig(ctx context.Context, container
 		return containertypes.EditConfig{}, fmt.Errorf("failed to inspect container: %w", err)
 	}
 
-	containerInfo := containerJSON.Container
-	var containerLabels map[string]string
-	if containerInfo.Config != nil {
-		containerLabels = containerInfo.Config.Labels
-	}
-
-	isCompose := docker.ComposeProjectLabel(containerLabels) != ""
 	currentContainerID, currentContainerErr := cgroup.CurrentContainerID()
-	editDisabled := labels.ShouldDisableArcaneServerRedeploy(containerLabels, containerInfo.ID, currentContainerID, currentContainerErr)
-
-	return containertypes.NewEditConfigFromInspect(&containerInfo, isCompose, editDisabled), nil
+	return containertypes.NewEditConfigFromInspect(
+		&containerJSON.Container,
+		docker.ComposeProjectLabel(kit.FromPtr(containerJSON.Container.Config).Labels) != "",
+		labels.ShouldDisableArcaneServerRedeploy(kit.FromPtr(containerJSON.Container.Config).Labels, containerJSON.Container.ID, currentContainerID, currentContainerErr),
+	), nil
 }
 
 // EditContainer applies a user-supplied config diff onto the container's
@@ -1200,12 +1021,7 @@ func (s *ContainerService) EditContainer(ctx context.Context, containerID string
 		return "", err
 	}
 
-	newName := containerName
-	if req.Name != nil {
-		if trimmed := strings.TrimPrefix(strings.TrimSpace(*req.Name), "/"); trimmed != "" {
-			newName = trimmed
-		}
-	}
+	newName := cmp.Or(strings.TrimPrefix(strings.TrimSpace(kit.FromPtr(req.Name)), "/"), containerName)
 	if newName != containerName {
 		if _, inspectErr := compat.ContainerInspectWithCompatibility(ctx, dockerClient, newName, client.ContainerInspectOptions{}); inspectErr == nil {
 			return "", fmt.Errorf("container name %s: %w", newName, common.ErrContainerNameTaken)
@@ -1214,35 +1030,30 @@ func (s *ContainerService) EditContainer(ctx context.Context, containerID string
 
 	apiVersion := compat.DetectDockerAPIVersion(ctx, dockerClient)
 
-	newConfig := *containerInfo.Config
-	var newHostConfig container.HostConfig
-	if containerInfo.HostConfig != nil {
-		newHostConfig = *containerInfo.HostConfig
+	newHostConfig := kit.FromPtr(containerInfo.HostConfig)
+	newConfig, err := applyEditToContainerConfig(*containerInfo.Config, newHostConfig.PortBindings, req)
+	if err != nil {
+		return "", common.Classify(common.ErrValidation, err)
 	}
-
-	if applyEditToContainerConfigErr := applyEditToContainerConfigInternal(&newConfig, newHostConfig.PortBindings, req); applyEditToContainerConfigErr != nil {
-		return "", common.Classify(common.ErrValidation, applyEditToContainerConfigErr)
-	}
-	if applyEditToHostConfigErr := applyEditToHostConfigInternal(&newHostConfig, req); applyEditToHostConfigErr != nil {
+	if applyEditToHostConfigErr := applyEditToHostConfig(&newHostConfig, req); applyEditToHostConfigErr != nil {
 		return "", common.Classify(common.ErrValidation, applyEditToHostConfigErr)
 	}
-	networkingConfig, err := buildEditNetworkingConfigInternal(containerInfo, req.NetworkingConfig, apiVersion)
+	networkingConfig, err := buildEditNetworkingConfig(containerInfo, req.NetworkingConfig, apiVersion)
 	if err != nil {
 		return "", common.Classify(common.ErrValidation, err)
 	}
 
 	// Unlike redeploy, edit only pulls when the effective image is missing
 	// locally so an unrelated config change never surprise-upgrades the image.
-	imageName := newConfig.Image
-	if imageName != "" {
-		if _, inspectErr := dockerClient.ImageInspect(ctx, imageName); inspectErr != nil {
-			if pullRedeployImageErr := s.pullRedeployImageInternal(ctx, dockerClient, imageName, containerID, containerName, "edit", req.Credentials, user); pullRedeployImageErr != nil {
+	if newConfig.Image != "" {
+		if _, inspectErr := dockerClient.ImageInspect(ctx, newConfig.Image); inspectErr != nil {
+			if pullRedeployImageErr := s.pullRedeployImage(ctx, dockerClient, newConfig.Image, containerID, containerName, "edit", req.Credentials, user); pullRedeployImageErr != nil {
 				return "", pullRedeployImageErr
 			}
 		}
 	}
 
-	return s.recreateContainerInternal(ctx, dockerClient, containerInfo, "edit", newName, &newConfig, &newHostConfig, networkingConfig, apiVersion, event.EventTypeContainerUpdate, user)
+	return s.recreateContainer(ctx, dockerClient, containerInfo, "edit", newName, &newConfig, &newHostConfig, networkingConfig, apiVersion, event.EventTypeContainerUpdate, user)
 }
 
 func (s *ContainerService) GetContainerByReference(ctx context.Context, ref string) (*container.InspectResponse, error) {
@@ -1271,17 +1082,39 @@ func (s *ContainerService) GetContainerDetails(ctx context.Context, id string) (
 
 	details := containertypes.NewDetails(containerInspect)
 	currentContainerID, currentContainerErr := cgroup.CurrentContainerID()
-	details.RedeployDisabled = labels.ShouldDisableArcaneServerRedeploy(details.Labels, details.ID, currentContainerID, currentContainerErr)
-	var excluded map[string]bool
-	if s.settingsService != nil {
-		excluded = docker.ExcludedContainerNameSet(s.settingsService.GetStringSetting(ctx, "autoUpdateExcludedContainers", ""))
+	updates, err := s.imageService.GetUpdateInfoByContainers(ctx, []container.Summary{{
+		ID:      details.ID,
+		Image:   details.Image,
+		ImageID: details.ImageID,
+		Labels:  details.Labels,
+	}})
+	if err != nil {
+		slog.WarnContext(ctx, "Failed to fetch container update info", "error", err)
 	}
-	details.AutoUpdateEnabled = !labels.IsUpdateDisabled(details.Labels) && !docker.ContainerNameExcluded([]string{details.Name}, excluded)
-	updates := s.lookupContainerUpdateInfoInternal(ctx, []container.Summary{{ID: details.ID, Image: details.Image, ImageID: details.ImageID, Labels: details.Labels}})
-	details.UpdateInfo = updates[details.ID]
-	s.applyContainerDetailsIconInternal(ctx, &details)
+	resolvedIcon := s.resolveContainerIcon(ctx, details.Labels, map[string]projects.ArcaneComposeMetadata{})
 
-	return details, nil
+	return containertypes.Details{ //exhaustruct:enforce
+		ID:               details.ID,
+		Name:             details.Name,
+		Image:            details.Image,
+		ImageID:          details.ImageID,
+		Created:          details.Created,
+		State:            details.State,
+		Config:           details.Config,
+		HostConfig:       details.HostConfig,
+		NetworkSettings:  details.NetworkSettings,
+		Ports:            details.Ports,
+		Mounts:           details.Mounts,
+		Labels:           details.Labels,
+		ComposeInfo:      details.ComposeInfo,
+		IconLightURL:     resolvedIcon.IconLightURL,
+		IconDarkURL:      resolvedIcon.IconDarkURL,
+		RedeployDisabled: labels.ShouldDisableArcaneServerRedeploy(details.Labels, details.ID, currentContainerID, currentContainerErr),
+		AutoUpdateEnabled: !labels.IsUpdateDisabled(details.Labels) &&
+			!docker.ContainerNameExcluded([]string{details.Name}, docker.ExcludedContainerNameSet(s.settingsService.GetStringSetting(ctx, "autoUpdateExcludedContainers", ""))),
+		UpdateInfo: updates[details.ID],
+		ActivityID: details.ActivityID,
+	}, nil
 }
 
 // containerProcessesPsArgs lists ps argument sets in preference order: procps first, then
@@ -1298,11 +1131,7 @@ func (s *ContainerService) GetContainerProcesses(ctx context.Context, containerI
 		return containertypes.Processes{}, fmt.Errorf("failed to connect to Docker: %w", err)
 	}
 
-	timeout := timeouts.DefaultDockerAPI
-	if s.settingsService != nil {
-		timeout = timeouts.GetDuration(s.settingsService.GetSettingsConfig().DockerAPITimeout.AsInt(), timeouts.DefaultDockerAPI)
-	}
-	topCtx, cancel := context.WithTimeout(ctx, timeout)
+	topCtx, cancel := context.WithTimeout(ctx, timeouts.GetDuration(s.settingsService.GetSettingsConfig().DockerAPITimeout.AsInt(), timeouts.DefaultDockerAPI))
 	defer cancel()
 
 	var result client.ContainerTopResult
@@ -1313,16 +1142,23 @@ func (s *ContainerService) GetContainerProcesses(ctx context.Context, containerI
 		}
 	}
 	if err != nil {
-		return containertypes.Processes{}, fmt.Errorf("failed to list container processes: %w", err)
+		return containertypes.Processes{}, common.Classify(func() error {
+			switch {
+			case errdefs.IsNotFound(err):
+				return common.ErrNotFound
+			case errdefs.IsConflict(err):
+				return common.ErrConflict
+			case errors.Is(err, context.DeadlineExceeded):
+				return common.ErrTimeout
+			default:
+				return nil
+			}
+		}(), fmt.Errorf("failed to list container processes: %w", err))
 	}
-	processes := containertypes.Processes{Titles: result.Titles, Processes: result.Processes}
-	if processes.Titles == nil {
-		processes.Titles = []string{}
-	}
-	if processes.Processes == nil {
-		processes.Processes = [][]string{}
-	}
-	return processes, nil
+	return containertypes.Processes{
+		Titles:    kit.Ternary(result.Titles == nil, []string{}, result.Titles),
+		Processes: kit.Ternary(result.Processes == nil, [][]string{}, result.Processes),
+	}, nil
 }
 
 // GetContainerNameByReference resolves a container's clean name from a Docker ID or name.
@@ -1411,21 +1247,17 @@ func (s *ContainerService) DeleteContainer(ctx context.Context, containerID stri
 	}
 
 	// Remove named volumes if requested
-	if removeVolumes && len(volumesToRemove) > 0 {
-		for _, volumeName := range volumesToRemove {
-			if _, removeErr := dockerClient.VolumeRemove(ctx, volumeName, client.VolumeRemoveOptions{Force: false}); removeErr != nil {
-				// Log but don't fail if volume removal fails (might be in use by another container)
-				s.eventService.LogErrorEvent(ctx, event.EventTypeVolumeError, "volume", volumeName, "", user.ID, user.Username, "0", removeErr, database.JSON{"action": "delete", "container": containerID})
-			}
+	for _, volumeName := range volumesToRemove {
+		if _, removeErr := dockerClient.VolumeRemove(ctx, volumeName, client.VolumeRemoveOptions{Force: false}); removeErr != nil {
+			// Log but don't fail if volume removal fails (might be in use by another container)
+			s.eventService.LogErrorEvent(ctx, event.EventTypeVolumeError, "volume", volumeName, "", user.ID, user.Username, "0", removeErr, database.JSON{"action": "delete", "container": containerID})
 		}
 	}
 
-	metadata := database.JSON{
+	err = s.eventService.LogContainerEvent(ctx, event.EventTypeContainerDelete, containerID, "name", user.ID, user.Username, "0", database.JSON{
 		"action":      "delete",
 		"containerId": containerID,
-	}
-
-	err = s.eventService.LogContainerEvent(ctx, event.EventTypeContainerDelete, containerID, "name", user.ID, user.Username, "0", metadata)
+	})
 	if err != nil {
 		return fmt.Errorf("failed to log action: %w", err)
 	}
@@ -1433,9 +1265,7 @@ func (s *ContainerService) DeleteContainer(ctx context.Context, containerID stri
 	return nil
 }
 
-func (
-	s *ContainerService,
-) CreateContainer(
+func (s *ContainerService) CreateContainer(
 	ctx context.Context,
 	config *container.Config,
 	hostConfig *container.HostConfig,
@@ -1453,85 +1283,10 @@ func (
 		return nil, fmt.Errorf("failed to connect to Docker: %w", err)
 	}
 
-	_, err = dockerClient.ImageInspect(ctx, config.Image)
-	if err != nil {
+	if _, inspectErr := dockerClient.ImageInspect(ctx, config.Image); inspectErr != nil {
 		// Image not found locally, need to pull it
-		pullOptions, authErr := s.imageService.PullOptionsWithAuth(ctx, config.Image, credentials)
-		if authErr != nil {
-			slog.WarnContext(ctx, "Failed to get registry authentication for container image; proceeding without auth",
-				"image", config.Image,
-				"error", authErr.Error())
-			pullOptions = client.ImagePullOptions{}
-		}
-
-		localSettings := s.settingsService.GetSettingsConfig()
-		pullCtx, pullCancel := context.WithTimeout(ctx, timeouts.GetDuration(localSettings.DockerImagePullTimeout.AsInt(), timeouts.DefaultDockerImagePull))
-		defer pullCancel()
-
-		defer s.eventService.BeginDockerResourceSuppressionWindow("image", "", config.Image)()
-		reader, pullErr := dockerClient.ImagePull(pullCtx, config.Image, pullOptions)
-		if pullErr != nil {
-			if errors.Is(pullCtx.Err(), context.DeadlineExceeded) {
-				s.eventService.LogErrorEvent(
-					ctx,
-					event.EventTypeContainerError,
-					"container",
-					"",
-					containerName,
-					user.ID,
-					user.Username,
-					"0",
-					pullErr,
-					database.JSON{
-						"action": "create",
-						"image":  config.Image,
-						"step":   "pull_image_timeout",
-					},
-				)
-				return nil, fmt.Errorf("image pull timed out for %s (increase DOCKER_IMAGE_PULL_TIMEOUT or setting)", config.Image)
-			}
-			s.eventService.LogErrorEvent(
-				ctx,
-				event.EventTypeContainerError,
-				"container",
-				"",
-				containerName,
-				user.ID,
-				user.Username,
-				"0",
-				pullErr,
-				database.JSON{
-					"action": "create",
-					"image":  config.Image,
-					"step":   "pull_image",
-				},
-			)
-			return nil, fmt.Errorf("failed to pull image %s: %w", config.Image, pullErr)
-		}
-		defer func() { _ = reader.Close() }()
-
-		progressWriter, _ := ctx.Value(types.ProgressWriterKey{}).(io.Writer)
-		logWriter := docker.NewLogLineWriter(progressWriter)
-		streamErr := docker.RenderJSONMessageStream(reader, logWriter)
-		_ = logWriter.Close()
-		if streamErr != nil {
-			s.eventService.LogErrorEvent(
-				ctx,
-				event.EventTypeContainerError,
-				"container",
-				"",
-				containerName,
-				user.ID,
-				user.Username,
-				"0",
-				streamErr,
-				database.JSON{
-					"action": "create",
-					"image":  config.Image,
-					"step":   "complete_pull",
-				},
-			)
-			return nil, fmt.Errorf("failed to complete image pull: %w", streamErr)
+		if pullErr := s.pullRedeployImage(ctx, dockerClient, config.Image, "", containerName, "create", credentials, user); pullErr != nil {
+			return nil, pullErr
 		}
 	}
 
@@ -1563,12 +1318,10 @@ func (
 	}
 
 	defer s.eventService.BeginDockerResourceSuppressionWindow("container", resp.ID, containerName)()
-	metadata := database.JSON{
+	if logErr := s.eventService.LogContainerEvent(ctx, event.EventTypeContainerCreate, resp.ID, "name", user.ID, user.Username, "0", database.JSON{
 		"action":      "create",
 		"containerId": resp.ID,
-	}
-
-	if logErr := s.eventService.LogContainerEvent(ctx, event.EventTypeContainerCreate, resp.ID, "name", user.ID, user.Username, "0", metadata); logErr != nil {
+	}); logErr != nil {
 		slog.WarnContext(ctx, "could not log container stop action", "error", logErr)
 	}
 
@@ -1670,7 +1423,11 @@ func (s *ContainerService) ListContainersPaginated(
 	}
 
 	dockerContainers = FilterExcludedContainers(dockerContainers, includeInternal, includeHidden)
-	updateInfoMap := s.lookupContainerUpdateInfoInternal(ctx, dockerContainers)
+	// Update lookup failures degrade to missing status rather than a failed list.
+	updateInfoMap, err := s.imageService.GetUpdateInfoByContainers(ctx, dockerContainers)
+	if err != nil {
+		slog.WarnContext(ctx, "Failed to fetch container update info", "error", err)
+	}
 	currentContainerID, currentContainerErr := cgroup.CurrentContainerID()
 	items := s.BuildSummaries(ctx, dockerContainers, updateInfoMap, currentContainerID, currentContainerErr)
 
@@ -1678,11 +1435,12 @@ func (s *ContainerService) ListContainersPaginated(
 	counts := s.CalculateStatusCounts(items)
 
 	if groupBy == containerGroupByProject {
-		ungroupedParams := params
-		ungroupedParams.Start = 0
-		ungroupedParams.Limit = -1
-
-		result := config.SearchOrderAndPaginate(items, ungroupedParams)
+		result := config.SearchOrderAndPaginate(items, pagination.QueryParams{
+			SearchQuery: params.SearchQuery,
+			SortParams:  params.SortParams,
+			Params:      pagination.Params{Limit: -1, SkipCount: params.SkipCount},
+			Filters:     params.Filters,
+		})
 		groups, paginationResp := paginateContainerProjectGroups(result, params)
 
 		// Icons must be resolved before flattening: groups hold value copies,
@@ -1693,58 +1451,71 @@ func (s *ContainerService) ListContainersPaginated(
 		}
 
 		return ContainerListResult{
-			Items:      flattenContainerProjectGroupsInternal(groups),
+			Items:      flattenContainerProjectGroups(groups),
 			Groups:     groups,
 			Pagination: paginationResp,
 			Counts:     counts,
 		}, nil
 	}
 
-	if isContainerResourceSortRequestInternal(params, groupBy) {
-		return s.listContainersByResourceInternal(ctx, config, items, counts, params)
+	// Resource sorting is limited to the ungrouped list: project-grouped mode keeps the existing group pagination.
+	if containertypes.IsResourceSort(params.Sort) {
+		// Apply search and filters, collect stats for the matching containers, then sort and paginate.
+		filtered := make([]containertypes.Summary, 0, len(items))
+		for _, item := range items {
+			if config.MatchesSearchAndFilters(item, params) {
+				filtered = append(filtered, item)
+			}
+		}
+
+		samples, collectErr := s.stats.Collect(ctx, filtered, stats.ContainerResourceSampleTTL)
+		if collectErr != nil {
+			return ContainerListResult{}, collectErr
+		}
+		sampled := make([]containertypes.Summary, 0, len(filtered))
+		for _, item := range filtered {
+			sampled = append(sampled, containertypes.Summary{ //exhaustruct:enforce
+				EnvironmentTag:    item.EnvironmentTag,
+				ID:                item.ID,
+				Names:             item.Names,
+				Image:             item.Image,
+				ImageID:           item.ImageID,
+				Command:           item.Command,
+				Created:           item.Created,
+				Ports:             item.Ports,
+				Labels:            item.Labels,
+				State:             item.State,
+				Status:            item.Status,
+				HostConfig:        item.HostConfig,
+				NetworkSettings:   item.NetworkSettings,
+				Mounts:            item.Mounts,
+				IconLightURL:      item.IconLightURL,
+				IconDarkURL:       item.IconDarkURL,
+				UpdateStrategy:    item.UpdateStrategy,
+				UpdateInfo:        item.UpdateInfo,
+				RedeployDisabled:  item.RedeployDisabled,
+				AutoUpdateEnabled: item.AutoUpdateEnabled,
+				Hidden:            item.Hidden,
+				ResourceSample:    samples[item.ID],
+			})
+		}
+
+		page := config.OrderAndPaginate(sampled, params)
+		s.ApplySummaryIcons(ctx, page, nil)
+
+		return ContainerListResult{
+			Items:      page,
+			Pagination: pagination.BuildResponse(int64(len(sampled)), int64(len(items)), params),
+			Counts:     counts,
+		}, nil
 	}
 
 	result := config.SearchOrderAndPaginate(items, params)
 	s.ApplySummaryIcons(ctx, result.Items, nil)
-	paginationResp := pagination.BuildResponse(result.TotalCount, result.TotalAvailable, params)
 
 	return ContainerListResult{
 		Items:      result.Items,
-		Pagination: paginationResp,
-		Counts:     counts,
-	}, nil
-}
-
-// listContainersByResourceInternal applies search and filters, collects stats
-// for the matching containers, then sorts and paginates.
-func (s *ContainerService) listContainersByResourceInternal(
-	ctx context.Context,
-	config pagination.Config[containertypes.Summary],
-	items []containertypes.Summary,
-	counts containertypes.StatusCounts,
-	params pagination.QueryParams,
-) (ContainerListResult, error) {
-	filtered := make([]containertypes.Summary, 0, len(items))
-	for _, item := range items {
-		if config.MatchesSearchAndFilters(item, params) {
-			filtered = append(filtered, item)
-		}
-	}
-
-	samples, err := s.stats.Collect(ctx, filtered, stats.ContainerResourceSampleTTL)
-	if err != nil {
-		return ContainerListResult{}, err
-	}
-	for i := range filtered {
-		filtered[i].ResourceSample = samples[filtered[i].ID]
-	}
-
-	page := config.OrderAndPaginate(filtered, params)
-	s.ApplySummaryIcons(ctx, page, nil)
-
-	return ContainerListResult{
-		Items:      page,
-		Pagination: pagination.BuildResponse(int64(len(filtered)), int64(len(items)), params),
+		Pagination: pagination.BuildResponse(result.TotalCount, result.TotalAvailable, params),
 		Counts:     counts,
 	}, nil
 }
@@ -1756,37 +1527,57 @@ func (s *ContainerService) AggregateContainers(ctx context.Context, params pagin
 	}
 
 	pages := make([]pagination.EnvironmentPage[containertypes.Summary], 0, len(collection.Results))
-	counts := containertypes.StatusCounts{}
+	running, stopped, total := 0, 0, 0
 	resourceSortSupported := true
 	for _, result := range collection.Results {
-		page := result.Value
 		pages = append(pages, pagination.EnvironmentPage[containertypes.Summary]{
 			Environment:    result.Environment,
-			Items:          page.Data,
-			TotalAvailable: cmp.Or(page.Pagination.GrandTotalItems, page.Pagination.TotalItems),
+			Items:          result.Value.Data,
+			TotalAvailable: cmp.Or(result.Value.Pagination.GrandTotalItems, result.Value.Pagination.TotalItems),
 		})
-		counts.RunningContainers += page.Counts.RunningContainers
-		counts.StoppedContainers += page.Counts.StoppedContainers
-		counts.TotalContainers += page.Counts.TotalContainers
-		resourceSortSupported = resourceSortSupported && page.ResourceSortSupported
+		running += result.Value.Counts.RunningContainers
+		stopped += result.Value.Counts.StoppedContainers
+		total += result.Value.Counts.TotalContainers
+		resourceSortSupported = resourceSortSupported && result.Value.ResourceSortSupported
 	}
 
-	grouped := groupBy == containerGroupByProject
-	ungroupedParams := params
-	ungroupedParams.Start, ungroupedParams.Limit = 0, -1
-	data, resp := pagination.MergeEnvironmentPages(s.buildContainerPaginationConfig(), pages, kit.Ternary(grouped, ungroupedParams, params))
-	var groups []containertypes.SummaryGroup
-	if grouped {
-		groups, resp = paginateContainerProjectGroups(pagination.FilterResult[containertypes.Summary]{Items: data, TotalCount: resp.TotalItems, TotalAvailable: resp.GrandTotalItems}, params)
-		data = flattenContainerProjectGroupsInternal(groups)
+	if groupBy != containerGroupByProject {
+		data, resp := pagination.MergeEnvironmentPages(s.buildContainerPaginationConfig(), pages, params)
+		return ContainerPaginatedResponse{
+			Success: true,
+			Data:    data,
+			Counts: containertypes.StatusCounts{
+				RunningContainers: running,
+				StoppedContainers: stopped,
+				TotalContainers:   total,
+			},
+			Pagination:            handlerutil.PaginationResponse(resp),
+			ResourceSortSupported: resourceSortSupported,
+			FailedEnvironments:    collection.Failures,
+		}, nil
 	}
 
+	data, resp := pagination.MergeEnvironmentPages(s.buildContainerPaginationConfig(), pages, pagination.QueryParams{
+		SearchQuery: params.SearchQuery,
+		SortParams:  params.SortParams,
+		Params:      pagination.Params{Limit: -1, SkipCount: params.SkipCount},
+		Filters:     params.Filters,
+	})
+	groups, groupedResp := paginateContainerProjectGroups(pagination.FilterResult[containertypes.Summary]{
+		Items:          data,
+		TotalCount:     resp.TotalItems,
+		TotalAvailable: resp.GrandTotalItems,
+	}, params)
 	return ContainerPaginatedResponse{
-		Success:               true,
-		Data:                  data,
-		Groups:                groups,
-		Counts:                counts,
-		Pagination:            handlerutil.PaginationResponse(resp),
+		Success: true,
+		Data:    flattenContainerProjectGroups(groups),
+		Groups:  groups,
+		Counts: containertypes.StatusCounts{
+			RunningContainers: running,
+			StoppedContainers: stopped,
+			TotalContainers:   total,
+		},
+		Pagination:            handlerutil.PaginationResponse(groupedResp),
 		ResourceSortSupported: resourceSortSupported,
 		FailedEnvironments:    collection.Failures,
 	}, nil
@@ -1847,40 +1638,30 @@ func paginateContainerProjectGroups(
 }
 
 func groupContainersByProject(items []containertypes.Summary) []containertypes.SummaryGroup {
-	groups := make([]containertypes.SummaryGroup, 0)
-	groupIndexes := make(map[string]int)
-
+	groupNames := make([]string, 0)
+	itemsByGroup := make(map[string][]containertypes.Summary)
 	for _, item := range items {
-		groupName := getContainerProjectNameInternal(item)
-		groupIndex, exists := groupIndexes[groupName]
-		if !exists {
-			groupIndex = len(groups)
-			groupIndexes[groupName] = groupIndex
-			groups = append(groups, containertypes.SummaryGroup{GroupName: groupName})
+		groupName := cmp.Or(docker.ComposeProjectLabel(item.Labels), containerNoProjectGroup)
+		if _, exists := itemsByGroup[groupName]; !exists {
+			groupNames = append(groupNames, groupName)
 		}
-
-		groups[groupIndex].Items = append(groups[groupIndex].Items, item)
+		itemsByGroup[groupName] = append(itemsByGroup[groupName], item)
 	}
 
+	groups := make([]containertypes.SummaryGroup, 0, len(groupNames))
+	for _, groupName := range groupNames {
+		groups = append(groups, containertypes.SummaryGroup{GroupName: groupName, Items: itemsByGroup[groupName]})
+	}
 	return groups
 }
 
-func flattenContainerProjectGroupsInternal(groups []containertypes.SummaryGroup) []containertypes.Summary {
+func flattenContainerProjectGroups(groups []containertypes.SummaryGroup) []containertypes.Summary {
 	flattened := make([]containertypes.Summary, 0)
 	for _, group := range groups {
 		flattened = append(flattened, group.Items...)
 	}
 
 	return flattened
-}
-
-func getContainerProjectNameInternal(localContainer containertypes.Summary) string {
-	if localContainer.Labels == nil {
-		return containerNoProjectGroup
-	}
-
-	projectName := docker.ComposeProjectLabel(localContainer.Labels)
-	return kit.Ternary(projectName == "", containerNoProjectGroup, projectName)
 }
 
 // FilterExcludedContainers removes internal and hidden containers unless their corresponding inclusion flags are enabled.
@@ -1901,23 +1682,7 @@ func FilterExcludedContainers(containers []container.Summary, includeInternal, i
 	return filtered
 }
 
-// lookupContainerUpdateInfoInternal resolves stored update checks keyed by
-// container ID; lookup failures degrade to missing status rather than a failed list.
-func (s *ContainerService) lookupContainerUpdateInfoInternal(ctx context.Context, containers []container.Summary) map[string]*imagetypes.UpdateInfo {
-	if s.imageService == nil || len(containers) == 0 {
-		return map[string]*imagetypes.UpdateInfo{}
-	}
-	updates, err := s.imageService.GetUpdateInfoByContainers(ctx, containers)
-	if err != nil {
-		slog.WarnContext(ctx, "Failed to fetch container update info", "error", err)
-		return map[string]*imagetypes.UpdateInfo{}
-	}
-	return updates
-}
-
-func (
-	s *ContainerService,
-) BuildSummaries(
+func (s *ContainerService) BuildSummaries(
 	ctx context.Context,
 	containers []container.Summary,
 	updateInfoMap map[string]*imagetypes.UpdateInfo,
@@ -1925,23 +1690,36 @@ func (
 	currentContainerErr error,
 ) []containertypes.Summary {
 	items := make([]containertypes.Summary, 0, len(containers))
-	var excluded map[string]bool
-	if s.settingsService != nil {
-		excluded = docker.ExcludedContainerNameSet(s.settingsService.GetStringSetting(ctx, "autoUpdateExcludedContainers", ""))
-	}
+	excluded := docker.ExcludedContainerNameSet(s.settingsService.GetStringSetting(ctx, "autoUpdateExcludedContainers", ""))
 	for _, dc := range containers {
 		summary := containertypes.NewSummary(dc)
 		policy := updater.DefaultLabelPolicy().TagPolicy(dc.Labels)
 		resolved, policyErr := tagpolicy.Resolve(dc.Image, policy)
-		summary.UpdateStrategy = resolved.Strategy
-		if policyErr != nil {
-			summary.UpdateStrategy = cmp.Or(policy.Strategy, "auto")
-		}
-		summary.UpdateInfo = updateInfoMap[dc.ID]
-		summary.RedeployDisabled = labels.ShouldDisableArcaneServerRedeploy(summary.Labels, summary.ID, currentContainerID, currentContainerErr)
-		summary.AutoUpdateEnabled = !labels.IsUpdateDisabled(dc.Labels) && !docker.ContainerNameExcluded(dc.Names, excluded)
-		summary.Hidden, _ = kit.ParseBool(dc.Labels[libarcane.HiddenResourceLabel])
-		items = append(items, summary)
+		hidden, _ := kit.ParseBool(dc.Labels[libarcane.HiddenResourceLabel])
+		items = append(items, containertypes.Summary{ //exhaustruct:enforce
+			EnvironmentTag:    summary.EnvironmentTag,
+			ID:                summary.ID,
+			Names:             summary.Names,
+			Image:             summary.Image,
+			ImageID:           summary.ImageID,
+			Command:           summary.Command,
+			Created:           summary.Created,
+			Ports:             summary.Ports,
+			Labels:            summary.Labels,
+			State:             summary.State,
+			Status:            summary.Status,
+			HostConfig:        summary.HostConfig,
+			NetworkSettings:   summary.NetworkSettings,
+			Mounts:            summary.Mounts,
+			IconLightURL:      summary.IconLightURL,
+			IconDarkURL:       summary.IconDarkURL,
+			UpdateStrategy:    kit.Ternary(policyErr != nil, cmp.Or(policy.Strategy, "auto"), resolved.Strategy),
+			UpdateInfo:        updateInfoMap[dc.ID],
+			RedeployDisabled:  labels.ShouldDisableArcaneServerRedeploy(summary.Labels, summary.ID, currentContainerID, currentContainerErr),
+			AutoUpdateEnabled: !labels.IsUpdateDisabled(dc.Labels) && !docker.ContainerNameExcluded(dc.Names, excluded),
+			Hidden:            hidden,
+			ResourceSample:    summary.ResourceSample,
+		})
 	}
 	return items
 }
@@ -1954,80 +1732,61 @@ func (s *ContainerService) ApplySummaryIcons(ctx context.Context, summaries []co
 		metadataByProject = map[string]projects.ArcaneComposeMetadata{}
 	}
 	for i := range summaries {
-		s.applyContainerSummaryIconInternal(ctx, &summaries[i], metadataByProject)
+		resolvedIcon := s.resolveContainerIcon(ctx, summaries[i].Labels, metadataByProject)
+		summaries[i].IconLightURL = resolvedIcon.IconLightURL // keep: the exported API enriches caller-owned rows in place
+		summaries[i].IconDarkURL = resolvedIcon.IconDarkURL   // keep: the exported API enriches caller-owned rows in place
 	}
 }
 
-func (s *ContainerService) applyContainerSummaryIconInternal(ctx context.Context, summary *containertypes.Summary, metadataByProject map[string]projects.ArcaneComposeMetadata) {
-	if summary == nil {
-		return
-	}
-	resolvedIcon := s.resolveContainerIconInternal(ctx, summary.Labels, metadataByProject)
-	summary.IconLightURL = resolvedIcon.IconLightURL
-	summary.IconDarkURL = resolvedIcon.IconDarkURL
-}
-
-func (s *ContainerService) applyContainerDetailsIconInternal(ctx context.Context, details *containertypes.Details) {
-	if details == nil {
-		return
-	}
-	resolvedIcon := s.resolveContainerIconInternal(ctx, details.Labels, nil)
-	details.IconLightURL = resolvedIcon.IconLightURL
-	details.IconDarkURL = resolvedIcon.IconDarkURL
-}
-
-func (s *ContainerService) resolveContainerIconInternal(ctx context.Context, localLabels map[string]string, metadataByProject map[string]projects.ArcaneComposeMetadata) iconcatalog.ResolvedIconSet {
+func (s *ContainerService) resolveContainerIcon(ctx context.Context, localLabels map[string]string, metadataByProject map[string]projects.ArcaneComposeMetadata) iconcatalog.ResolvedIconSet {
 	explicitIcon := projects.FindArcaneIconSet(localLabels)
-	if !explicitIcon.IsEmpty() {
-		return iconcatalog.Resolve(project.IconCatalogForContext(ctx), explicitIcon)
-	}
-
 	projectName := docker.ComposeProjectLabel(localLabels)
-	if projectName == "" || s == nil || s.projectService == nil {
+	if !explicitIcon.IsEmpty() || projectName == "" {
 		return iconcatalog.Resolve(project.IconCatalogForContext(ctx), explicitIcon)
 	}
 
-	meta := s.getCachedProjectIconMetadataInternal(ctx, projectName, metadataByProject)
+	meta, ok := metadataByProject[projectName]
+	if !ok {
+		meta, ok, _ = s.iconMetaCache.Get(projectName)
+	}
+	if !ok {
+		meta = func() projects.ArcaneComposeMetadata {
+			proj, err := s.projectService.GetProjectByComposeName(ctx, projectName)
+			if err != nil {
+				return projects.ArcaneComposeMetadata{ServiceIconSets: map[string]projects.IconSet{}}
+			}
+			return s.projectService.ProjectMetadata(ctx, *proj, nil)
+		}()
+		s.iconMetaCache.Set(projectName, meta)
+	}
+	metadataByProject[projectName] = meta
 
-	serviceName := docker.ComposeServiceLabel(localLabels)
 	return iconcatalog.Resolve(project.IconCatalogForContext(ctx), cmp.Or(
 		explicitIcon,
-		meta.ServiceIconSets[serviceName],
+		meta.ServiceIconSets[docker.ComposeServiceLabel(localLabels)],
 		meta.ProjectIcon,
 	))
 }
 
-func (s *ContainerService) getCachedProjectIconMetadataInternal(ctx context.Context, projectName string, metadataByProject map[string]projects.ArcaneComposeMetadata) projects.ArcaneComposeMetadata {
-	if metadataByProject != nil {
-		if meta, ok := metadataByProject[projectName]; ok {
-			return meta
-		}
-	}
-
-	if s.iconMetaCache != nil {
-		if meta, ok, _ := s.iconMetaCache.Get(projectName); ok {
-			if metadataByProject != nil {
-				metadataByProject[projectName] = meta
-			}
-			return meta
-		}
-	}
-
-	meta := projects.ArcaneComposeMetadata{ServiceIconSets: map[string]projects.IconSet{}}
-	proj, err := s.projectService.GetProjectByComposeName(ctx, projectName)
-	if err == nil && proj != nil {
-		meta = s.projectService.ProjectMetadata(ctx, *proj, nil)
-	}
-	if s.iconMetaCache != nil {
-		s.iconMetaCache.Set(projectName, meta)
-	}
-	if metadataByProject != nil {
-		metadataByProject[projectName] = meta
-	}
-	return meta
-}
-
 func (s *ContainerService) buildContainerPaginationConfig() pagination.Config[containertypes.Summary] {
+	comparePorts := func(descending bool) pagination.SortOption[containertypes.Summary] {
+		return func(a, b containertypes.Summary) int {
+			hasPortsA, portA := lowestContainerPortSortValue(a.Ports)
+			hasPortsB, portB := lowestContainerPortSortValue(b.Ports)
+
+			switch {
+			case !hasPortsA && !hasPortsB, portA == portB:
+				return stats.CompareContainerNamesForSort(a, b)
+			case !hasPortsA:
+				return 1
+			case !hasPortsB:
+				return -1
+			default:
+				return kit.Ternary((portA < portB) != descending, -1, 1)
+			}
+		}
+	}
+
 	return pagination.Config[containertypes.Summary]{
 		SearchAccessors: []pagination.SearchAccessor[containertypes.Summary]{
 			func(c containertypes.Summary) (string, error) {
@@ -2040,122 +1799,93 @@ func (s *ContainerService) buildContainerPaginationConfig() pagination.Config[co
 			func(c containertypes.Summary) (string, error) { return c.State, nil },
 			func(c containertypes.Summary) (string, error) { return c.Status, nil },
 		},
-		SortBindings:    s.buildContainerSortBindings(),
-		FilterAccessors: s.buildContainerFilterAccessors(),
+		SortBindings: []pagination.SortBinding[containertypes.Summary]{
+			{
+				Key: "name",
+				Fn:  stats.CompareContainerNamesForSort,
+			},
+			{
+				Key: "image",
+				Fn: func(a, b containertypes.Summary) int {
+					return strings.Compare(a.Image, b.Image)
+				},
+			},
+			{
+				Key: "state",
+				Fn: func(a, b containertypes.Summary) int {
+					return strings.Compare(a.State, b.State)
+				},
+			},
+			{
+				Key: "status",
+				Fn: func(a, b containertypes.Summary) int {
+					return strings.Compare(a.Status, b.Status)
+				},
+			},
+			{
+				Key:    "ports",
+				Fn:     comparePorts(false),
+				DescFn: comparePorts(true),
+			},
+			{
+				Key: "created",
+				Fn: func(a, b containertypes.Summary) int {
+					return cmp.Compare(a.Created, b.Created)
+				},
+			},
+			{
+				Key:    containertypes.SortCPUUsage,
+				Fn:     stats.ContainerResourceSampleSort(containertypes.SortCPUUsage, false),
+				DescFn: stats.ContainerResourceSampleSort(containertypes.SortCPUUsage, true),
+			},
+			{
+				Key:    containertypes.SortMemoryUsage,
+				Fn:     stats.ContainerResourceSampleSort(containertypes.SortMemoryUsage, false),
+				DescFn: stats.ContainerResourceSampleSort(containertypes.SortMemoryUsage, true),
+			},
+		},
+		FilterAccessors: []pagination.FilterAccessor[containertypes.Summary]{
+			{
+				Key: "updates",
+				Fn: func(c containertypes.Summary, filterValue string) bool {
+					switch filterValue {
+					case "has_update":
+						return kit.FromPtr(c.UpdateInfo).HasUpdate
+					case "up_to_date":
+						return c.UpdateInfo != nil && !c.UpdateInfo.HasUpdate && c.UpdateInfo.Error == ""
+					case "error":
+						return kit.FromPtr(c.UpdateInfo).Error != ""
+					case "unknown":
+						return c.UpdateInfo == nil
+					default:
+						return true
+					}
+				},
+			},
+			{
+				Key: "standalone",
+				Fn: func(c containertypes.Summary, filterValue string) bool {
+					value, valid := kit.ParseBool(filterValue)
+					return !valid || (docker.ComposeProjectLabel(c.Labels) == "" && !labels.IsSwarmTask(c.Labels)) == value
+				},
+			},
+			{
+				Key:     "label",
+				NoSplit: true,
+				Fn: func(c containertypes.Summary, filterValue string) bool {
+					key, value, hasValue := strings.Cut(filterValue, "=")
+					if strings.TrimSpace(key) == "" {
+						return true
+					}
+					actual, ok := c.Labels[strings.TrimSpace(key)]
+					return ok && (!hasValue || actual == value)
+				},
+			},
+		},
 	}
 }
 
-func (s *ContainerService) buildContainerSortBindings() []pagination.SortBinding[containertypes.Summary] {
-	return []pagination.SortBinding[containertypes.Summary]{
-		{
-			Key: "name",
-			Fn: func(a, b containertypes.Summary) int {
-				nameA, nameB := "", ""
-				if len(a.Names) > 0 {
-					nameA = a.Names[0]
-				}
-				if len(b.Names) > 0 {
-					nameB = b.Names[0]
-				}
-				return strings.Compare(nameA, nameB)
-			},
-		},
-		{
-			Key: "image",
-			Fn: func(a, b containertypes.Summary) int {
-				return strings.Compare(a.Image, b.Image)
-			},
-		},
-		{
-			Key: "state",
-			Fn: func(a, b containertypes.Summary) int {
-				return strings.Compare(a.State, b.State)
-			},
-		},
-		{
-			Key: "status",
-			Fn: func(a, b containertypes.Summary) int {
-				return strings.Compare(a.Status, b.Status)
-			},
-		},
-		{
-			Key:    "ports",
-			Fn:     compareContainerPortsForSortInternal,
-			DescFn: compareContainerPortsForSortDescInternal,
-		},
-		{
-			Key: "created",
-			Fn: func(a, b containertypes.Summary) int {
-				if a.Created < b.Created {
-					return -1
-				}
-				return kit.Ternary(a.Created > b.Created, 1, 0)
-			},
-		},
-		{
-			Key:    containertypes.SortCPUUsage,
-			Fn:     stats.ContainerResourceSampleSort(containertypes.SortCPUUsage, false),
-			DescFn: stats.ContainerResourceSampleSort(containertypes.SortCPUUsage, true),
-		},
-		{
-			Key:    containertypes.SortMemoryUsage,
-			Fn:     stats.ContainerResourceSampleSort(containertypes.SortMemoryUsage, false),
-			DescFn: stats.ContainerResourceSampleSort(containertypes.SortMemoryUsage, true),
-		},
-	}
-}
-
-// isContainerResourceSortRequestInternal limits resource sorting to the
-// ungrouped list: project-grouped mode keeps the existing group pagination.
-func isContainerResourceSortRequestInternal(params pagination.QueryParams, groupBy string) bool {
-	return groupBy != containerGroupByProject && containertypes.IsResourceSort(params.Sort)
-}
-
-func compareContainerPortsForSortInternal(a, b containertypes.Summary) int {
-	hasPortsA, portA := lowestContainerPortSortValueInternal(a.Ports)
-	hasPortsB, portB := lowestContainerPortSortValueInternal(b.Ports)
-
-	switch {
-	case !hasPortsA && !hasPortsB:
-		return stats.CompareContainerNamesForSort(a, b)
-	case !hasPortsA:
-		return 1
-	case !hasPortsB:
-		return -1
-	case portA < portB:
-		return -1
-	case portA > portB:
-		return 1
-	default:
-		return stats.CompareContainerNamesForSort(a, b)
-	}
-}
-
-func compareContainerPortsForSortDescInternal(a, b containertypes.Summary) int {
-	hasPortsA, portA := lowestContainerPortSortValueInternal(a.Ports)
-	hasPortsB, portB := lowestContainerPortSortValueInternal(b.Ports)
-
-	switch {
-	case !hasPortsA && !hasPortsB:
-		return stats.CompareContainerNamesForSort(a, b)
-	case !hasPortsA:
-		return 1
-	case !hasPortsB:
-		return -1
-	case portA > portB:
-		return -1
-	case portA < portB:
-		return 1
-	default:
-		return stats.CompareContainerNamesForSort(a, b)
-	}
-}
-
-func lowestContainerPortSortValueInternal(ports []containertypes.Port) (bool, int) {
-	if len(ports) == 0 {
-		return false, 0
-	}
-
+func lowestContainerPortSortValue(ports []containertypes.Port) (bool, int) {
 	lowestPublished := 0
 	lowestPrivate := 0
 	for _, port := range ports {
@@ -2167,71 +1897,22 @@ func lowestContainerPortSortValueInternal(ports []containertypes.Port) (bool, in
 		}
 	}
 
-	switch {
-	case lowestPublished > 0:
-		return true, lowestPublished
-	case lowestPrivate > 0:
-		return true, lowestPrivate
-	default:
-		return false, 0
-	}
-}
-
-func (s *ContainerService) buildContainerFilterAccessors() []pagination.FilterAccessor[containertypes.Summary] {
-	return []pagination.FilterAccessor[containertypes.Summary]{
-		{
-			Key: "updates",
-			Fn: func(c containertypes.Summary, filterValue string) bool {
-				switch filterValue {
-				case "has_update":
-					return c.UpdateInfo != nil && c.UpdateInfo.HasUpdate
-				case "up_to_date":
-					return c.UpdateInfo != nil && !c.UpdateInfo.HasUpdate && c.UpdateInfo.Error == ""
-				case "error":
-					return c.UpdateInfo != nil && c.UpdateInfo.Error != ""
-				case "unknown":
-					return c.UpdateInfo == nil
-				default:
-					return true
-				}
-			},
-		},
-		{
-			Key: "standalone",
-			Fn: func(c containertypes.Summary, filterValue string) bool {
-				isStandalone := docker.ComposeProjectLabel(c.Labels) == "" && !labels.IsSwarmTask(c.Labels)
-				value, valid := kit.ParseBool(filterValue)
-				return !valid || isStandalone == value
-			},
-		},
-		{
-			Key:     "label",
-			NoSplit: true,
-			Fn: func(c containertypes.Summary, filterValue string) bool {
-				key, value, hasValue := strings.Cut(filterValue, "=")
-				key = strings.TrimSpace(key)
-				if key == "" {
-					return true
-				}
-				actual, ok := c.Labels[key]
-				return ok && (!hasValue || actual == value)
-			},
-		},
-	}
+	lowest := cmp.Or(lowestPublished, lowestPrivate)
+	return lowest > 0, lowest
 }
 
 func (s *ContainerService) CalculateStatusCounts(items []containertypes.Summary) containertypes.StatusCounts {
-	counts := containertypes.StatusCounts{
-		TotalContainers: len(items),
-	}
+	running := 0
 	for _, c := range items {
 		if c.State == "running" {
-			counts.RunningContainers++
-		} else {
-			counts.StoppedContainers++
+			running++
 		}
 	}
-	return counts
+	return containertypes.StatusCounts{
+		RunningContainers: running,
+		StoppedContainers: len(items) - running,
+		TotalContainers:   len(items),
+	}
 }
 
 // CreateExec creates an exec instance in the container
@@ -2241,29 +1922,18 @@ func (s *ContainerService) CreateExec(ctx context.Context, containerID string, c
 		return "", fmt.Errorf("failed to connect to Docker: %w", err)
 	}
 
-	execConfig := client.ExecCreateOptions{
+	execResp, err := dockerClient.ExecCreate(ctx, containerID, client.ExecCreateOptions{
 		AttachStdin:  true,
 		AttachStdout: true,
 		AttachStderr: true,
 		TTY:          true,
 		Cmd:          cmd,
-	}
-
-	execResp, err := dockerClient.ExecCreate(ctx, containerID, execConfig)
+	})
 	if err != nil {
 		return "", fmt.Errorf("failed to create exec: %w", err)
 	}
 
 	return execResp.ID, nil
-}
-
-// ExecSession manages the lifecycle of a Docker exec session.
-type ExecSession struct {
-	execID       string
-	containerID  string
-	hijackedResp client.HijackedResponse
-	dockerClient *client.Client
-	closeOnce    sync.Once
 }
 
 func (e *ExecSession) Stdin() io.WriteCloser { return e.hijackedResp.Conn }
@@ -2310,18 +1980,11 @@ func (s *ContainerService) AttachExec(ctx context.Context, containerID, execID s
 	}, nil
 }
 
-type demuxedLogsInternal struct {
-	io.Reader
-
-	pipe *io.PipeReader
-	logs io.ReadCloser
-}
-
-func (d *demuxedLogsInternal) Close() error {
+func (d *demuxedLogs) Close() error {
 	return errors.Join(d.logs.Close(), d.pipe.Close())
 }
 
-func (s *ContainerService) openLogsInternal(ctx context.Context, containerID string, options client.ContainerLogsOptions) (io.ReadCloser, client.ContainerInspectResult, error) {
+func (s *ContainerService) openLogs(ctx context.Context, containerID string, options client.ContainerLogsOptions) (io.ReadCloser, client.ContainerInspectResult, error) {
 	dockerClient, err := s.dockerService.GetClient(ctx)
 	if err != nil {
 		return nil, client.ContainerInspectResult{}, fmt.Errorf("failed to connect to Docker: %w", err)
@@ -2340,7 +2003,7 @@ func (s *ContainerService) openLogsInternal(ctx context.Context, containerID str
 }
 
 func (s *ContainerService) StreamLogs(ctx context.Context, containerID string, logsChan chan<- string, follow bool, tail, since string, timestamps bool) error {
-	logs, containerInspect, err := s.openLogsInternal(ctx, containerID, client.ContainerLogsOptions{
+	logs, containerInspect, err := s.openLogs(ctx, containerID, client.ContainerLogsOptions{
 		ShowStdout: true,
 		ShowStderr: true,
 		Follow:     follow,
@@ -2353,14 +2016,13 @@ func (s *ContainerService) StreamLogs(ctx context.Context, containerID string, l
 	}
 	defer func() { _ = logs.Close() }()
 
-	isTTY := containerInspect.Container.Config != nil && containerInspect.Container.Config.Tty
-	return docker.StreamContainerLogs(ctx, logs, logsChan, follow, isTTY)
+	return docker.StreamContainerLogs(ctx, logs, logsChan, follow, kit.FromPtr(containerInspect.Container.Config).Tty)
 }
 
 // DownloadLogs returns every log line Docker retains for the container as a
 // single plain-text stream plus the attachment filename. Callers must Close it.
 func (s *ContainerService) DownloadLogs(ctx context.Context, containerID string) (io.ReadCloser, string, error) {
-	logs, containerInspect, err := s.openLogsInternal(ctx, containerID, client.ContainerLogsOptions{
+	logs, containerInspect, err := s.openLogs(ctx, containerID, client.ContainerLogsOptions{
 		ShowStdout: true,
 		ShowStderr: true,
 		Tail:       "all",
@@ -2371,7 +2033,7 @@ func (s *ContainerService) DownloadLogs(ctx context.Context, containerID string)
 	}
 
 	filename := "container-" + containerInspect.Container.ID[:min(12, len(containerInspect.Container.ID))] + "-logs.log"
-	if containerInspect.Container.Config != nil && containerInspect.Container.Config.Tty {
+	if kit.FromPtr(containerInspect.Container.Config).Tty {
 		return logs, filename, nil
 	}
 
@@ -2383,5 +2045,9 @@ func (s *ContainerService) DownloadLogs(ctx context.Context, containerID string)
 		}
 		_ = pw.CloseWithError(copyErr)
 	}()
-	return &demuxedLogsInternal{Reader: pr, pipe: pr, logs: logs}, filename, nil
+	return &demuxedLogs{
+		Reader: pr,
+		pipe:   pr,
+		logs:   logs,
+	}, filename, nil
 }

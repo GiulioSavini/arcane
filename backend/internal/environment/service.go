@@ -76,7 +76,7 @@ type EnvironmentService struct {
 	runtimeWatchers runtimeWatchers
 
 	// syncGate skips agent config pushes while the last accepted payload is unchanged.
-	syncGate utils.SyncGate
+	syncGate *utils.SyncGate
 
 	proxy    *proxy.Service
 	health   *health.Service
@@ -106,6 +106,34 @@ type VariableSyncer interface {
 	ForgetSyncState(envID string)
 }
 
+type resourceSync struct {
+	kind string
+	sync func(ctx context.Context, environmentID string) error
+}
+
+// DeploymentSnippets contains deployment configuration snippets for an environment.
+type DeploymentSnippets struct {
+	DockerRun     string
+	DockerCompose string
+	MTLS          *DeploymentSnippetMTLS
+}
+
+type DeploymentSnippetFile struct {
+	Name          string `json:"name" doc:"Suggested filename"`
+	Content       string `json:"content,omitempty" doc:"PEM file contents. Omitted for sensitive files such as private keys; use downloadUrl instead."`
+	DownloadURL   string `json:"downloadUrl,omitempty" doc:"Pairing-permission endpoint to download this file when content is withheld"`
+	Sensitive     bool   `json:"sensitive,omitempty" doc:"True when this file is sensitive and must be fetched via downloadUrl"`
+	ContainerPath string `json:"containerPath" doc:"Container mount path expected by the mTLS snippet"`
+	Permissions   string `json:"permissions" doc:"Suggested file mode"`
+}
+
+type DeploymentSnippetMTLS struct {
+	DockerRun     string                  `json:"dockerRun" doc:"Docker run snippet using Arcane-generated mTLS assets"`
+	DockerCompose string                  `json:"dockerCompose" doc:"Docker compose snippet using Arcane-generated mTLS assets"`
+	Files         []DeploymentSnippetFile `json:"files" doc:"Generated PEM files to place on the edge host"`
+	HostDirHint   string                  `json:"hostDirHint" doc:"Suggested host directory containing the generated PEM files"`
+}
+
 // ForgetSyncState makes the next sync of every resource group resend regardless of payload changes.
 func (s *EnvironmentService) ForgetSyncState(environmentID string) {
 	s.syncGate.Forget(environmentID)
@@ -122,11 +150,9 @@ func NewEnvironmentService(
 	settingsService *settings.SettingsService,
 	apiKeyService *apikey.ApiKeyService,
 ) *EnvironmentService {
-	if httpClient == nil {
-		httpClient = http.DefaultClient
-	}
-	s := &EnvironmentService{
-		syncGate:        utils.SyncGate{Expiry: SyncDeliveryExpiry},
+	syncGate := &utils.SyncGate{Expiry: SyncDeliveryExpiry}
+	return &EnvironmentService{
+		syncGate:        syncGate,
 		db:              db,
 		eventService:    eventService,
 		settingsService: settingsService,
@@ -141,14 +167,13 @@ func NewEnvironmentService(
 			WithMissingSharedCache().
 			WithJanitor().
 			Build(),
-		jobs:     entityjobs.New(environmentHealthJobPrefix, environmentHealthAdmissionScope),
-		health:   health.New(httpClient, dockerService),
-		snippets: snippets.New(eventService),
-		swarm:    swarm.New(apiKeyService),
+		jobs:            entityjobs.New(environmentHealthJobPrefix, environmentHealthAdmissionScope),
+		runtimeWatchers: runtimeWatchers{chans: make(map[int]chan struct{})},
+		proxy:           proxy.New(db, httpClient, settingsService, syncGate),
+		health:          health.New(httpClient, dockerService),
+		snippets:        snippets.New(eventService),
+		swarm:           swarm.New(apiKeyService),
 	}
-	s.proxy = proxy.New(db, httpClient, settingsService, &s.syncGate)
-
-	return s
 }
 
 // RegisterMetrics reports the arcane.environments gauge; only the manager calls it.
@@ -204,8 +229,16 @@ func (s *EnvironmentService) ResolveEdgeEnvironmentByToken(ctx context.Context, 
 		return "", errors.New("agent token required")
 	}
 
-	if envID, ok := s.edgeTokens.environmentID(token).Get(); ok {
+	staleEnvironmentID, wasCached := s.edgeTokens.byToken.Peek(token)
+	if envID, ok, _ := s.edgeTokens.byToken.Get(token); ok {
 		return envID, nil
+	}
+	if wasCached {
+		s.edgeTokens.mu.Lock()
+		if currentToken, indexed := s.edgeTokens.byEnvID[staleEnvironmentID]; indexed && currentToken == token {
+			delete(s.edgeTokens.byEnvID, staleEnvironmentID)
+		}
+		s.edgeTokens.mu.Unlock()
 	}
 
 	var env Environment
@@ -214,44 +247,37 @@ func (s *EnvironmentService) ResolveEdgeEnvironmentByToken(ctx context.Context, 
 		Where("is_edge = ?", true).
 		Where("access_token = ?", token).
 		First(&env).Error; err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			s.logEdgeTokenResolveMiss(ctx, token)
-			return "", errors.New("invalid agent token")
+		if !errors.Is(err, gorm.ErrRecordNotFound) {
+			return "", fmt.Errorf("failed to resolve edge environment by token: %w", err)
 		}
-		return "", fmt.Errorf("failed to resolve edge environment by token: %w", err)
+		// Log edge environment counts so a miss can be diagnosed; only the token's
+		// length and irreversible fingerprint are logged.
+		if slog.Default().Enabled(ctx, slog.LevelDebug) {
+			var totalEdgeEnvs int64
+			var edgeEnvsWithToken int64
+			totalEdgeEnvsErr := s.db.WithContext(ctx).Model(&Environment{}).Where("is_edge = ?", true).Count(&totalEdgeEnvs).Error
+			edgeEnvsWithTokenErr := s.db.WithContext(ctx).Model(&Environment{}).
+				Where("is_edge = ?", true).
+				Where("access_token IS NOT NULL AND access_token != ?", "").
+				Count(&edgeEnvsWithToken).Error
+
+			args := []any{
+				"token_length", len(token),
+				"token_fingerprint", remenv.RedactedTokenFingerprint(token),
+			}
+			if totalEdgeEnvsErr == nil {
+				args = append(args, "edge_envs_total", totalEdgeEnvs)
+			}
+			if edgeEnvsWithTokenErr == nil {
+				args = append(args, "edge_envs_with_access_token", edgeEnvsWithToken)
+			}
+			slog.DebugContext(ctx, "Edge agent token did not match any environment", args...)
+		}
+		return "", errors.New("invalid agent token")
 	}
 
-	s.edgeTokens.put(env.ID, token)
+	s.edgeTokens.sync(env.ID, token)
 	return env.ID, nil
-}
-
-// logEdgeTokenResolveMiss logs edge environment counts at debug level so a token
-// miss can be diagnosed; only the token's length and irreversible fingerprint are logged.
-func (s *EnvironmentService) logEdgeTokenResolveMiss(ctx context.Context, token string) {
-	if !slog.Default().Enabled(ctx, slog.LevelDebug) {
-		return
-	}
-
-	var totalEdgeEnvs int64
-	var edgeEnvsWithToken int64
-	totalEdgeEnvsErr := s.db.WithContext(ctx).Model(&Environment{}).Where("is_edge = ?", true).Count(&totalEdgeEnvs).Error
-	edgeEnvsWithTokenErr := s.db.WithContext(ctx).Model(&Environment{}).
-		Where("is_edge = ?", true).
-		Where("access_token IS NOT NULL AND access_token != ?", "").
-		Count(&edgeEnvsWithToken).Error
-
-	args := []any{
-		"token_length", len(token),
-		"token_fingerprint", remenv.RedactedTokenFingerprint(token),
-	}
-	if totalEdgeEnvsErr == nil {
-		args = append(args, "edge_envs_total", totalEdgeEnvs)
-	}
-	if edgeEnvsWithTokenErr == nil {
-		args = append(args, "edge_envs_with_access_token", edgeEnvsWithToken)
-	}
-
-	slog.DebugContext(ctx, "Edge agent token did not match any environment", args...)
 }
 
 // ResolveEnvironmentName returns an environment's display label; names are
@@ -261,7 +287,7 @@ func (s *EnvironmentService) ResolveEnvironmentName(ctx context.Context, environ
 		environmentID = LocalEnvironmentID
 	}
 	env, err := s.GetEnvironmentByIDCached(ctx, environmentID)
-	if err != nil || env == nil {
+	if err != nil {
 		if !errors.Is(err, context.Canceled) {
 			slog.WarnContext(ctx, "failed to resolve environment name", "environmentId", environmentID, "error", err)
 		}
@@ -290,7 +316,7 @@ func (s *EnvironmentService) EnsureLocalEnvironment(ctx context.Context, appUrl 
 	}
 
 	now := time.Now()
-	localEnv := &Environment{
+	if createLocalEnvironmentErr := s.db.WithContext(ctx).Create(&Environment{
 		ID:        LocalEnvironmentID,
 		CreatedAt: now,
 		UpdatedAt: new(now),
@@ -298,9 +324,7 @@ func (s *EnvironmentService) EnsureLocalEnvironment(ctx context.Context, appUrl 
 		ApiUrl:    appUrl,
 		Status:    string(EnvironmentStatusOnline),
 		Enabled:   true,
-	}
-
-	if createLocalEnvironmentErr := s.db.WithContext(ctx).Create(localEnv).Error; createLocalEnvironmentErr != nil {
+	}).Error; createLocalEnvironmentErr != nil {
 		return fmt.Errorf("failed to create local environment: %w", createLocalEnvironmentErr)
 	}
 	s.invalidateEnvironmentCache(LocalEnvironmentID)
@@ -313,16 +337,27 @@ func (s *EnvironmentService) CreateEnvironment(ctx context.Context, env *Environ
 	if err := normalization.Normalize(env); err != nil {
 		return nil, err
 	}
-	env.ID = uuid.New().String()
-
-	// Only set status to offline if not already set (e.g., API key flow sets it to pending)
-	if env.Status == "" {
-		env.Status = string(EnvironmentStatusOffline)
-	}
-
 	now := time.Now()
-	env.CreatedAt = now
-	env.UpdatedAt = new(now)
+	*env = Environment{ //exhaustruct:enforce
+		BaseModel: database.BaseModel{
+			ID:        uuid.New().String(),
+			CreatedAt: now,
+			UpdatedAt: new(now),
+		},
+		Name:   env.Name,
+		ApiUrl: env.ApiUrl,
+		// Only set status to offline if not already set (e.g., API key flow sets it to pending)
+		Status:              cmp.Or(env.Status, string(EnvironmentStatusOffline)),
+		Enabled:             env.Enabled,
+		IsEdge:              env.IsEdge,
+		Hidden:              env.Hidden,
+		LastSeen:            env.LastSeen,
+		LastEdgeTransport:   env.LastEdgeTransport,
+		AccessToken:         env.AccessToken,
+		ApiKeyID:            env.ApiKeyID,
+		ParentEnvironmentID: env.ParentEnvironmentID,
+		SwarmNodeID:         env.SwarmNodeID,
+	}
 
 	if err := s.db.WithContext(ctx).Create(env).Error; err != nil {
 		return nil, fmt.Errorf("failed to create environment: %w", err)
@@ -361,17 +396,15 @@ func (s *EnvironmentService) UpdateEnvironment(ctx context.Context, id string, u
 		return nil, err
 	}
 
-	var nextAPIURL *string
-	if rawAPIURL, ok := updates["api_url"]; ok {
-		if apiURL, isString := rawAPIURL.(string); isString {
-			nextAPIURL = new(apiURL)
-		}
-	}
-	_, accessTokenUpdated := updates["access_token"]
 	if validateCredentialTargetChangeErr := validation.ValidateCredentialTargetChange(
 		"environment API URL",
 		current.ApiUrl,
-		nextAPIURL,
+		func() *string {
+			if apiURL, isString := updates["api_url"].(string); isString {
+				return new(apiURL)
+			}
+			return nil
+		}(),
 		func(value string) string {
 			normalized, normalizeErr := httpx.NormalizeBaseURL(value)
 			if normalizeErr != nil {
@@ -379,8 +412,11 @@ func (s *EnvironmentService) UpdateEnvironment(ctx context.Context, id string, u
 			}
 			return normalized
 		},
-		map[string]bool{"accessToken": current.AccessToken != nil && *current.AccessToken != ""},
-		map[string]bool{"accessToken": accessTokenUpdated},
+		map[string]bool{"accessToken": kit.FromPtr(current.AccessToken) != ""},
+		map[string]bool{"accessToken": func() bool {
+			_, accessTokenUpdated := updates["access_token"]
+			return accessTokenUpdated
+		}()},
 	); validateCredentialTargetChangeErr != nil {
 		return nil, validateCredentialTargetChangeErr
 	}
@@ -469,9 +505,12 @@ func (s *EnvironmentService) DeleteEnvironment(ctx context.Context, id string, u
 		}
 	}
 
-	s.edgeTokens.invalidate(id)
+	s.edgeTokens.sync(id, "")
 	s.ForgetSyncState(id)
-	s.remoteEnvs.remove(id)
+	s.remoteEnvs.mu.Lock()
+	delete(s.remoteEnvs.envs, id)
+	s.remoteEnvs.revision++
+	s.remoteEnvs.mu.Unlock()
 	s.invalidateEnvironmentCache(id)
 	s.NotifyRuntimeStateChanged()
 
@@ -489,10 +528,6 @@ func (s *EnvironmentService) createEnvironmentEvent(
 	severity event.EventSeverity,
 	userID, username *string,
 ) {
-	if s.eventService == nil {
-		return
-	}
-
 	_, _ = s.eventService.CreateEvent(ctx, event.CreateEventRequest{
 		Type:          eventType,
 		Severity:      severity,
@@ -509,9 +544,6 @@ func (s *EnvironmentService) createEnvironmentEvent(
 
 // RegenerateEnvironmentApiKey rotates the key and updates its environment binding.
 func (s *EnvironmentService) RegenerateEnvironmentApiKey(ctx context.Context, env *Environment, userID, username string) (string, error) {
-	if env == nil {
-		return "", errors.New("environment is required")
-	}
 	return s.swarm.EnsureApiKey(ctx, env.ID, env.AccessToken, env.ApiKeyID, true,
 		func(linkCtx context.Context, apiKeyID, apiKey string) error {
 			return s.linkEnvironmentApiKey(linkCtx, env.ID, apiKeyID, apiKey, userID, username, env.Name)
@@ -522,14 +554,12 @@ func (s *EnvironmentService) linkEnvironmentApiKey(ctx context.Context, envID, n
 	// Persisted, cached, and returned keys must stay byte-identical: token lookup is direct equality.
 	apiKey = strings.TrimSpace(apiKey)
 
-	updates := map[string]any{
+	result := s.db.WithContext(ctx).Model(&Environment{}).Where("id = ?", envID).Updates(map[string]any{
 		"api_key_id":   newApiKeyID,
 		"access_token": apiKey,
 		"status":       string(EnvironmentStatusPending),
 		"last_seen":    nil,
-	}
-
-	result := s.db.WithContext(ctx).Model(&Environment{}).Where("id = ?", envID).Updates(updates)
+	})
 	if result.Error != nil {
 		return fmt.Errorf("failed to update environment with new API key: %w", result.Error)
 	}
@@ -541,14 +571,30 @@ func (s *EnvironmentService) linkEnvironmentApiKey(ctx context.Context, envID, n
 	s.NotifyRuntimeStateChanged()
 
 	s.edgeTokens.sync(envID, apiKey)
-	now := time.Now()
-	s.remoteEnvs.update(envID, func(env *Environment) {
-		env.ApiKeyID = &newApiKeyID
-		env.AccessToken = &apiKey
-		env.Status = string(EnvironmentStatusPending)
-		env.LastSeen = nil
-		env.UpdatedAt = &now
-	})
+	s.remoteEnvs.mu.Lock()
+	s.remoteEnvs.revision++
+	if envRecord, ok := s.remoteEnvs.envs[envID]; ok {
+		s.remoteEnvs.envs[envID] = Environment{ //exhaustruct:enforce
+			BaseModel: database.BaseModel{
+				ID:        envRecord.ID,
+				CreatedAt: envRecord.CreatedAt,
+				UpdatedAt: new(time.Now()),
+			},
+			Name:                envRecord.Name,
+			ApiUrl:              envRecord.ApiUrl,
+			Status:              string(EnvironmentStatusPending),
+			Enabled:             envRecord.Enabled,
+			IsEdge:              envRecord.IsEdge,
+			Hidden:              envRecord.Hidden,
+			LastSeen:            nil,
+			LastEdgeTransport:   envRecord.LastEdgeTransport,
+			AccessToken:         &apiKey,
+			ApiKeyID:            &newApiKeyID,
+			ParentEnvironmentID: envRecord.ParentEnvironmentID,
+			SwarmNodeID:         envRecord.SwarmNodeID,
+		}
+	}
+	s.remoteEnvs.mu.Unlock()
 
 	go s.createEnvironmentEvent(context.WithoutCancel(ctx), envID, envName, event.EventTypeEnvironmentApiKeyRegenerated,
 		"API Key Regenerated", "Environment API key was regenerated and status set to pending", event.EventSeverityInfo, new(userID), new(username))
@@ -640,11 +686,6 @@ func (s *EnvironmentService) SyncResourcesToEnvironment(ctx context.Context, env
 	})
 }
 
-type resourceSync struct {
-	kind string
-	sync func(ctx context.Context, environmentID string) error
-}
-
 // resourceSyncs lists the manager-owned resource groups pushed to remote environments.
 func (s *EnvironmentService) resourceSyncs() []resourceSync {
 	return []resourceSync{
@@ -671,10 +712,13 @@ const (
 // GetActiveRemoteEnvironmentSnapshot returns the latest in-process snapshot for
 // an enabled, visible, non-local remote environment.
 func (s *EnvironmentService) GetActiveRemoteEnvironmentSnapshot(environmentID string) mo.Option[Environment] {
-	if s == nil {
+	s.remoteEnvs.mu.RLock()
+	envRecord, ok := s.remoteEnvs.envs[environmentID]
+	s.remoteEnvs.mu.RUnlock()
+	if !ok || !isActiveRemoteEnvironment(envRecord) {
 		return mo.None[Environment]()
 	}
-	return s.remoteEnvs.get(environmentID)
+	return mo.Some(envRecord)
 }
 
 // ListActiveRemoteEnvironments returns every enabled, visible, non-local
@@ -728,16 +772,111 @@ func (s *EnvironmentService) GetEnvironmentByIDCached(ctx context.Context, id st
 // invalidateEnvironmentCache starts a new generation for id's stripe after a
 // committed write, orphaning its cached record and in-flight loads.
 func (s *EnvironmentService) invalidateEnvironmentCache(id string) {
-	if s == nil || s.environmentCache == nil {
-		return
-	}
 	previous := s.environmentGens[maphash.String(environmentCacheSeed, id)%environmentCacheStripes].Add(1) - 1
 	s.environmentCache.Delete(environmentCacheKey{gen: previous, id: id})
 }
 
 func (s *EnvironmentService) ListEnvironmentsPaginated(ctx context.Context, params pagination.QueryParams, accessibleEnvIDs []string) ([]environment.Environment, pagination.Response, error) {
 	if strings.TrimSpace(params.Filters["type"]) != "" {
-		return s.listEnvironmentsPaginatedWithRuntimeFilters(ctx, params, accessibleEnvIDs)
+		var envs []Environment
+		if err := s.db.WithContext(ctx).
+			Model(&Environment{}).
+			Where("hidden = ?", false).
+			Find(&envs).Error; err != nil {
+			return nil, pagination.Response{}, fmt.Errorf("failed to list environments: %w", err)
+		}
+
+		items, mapErr := mapping.MapSlice[Environment, environment.Environment](envs)
+		if mapErr != nil {
+			return nil, pagination.Response{}, fmt.Errorf("failed to map environments: %w", mapErr)
+		}
+
+		// nil means no restriction; non-nil restricts to the caller's accessible environments.
+		if accessibleEnvIDs != nil {
+			items = slices.DeleteFunc(items, func(item environment.Environment) bool { return !slices.Contains(accessibleEnvIDs, item.ID) })
+		}
+
+		rows := make([]environment.Environment, 0, len(items))
+		for _, item := range items {
+			rows = append(rows, ApplyEnvironmentRuntimeState(item))
+		}
+
+		result := pagination.Config[environment.Environment]{
+			SearchAccessors: []pagination.SearchAccessor[environment.Environment]{
+				func(env environment.Environment) (string, error) { return env.Name, nil },
+				func(env environment.Environment) (string, error) { return env.ApiUrl, nil },
+			},
+			SortBindings: []pagination.SortBinding[environment.Environment]{
+				{
+					Key: "id",
+					Fn: func(a, b environment.Environment) int {
+						return strings.Compare(strings.ToLower(a.ID), strings.ToLower(b.ID))
+					},
+				},
+				{
+					Key: "name",
+					Fn: func(a, b environment.Environment) int {
+						return strings.Compare(strings.ToLower(a.Name), strings.ToLower(b.Name))
+					},
+				},
+				{
+					Key: "status",
+					Fn: func(a, b environment.Environment) int {
+						return strings.Compare(strings.ToLower(a.Status), strings.ToLower(b.Status))
+					},
+				},
+				{
+					Key: "enabled",
+					Fn: func(a, b environment.Environment) int {
+						if a.Enabled == b.Enabled {
+							return 0
+						}
+						return kit.Ternary(a.Enabled, 1, -1)
+					},
+				},
+				{
+					Key: "apiUrl",
+					Fn: func(a, b environment.Environment) int {
+						return strings.Compare(strings.ToLower(a.ApiUrl), strings.ToLower(b.ApiUrl))
+					},
+				},
+			},
+			FilterAccessors: []pagination.FilterAccessor[environment.Environment]{
+				{
+					Key: "status",
+					Fn: func(item environment.Environment, filterValue string) bool {
+						return strings.EqualFold(item.Status, strings.TrimSpace(filterValue))
+					},
+				},
+				{
+					Key: "enabled",
+					Fn: func(item environment.Environment, filterValue string) bool {
+						value, valid := kit.ParseBool(filterValue)
+						return !valid || item.Enabled == value
+					},
+				},
+				{
+					Key: "type",
+					Fn: func(item environment.Environment, filterValue string) bool {
+						if !item.IsEdge {
+							return strings.ToLower(strings.TrimSpace(filterValue)) == "http"
+						}
+						// Disconnected or poll-only agents classify by the transport they last used.
+						switch strings.ToLower(strings.TrimSpace(kit.Ternary(kit.FromPtr(item.Connected) && item.EdgeTransport != nil,
+							kit.FromPtr(item.EdgeTransport), kit.FromPtr(item.LastEdgeTransport)))) {
+						case edge.EdgeTransportWebSocket:
+							return strings.ToLower(strings.TrimSpace(filterValue)) == "websocket"
+						case edge.EdgeTransportGRPC:
+							return strings.ToLower(strings.TrimSpace(filterValue)) == "grpc"
+						default:
+							return strings.ToLower(strings.TrimSpace(filterValue)) == "edge"
+						}
+					},
+				},
+			},
+		}.SearchOrderAndPaginate(rows, params)
+
+		return result.Items, pagination.BuildResponse(result.TotalCount, result.TotalAvailable, params), nil
 	}
 
 	var envs []Environment
@@ -774,120 +913,6 @@ func (s *EnvironmentService) ListEnvironmentsPaginated(ctx context.Context, para
 	}
 
 	return out, paginationResp, nil
-}
-
-func (s *EnvironmentService) listEnvironmentsPaginatedWithRuntimeFilters(
-	ctx context.Context,
-	params pagination.QueryParams,
-	accessibleEnvIDs []string,
-) ([]environment.Environment, pagination.Response, error) {
-	var envs []Environment
-	if err := s.db.WithContext(ctx).
-		Model(&Environment{}).
-		Where("hidden = ?", false).
-		Find(&envs).Error; err != nil {
-		return nil, pagination.Response{}, fmt.Errorf("failed to list environments: %w", err)
-	}
-
-	items, mapErr := mapping.MapSlice[Environment, environment.Environment](envs)
-	if mapErr != nil {
-		return nil, pagination.Response{}, fmt.Errorf("failed to map environments: %w", mapErr)
-	}
-
-	// nil means no restriction; non-nil restricts to the caller's accessible environments.
-	if accessibleEnvIDs != nil {
-		items = slices.DeleteFunc(items, func(item environment.Environment) bool { return !slices.Contains(accessibleEnvIDs, item.ID) })
-	}
-
-	for i := range items {
-		ApplyEnvironmentRuntimeState(&items[i])
-	}
-
-	config := pagination.Config[environment.Environment]{
-		SearchAccessors: []pagination.SearchAccessor[environment.Environment]{
-			func(env environment.Environment) (string, error) { return env.Name, nil },
-			func(env environment.Environment) (string, error) { return env.ApiUrl, nil },
-		},
-		SortBindings: []pagination.SortBinding[environment.Environment]{
-			{
-				Key: "id",
-				Fn: func(a, b environment.Environment) int {
-					return strings.Compare(strings.ToLower(a.ID), strings.ToLower(b.ID))
-				},
-			},
-			{
-				Key: "name",
-				Fn: func(a, b environment.Environment) int {
-					return strings.Compare(strings.ToLower(a.Name), strings.ToLower(b.Name))
-				},
-			},
-			{
-				Key: "status",
-				Fn: func(a, b environment.Environment) int {
-					return strings.Compare(strings.ToLower(a.Status), strings.ToLower(b.Status))
-				},
-			},
-			{
-				Key: "enabled",
-				Fn: func(a, b environment.Environment) int {
-					if a.Enabled == b.Enabled {
-						return 0
-					}
-					return kit.Ternary(a.Enabled, 1, -1)
-				},
-			},
-			{
-				Key: "apiUrl",
-				Fn: func(a, b environment.Environment) int {
-					return strings.Compare(strings.ToLower(a.ApiUrl), strings.ToLower(b.ApiUrl))
-				},
-			},
-		},
-		FilterAccessors: []pagination.FilterAccessor[environment.Environment]{
-			{
-				Key: "status",
-				Fn: func(item environment.Environment, filterValue string) bool {
-					return strings.EqualFold(item.Status, strings.TrimSpace(filterValue))
-				},
-			},
-			{
-				Key: "enabled",
-				Fn: func(item environment.Environment, filterValue string) bool {
-					value, valid := kit.ParseBool(filterValue)
-					return !valid || item.Enabled == value
-				},
-			},
-			{
-				Key: "type",
-				Fn: func(item environment.Environment, filterValue string) bool {
-					typeKey := "http"
-					if item.IsEdge {
-						// Disconnected or poll-only agents classify by the transport they last used.
-						transport := ""
-						if item.Connected != nil && *item.Connected && item.EdgeTransport != nil {
-							transport = *item.EdgeTransport
-						} else if item.LastEdgeTransport != nil {
-							transport = *item.LastEdgeTransport
-						}
-						switch strings.ToLower(strings.TrimSpace(transport)) {
-						case edge.EdgeTransportWebSocket:
-							typeKey = "websocket"
-						case edge.EdgeTransportGRPC:
-							typeKey = "grpc"
-						default:
-							typeKey = "edge"
-						}
-					}
-					return typeKey == strings.ToLower(strings.TrimSpace(filterValue))
-				},
-			},
-		},
-	}
-
-	result := config.SearchOrderAndPaginate(items, params)
-	paginationResp := pagination.BuildResponse(result.TotalCount, result.TotalAvailable, params)
-
-	return result.Items, paginationResp, nil
 }
 
 // ListVisibleEnvironments returns persisted rows; callers apply ApplyEnvironmentRuntimeState.
@@ -961,15 +986,35 @@ func (s *EnvironmentService) ListRemoteEnvironments(ctx context.Context) ([]Envi
 // SubscribeRuntimeChanges returns a channel that receives a coalesced wake-up
 // whenever environment liveness may have changed, plus a function to release it.
 func (s *EnvironmentService) SubscribeRuntimeChanges() (<-chan struct{}, func()) {
-	return s.runtimeWatchers.subscribe()
+	w := &s.runtimeWatchers
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	w.seq++
+	id := w.seq
+	// Capacity 1: watchers read live state, so a second pending signal is redundant.
+	ch := make(chan struct{}, 1)
+	w.chans[id] = ch
+
+	return ch, func() {
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		delete(w.chans, id)
+	}
 }
 
-// NotifyRuntimeStateChanged wakes every runtime watcher.
+// NotifyRuntimeStateChanged wakes every runtime watcher without blocking, so
+// tunnel callbacks may call it.
 func (s *EnvironmentService) NotifyRuntimeStateChanged() {
-	if s == nil {
-		return
+	s.runtimeWatchers.mu.Lock()
+	defer s.runtimeWatchers.mu.Unlock()
+
+	for _, ch := range s.runtimeWatchers.chans {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
 	}
-	s.runtimeWatchers.notify()
 }
 
 const (
@@ -1038,15 +1083,14 @@ func (s *EnvironmentService) RunHealthChecksNow(ctx context.Context) error {
 		return err
 	}
 	parent, hasParent := jobcontext.Run(ctx)
-	request := scheduler.Request{EnvironmentID: LocalEnvironmentID, Trigger: "internal"}
-	if hasParent {
-		request.Trigger = parent.Trigger
-		request.RequestedBy = parent.RequestedBy
-		request.RequestedWithKey = parent.RequestedWithKey
-	}
 	for _, id := range ids {
-		request.JobID = s.jobs.JobName(id)
-		if _, submitErr := s.jobs.Scheduler().Submit(ctx, request); submitErr != nil {
+		if _, submitErr := s.jobs.Scheduler().Submit(ctx, scheduler.Request{
+			JobID:            s.jobs.JobName(id),
+			EnvironmentID:    LocalEnvironmentID,
+			Trigger:          kit.Ternary(hasParent, parent.Trigger, "internal"),
+			RequestedBy:      parent.RequestedBy,
+			RequestedWithKey: parent.RequestedWithKey,
+		}); submitErr != nil {
 			return submitErr
 		}
 	}
@@ -1148,11 +1192,7 @@ func (s *EnvironmentService) TestConnection(ctx context.Context, id string, cust
 		return "error", err
 	}
 
-	apiURL := envRecord.ApiUrl
-	if customApiUrl != nil {
-		apiURL = *customApiUrl
-	}
-	status, err := s.health.Probe(ctx, id, apiURL, envRecord.IsEdge, customApiUrl != nil)
+	status, err := s.health.Probe(ctx, id, mo.PointerToOption(customApiUrl).OrElse(envRecord.ApiUrl), envRecord.IsEdge, customApiUrl != nil)
 	if customApiUrl == nil {
 		if updateErr := s.updateEnvironmentStatus(ctx, id, status); updateErr != nil {
 			slog.WarnContext(ctx, "Failed to persist environment status", "environmentId", id, "status", status, "error", updateErr)
@@ -1248,65 +1288,48 @@ func (s *EnvironmentService) UpdateEnvironmentConnectionState(ctx context.Contex
 
 // ApplyEnvironmentRuntimeState overlays in-memory tunnel and poll state onto an
 // edge environment without mutating persisted state.
-func ApplyEnvironmentRuntimeState(env *environment.Environment) {
-	if env == nil || !env.IsEdge {
-		return
+func ApplyEnvironmentRuntimeState(env environment.Environment) environment.Environment {
+	if !env.IsEdge {
+		return env
 	}
 
-	connected := false
-	env.Connected = &connected
-	env.ConnectedAt = nil
-	env.LastHeartbeat = nil
-	env.LastPollAt = nil
-	env.EdgeTransport = nil
-	env.EdgeSecurityMode = nil
-	env.EdgeSessionID = nil
-	env.EdgeAgentInstance = nil
-	env.EdgeCapabilities = nil
-	env.EdgeDataPlane = nil
-	env.EdgeRoundTripMs = nil
-	env.EdgeOpenStreams = nil
-
-	if pollState, ok := edge.GetPollRuntimeRegistry().Get(env.ID, time.Now()).Get(); ok {
-		env.LastPollAt = pollState.LastPollAt
-	}
-
-	if runtimeState, ok := edge.GetTunnelRuntimeState(env.ID).Get(); ok {
-		connected = true
-		env.Connected = &connected
-		env.Status = string(EnvironmentStatusOnline)
-		env.ConnectedAt = runtimeState.ConnectedAt
-		env.LastHeartbeat = runtimeState.LastHeartbeat
-		if runtimeState.SecurityMode != "" {
-			env.EdgeSecurityMode = &runtimeState.SecurityMode
-		}
-		if runtimeState.SessionID != "" {
-			env.EdgeSessionID = &runtimeState.SessionID
-		}
-		if runtimeState.AgentInstance != "" {
-			env.EdgeAgentInstance = &runtimeState.AgentInstance
-		}
-		if len(runtimeState.Capabilities) > 0 {
-			env.EdgeCapabilities = append([]string(nil), runtimeState.Capabilities...)
-		}
-		if runtimeState.Transport != "" {
-			env.EdgeTransport = &runtimeState.Transport
-		}
-		env.EdgeDataPlane = &runtimeState.DataPlane
-		env.EdgeOpenStreams = &runtimeState.OpenStreams
-		if runtimeState.RoundTripTime != nil {
-			env.EdgeRoundTripMs = new(float64(runtimeState.RoundTripTime.Microseconds()) / 1000)
-		}
-		return
-	}
-
-	if env.LastPollAt != nil {
-		env.Status = string(EnvironmentStatusStandby)
-		return
-	}
-
-	if env.Status != string(EnvironmentStatusPending) {
-		env.Status = string(EnvironmentStatusOffline)
+	pollState, _ := edge.GetPollRuntimeRegistry().Get(env.ID, time.Now()).Get()
+	runtimeState, connected := edge.GetTunnelRuntimeState(env.ID).Get()
+	return environment.Environment{ //exhaustruct:enforce
+		ID:     env.ID,
+		Name:   env.Name,
+		ApiUrl: env.ApiUrl,
+		Status: func() string {
+			switch {
+			case connected:
+				return string(EnvironmentStatusOnline)
+			case pollState.LastPollAt != nil:
+				return string(EnvironmentStatusStandby)
+			case env.Status != string(EnvironmentStatusPending):
+				return string(EnvironmentStatusOffline)
+			default:
+				return env.Status
+			}
+		}(),
+		Enabled:           env.Enabled,
+		IsEdge:            env.IsEdge,
+		LastSeen:          env.LastSeen,
+		EdgeTransport:     kit.Ternary(kit.FromPtr(runtimeState).Transport != "", new(kit.FromPtr(runtimeState).Transport), nil),
+		LastEdgeTransport: env.LastEdgeTransport,
+		EdgeSecurityMode:  kit.Ternary(kit.FromPtr(runtimeState).SecurityMode != "", new(kit.FromPtr(runtimeState).SecurityMode), nil),
+		EdgeSessionID:     kit.Ternary(kit.FromPtr(runtimeState).SessionID != "", new(kit.FromPtr(runtimeState).SessionID), nil),
+		EdgeAgentInstance: kit.Ternary(kit.FromPtr(runtimeState).AgentInstance != "", new(kit.FromPtr(runtimeState).AgentInstance), nil),
+		EdgeCapabilities:  kit.Ternary(len(kit.FromPtr(runtimeState).Capabilities) > 0, slices.Clone(kit.FromPtr(runtimeState).Capabilities), nil),
+		EdgeDataPlane:     kit.Ternary(connected, new(kit.FromPtr(runtimeState).DataPlane), nil),
+		EdgeRoundTripMs: kit.Ternary(kit.FromPtr(runtimeState).RoundTripTime != nil,
+			new(float64(kit.FromPtr(kit.FromPtr(runtimeState).RoundTripTime).Microseconds())/1000), nil),
+		EdgeOpenStreams:     kit.Ternary(connected, new(kit.FromPtr(runtimeState).OpenStreams), nil),
+		Connected:           new(connected),
+		ConnectedAt:         kit.FromPtr(runtimeState).ConnectedAt,
+		LastHeartbeat:       kit.FromPtr(runtimeState).LastHeartbeat,
+		LastPollAt:          pollState.LastPollAt,
+		EdgeMTLSCertificate: env.EdgeMTLSCertificate,
+		ApiKey:              env.ApiKey,
 	}
 }
 
@@ -1350,7 +1373,7 @@ func (s *EnvironmentService) syncToRemoteEnvironments(ctx context.Context, kind 
 
 	var failedCount int
 	for _, env := range envs {
-		if env.AccessToken == nil || strings.TrimSpace(*env.AccessToken) == "" {
+		if strings.TrimSpace(kit.FromPtr(env.AccessToken)) == "" {
 			slog.DebugContext(ctx, "Skipping sync for environment without access token", "kind", kind, "environmentId", env.ID, "environmentName", env.Name)
 			continue
 		}
@@ -1375,12 +1398,11 @@ func (s *EnvironmentService) CheckS3DestinationReferences(ctx context.Context, d
 	}
 	for _, env := range envs {
 		// Environments without an access token never receive destination syncs.
-		if env.AccessToken == nil || strings.TrimSpace(*env.AccessToken) == "" {
+		if strings.TrimSpace(kit.FromPtr(env.AccessToken)) == "" {
 			continue
 		}
 		var result backup.S3DestinationUsage
-		path := "/api/backups/s3/" + url.PathEscape(destinationID) + "/in-use"
-		if proxyErr := s.ProxyJSONRequestForEnvironment(ctx, env, http.MethodGet, path, nil, &result); proxyErr != nil {
+		if proxyErr := s.ProxyJSONRequestForEnvironment(ctx, env, http.MethodGet, "/api/backups/s3/"+url.PathEscape(destinationID)+"/in-use", nil, &result); proxyErr != nil {
 			return fmt.Errorf("cannot verify S3 destination references on environment %s; restore connectivity before deleting: %w", env.Name, proxyErr)
 		}
 		if result.InUse {
@@ -1446,29 +1468,6 @@ func (s *EnvironmentService) ProxyRequest(ctx context.Context, envID, method, pa
 	return resp.Body, resp.StatusCode, nil
 }
 
-// DeploymentSnippets contains deployment configuration snippets for an environment.
-type DeploymentSnippets struct {
-	DockerRun     string
-	DockerCompose string
-	MTLS          *DeploymentSnippetMTLS
-}
-
-type DeploymentSnippetFile struct {
-	Name          string `json:"name" doc:"Suggested filename"`
-	Content       string `json:"content,omitempty" doc:"PEM file contents. Omitted for sensitive files such as private keys; use downloadUrl instead."`
-	DownloadURL   string `json:"downloadUrl,omitempty" doc:"Pairing-permission endpoint to download this file when content is withheld"`
-	Sensitive     bool   `json:"sensitive,omitempty" doc:"True when this file is sensitive and must be fetched via downloadUrl"`
-	ContainerPath string `json:"containerPath" doc:"Container mount path expected by the mTLS snippet"`
-	Permissions   string `json:"permissions" doc:"Suggested file mode"`
-}
-
-type DeploymentSnippetMTLS struct {
-	DockerRun     string                  `json:"dockerRun" doc:"Docker run snippet using Arcane-generated mTLS assets"`
-	DockerCompose string                  `json:"dockerCompose" doc:"Docker compose snippet using Arcane-generated mTLS assets"`
-	Files         []DeploymentSnippetFile `json:"files" doc:"Generated PEM files to place on the edge host"`
-	HostDirHint   string                  `json:"hostDirHint" doc:"Suggested host directory containing the generated PEM files"`
-}
-
 // GenerateDeploymentSnippets generates Docker deployment snippets for an environment.
 func (s *EnvironmentService) GenerateDeploymentSnippets(ctx context.Context, envID, managerURL, agentURL, apiKey string) (*DeploymentSnippets, error) {
 	dockerRun, dockerCompose := snippets.Direct(strings.TrimRight(managerURL, "/"), agentURL, apiKey)
@@ -1483,24 +1482,45 @@ func (s *EnvironmentService) GenerateDeploymentSnippets(ctx context.Context, env
 func (s *EnvironmentService) GenerateEdgeDeploymentSnippets(ctx context.Context, envID, managerURL, apiKey string, edgeCfg *edge.Config) (*DeploymentSnippets, error) {
 	managerURL = strings.TrimRight(managerURL, "/")
 	dockerRun, dockerCompose := snippets.Edge(managerURL, apiKey)
-	result := &DeploymentSnippets{
-		DockerRun:     dockerRun,
-		DockerCompose: dockerCompose,
-	}
-
-	envName := ""
-	if s != nil && s.db != nil {
-		if env, getErr := s.GetEnvironmentByID(ctx, envID); getErr == nil && env != nil {
-			envName = env.Name
-		}
-	}
-	if edgeCfg != nil && strings.TrimSpace(edgeCfg.AppURL) == "" {
-		edgeCfg.AppURL = managerURL
-	}
-
-	generatedAssets, mtlsDockerRun, mtlsDockerCompose := s.snippets.GenerateMTLS(ctx, edgeCfg, envID, envName, managerURL, apiKey)
+	generatedAssets, mtlsDockerRun, mtlsDockerCompose := s.snippets.GenerateMTLS(ctx,
+		func() *edge.Config {
+			if edgeCfg == nil {
+				return nil
+			}
+			return &edge.Config{ //exhaustruct:enforce
+				EdgeAgent:             edgeCfg.EdgeAgent,
+				EdgeTransport:         edgeCfg.EdgeTransport,
+				EdgeReconnectInterval: edgeCfg.EdgeReconnectInterval,
+				EdgeMTLSMode:          edgeCfg.EdgeMTLSMode,
+				EdgeMTLSCAFile:        edgeCfg.EdgeMTLSCAFile,
+				EdgeMTLSCertFile:      edgeCfg.EdgeMTLSCertFile,
+				EdgeMTLSKeyFile:       edgeCfg.EdgeMTLSKeyFile,
+				EdgeMTLSServerName:    edgeCfg.EdgeMTLSServerName,
+				EdgeMTLSAssetsDir:     edgeCfg.EdgeMTLSAssetsDir,
+				AppURL:                kit.Ternary(strings.TrimSpace(edgeCfg.AppURL) == "", managerURL, edgeCfg.AppURL),
+				ManagerApiUrl:         edgeCfg.ManagerApiUrl,
+				AgentToken:            edgeCfg.AgentToken,
+				Port:                  edgeCfg.Port,
+				Listen:                edgeCfg.Listen,
+				EdgeMuxDisabled:       edgeCfg.EdgeMuxDisabled,
+			}
+		}(),
+		envID,
+		func() string {
+			env, getErr := s.GetEnvironmentByID(ctx, envID)
+			if getErr != nil {
+				return ""
+			}
+			return env.Name
+		}(),
+		managerURL,
+		apiKey,
+	)
 	if generatedAssets == nil {
-		return result, nil
+		return &DeploymentSnippets{
+			DockerRun:     dockerRun,
+			DockerCompose: dockerCompose,
+		}, nil
 	}
 
 	files := make([]DeploymentSnippetFile, 0, len(generatedAssets.Files))
@@ -1512,13 +1532,16 @@ func (s *EnvironmentService) GenerateEdgeDeploymentSnippets(ctx context.Context,
 			Permissions:   file.Permissions,
 		})
 	}
-	result.MTLS = &DeploymentSnippetMTLS{
-		DockerRun:     mtlsDockerRun,
-		DockerCompose: mtlsDockerCompose,
-		Files:         files,
-		HostDirHint:   strings.TrimSpace(generatedAssets.HostDirHint),
-	}
-	return result, nil
+	return &DeploymentSnippets{
+		DockerRun:     dockerRun,
+		DockerCompose: dockerCompose,
+		MTLS: &DeploymentSnippetMTLS{
+			DockerRun:     mtlsDockerRun,
+			DockerCompose: mtlsDockerCompose,
+			Files:         files,
+			HostDirHint:   strings.TrimSpace(generatedAssets.HostDirHint),
+		},
+	}, nil
 }
 
 func (s *EnvironmentService) ListSwarmNodeAgentEnvironments(ctx context.Context, parentEnvironmentID string) ([]Environment, error) {

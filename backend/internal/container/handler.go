@@ -2,11 +2,9 @@ package container
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"maps"
-	"net/netip"
 	"strings"
 
 	"github.com/containerd/errdefs"
@@ -138,6 +136,16 @@ type GenerateComposeInput struct {
 	Body          container.GenerateComposeRequest
 }
 
+type containerActionConfig struct {
+	ActivityType    activitytypes.Type
+	Step            string
+	StartMessage    string
+	CompleteMessage string
+	SuccessMessage  string
+	Action          func(context.Context, string, usertypes.Actor) error
+	Error           func(error) error
+}
+
 func (h *ContainerHandler) ListContainers(ctx context.Context, input *ListContainersInput) (*ListContainersOutput, error) {
 	params := handlerutil.PaginationParams(input.Start, input.Limit, input.Sort, input.Order, input.Search)
 	if input.Updates != "" {
@@ -187,225 +195,23 @@ func (h *ContainerHandler) GetContainerStatusCounts(ctx context.Context, input *
 
 	containers = FilterExcludedContainers(containers, input.IncludeInternal, input.IncludeHidden)
 
-	running, stopped := 0, 0
+	running := 0
 	for _, c := range containers {
 		if c.State == "running" {
 			running++
-		} else {
-			stopped++
 		}
 	}
-	total := len(containers)
 
 	return &handlerutil.Out[container.StatusCounts]{
 		Body: base.ApiResponse[container.StatusCounts]{
 			Success: true,
 			Data: container.StatusCounts{
 				RunningContainers: running,
-				StoppedContainers: stopped,
-				TotalContainers:   total,
+				StoppedContainers: len(containers) - running,
+				TotalContainers:   len(containers),
 			},
 		},
 	}, nil
-}
-
-func parsePortSpec(spec string) (network.Port, error) {
-	if strings.Contains(spec, "/") {
-		return network.ParsePort(spec)
-	}
-
-	return network.ParsePort(spec + "/tcp")
-}
-
-func buildCreateLabels(body container.Create) map[string]string {
-	labels := map[string]string{
-		"com.arcane.created": "true",
-	}
-	maps.Copy(labels, body.Labels)
-
-	return labels
-}
-
-func buildContainerConfig(body container.Create) *dockercontainer.Config {
-	return &dockercontainer.Config{
-		Image:           body.Image,
-		Cmd:             kit.Ternary(len(body.Command) > 0, body.Command, body.Cmd),
-		Entrypoint:      body.Entrypoint,
-		WorkingDir:      body.WorkingDir,
-		User:            body.User,
-		Env:             kit.Ternary(len(body.Environment) > 0, body.Environment, body.Env),
-		ExposedPorts:    network.PortSet{},
-		Labels:          buildCreateLabels(body),
-		Healthcheck:     healthConfigFromCreateInternal(body.Healthcheck),
-		Hostname:        body.Hostname,
-		Domainname:      body.Domainname,
-		AttachStdout:    body.AttachStdout,
-		AttachStderr:    body.AttachStderr,
-		AttachStdin:     body.AttachStdin,
-		Tty:             body.Tty,
-		OpenStdin:       body.OpenStdin,
-		StdinOnce:       body.StdinOnce,
-		NetworkDisabled: body.NetworkDisabled,
-	}
-}
-
-func applyLegacyPortBindings(body container.Create, config *dockercontainer.Config, portBindings network.PortMap) error {
-	for containerPort, hostPort := range body.Ports {
-		port, err := network.ParsePort(containerPort + "/tcp")
-		if err != nil {
-			return err
-		}
-		config.ExposedPorts[port] = struct{}{}
-		portBindings[port] = []network.PortBinding{{HostPort: hostPort}}
-	}
-
-	return nil
-}
-
-func applyExposedPorts(exposedPorts map[string]struct{}, config *dockercontainer.Config) error {
-	for portSpec := range exposedPorts {
-		port, err := parsePortSpec(portSpec)
-		if err != nil {
-			return err
-		}
-		config.ExposedPorts[port] = struct{}{}
-	}
-
-	return nil
-}
-
-func buildHostConfigBase(body container.Create, portBindings network.PortMap) *dockercontainer.HostConfig {
-	return &dockercontainer.HostConfig{
-		Binds:         body.Volumes,
-		PortBindings:  portBindings,
-		Privileged:    body.Privileged,
-		AutoRemove:    body.AutoRemove,
-		RestartPolicy: dockercontainer.RestartPolicy{Name: dockercontainer.RestartPolicyMode(body.RestartPolicy)},
-	}
-}
-
-func applyHostConfigPortBindings(config *dockercontainer.Config, portBindings network.PortMap, bindings map[string][]container.PortBindingCreate) error {
-	for portSpec, bindingList := range bindings {
-		port, err := parsePortSpec(portSpec)
-		if err != nil {
-			return err
-		}
-		config.ExposedPorts[port] = struct{}{}
-		for _, binding := range bindingList {
-			pb := network.PortBinding{HostPort: binding.HostPort}
-			if hostIP := strings.TrimSpace(binding.HostIP); hostIP != "" {
-				parsedIP, parseAddrErr := netip.ParseAddr(hostIP)
-				if parseAddrErr != nil {
-					return parseAddrErr
-				}
-				pb.HostIP = parsedIP
-			}
-			portBindings[port] = append(portBindings[port], pb)
-		}
-	}
-
-	return nil
-}
-
-func applyHostConfigSettings(hostConfig *dockercontainer.HostConfig, input *container.HostConfigCreate) {
-	if input == nil {
-		return
-	}
-
-	if input.NetworkMode != "" {
-		hostConfig.NetworkMode = dockercontainer.NetworkMode(input.NetworkMode)
-	}
-	if input.Privileged != nil {
-		hostConfig.Privileged = *input.Privileged
-	}
-	if input.AutoRemove != nil {
-		hostConfig.AutoRemove = *input.AutoRemove
-	}
-	if input.ReadonlyRootfs != nil {
-		hostConfig.ReadonlyRootfs = *input.ReadonlyRootfs
-	}
-	if input.PublishAllPorts != nil {
-		hostConfig.PublishAllPorts = *input.PublishAllPorts
-	}
-	if input.RestartPolicy != nil {
-		hostConfig.RestartPolicy = dockercontainer.RestartPolicy{
-			Name:              dockercontainer.RestartPolicyMode(input.RestartPolicy.Name),
-			MaximumRetryCount: input.RestartPolicy.MaximumRetryCount,
-		}
-	}
-	if input.Memory > 0 {
-		hostConfig.Memory = input.Memory
-	}
-	if input.MemorySwap > 0 {
-		hostConfig.MemorySwap = input.MemorySwap
-	}
-	if input.NanoCPUs > 0 {
-		hostConfig.NanoCPUs = input.NanoCPUs
-	}
-	if input.CPUShares > 0 {
-		hostConfig.CPUShares = input.CPUShares
-	}
-	if len(input.CapAdd) > 0 {
-		hostConfig.CapAdd = input.CapAdd
-	}
-	if len(input.CapDrop) > 0 {
-		hostConfig.CapDrop = input.CapDrop
-	}
-	if len(input.Mounts) > 0 {
-		hostConfig.Mounts = mountsFromCreateInternal(input.Mounts)
-	}
-}
-
-func applyHostConfigOverrides(body container.Create, config *dockercontainer.Config, hostConfig *dockercontainer.HostConfig, portBindings network.PortMap) error {
-	if body.HostConfig == nil {
-		return nil
-	}
-
-	if len(body.HostConfig.Binds) > 0 {
-		hostConfig.Binds = body.HostConfig.Binds
-	}
-
-	if len(body.HostConfig.PortBindings) > 0 {
-		if err := applyHostConfigPortBindings(config, portBindings, body.HostConfig.PortBindings); err != nil {
-			return err
-		}
-	}
-
-	applyHostConfigSettings(hostConfig, body.HostConfig)
-	return nil
-}
-
-func applyLegacyResourceLimits(body container.Create, hostConfig *dockercontainer.HostConfig) {
-	if body.Memory > 0 {
-		hostConfig.Memory = body.Memory
-	}
-	if body.CPUs > 0 {
-		hostConfig.NanoCPUs = int64(body.CPUs * 1e9)
-	}
-}
-
-func buildNetworkingConfig(body container.Create) (*network.NetworkingConfig, error) {
-	if body.NetworkingConfig != nil && len(body.NetworkingConfig.EndpointsConfig) > 0 {
-		networkingConfig := &network.NetworkingConfig{EndpointsConfig: make(map[string]*network.EndpointSettings)}
-		for name, endpoint := range body.NetworkingConfig.EndpointsConfig {
-			ipam, err := endpointIPAMFromCreateInternal(endpoint)
-			if err != nil {
-				return nil, err
-			}
-			networkingConfig.EndpointsConfig[name] = &network.EndpointSettings{Aliases: endpoint.Aliases, IPAMConfig: ipam}
-		}
-		return networkingConfig, nil
-	}
-
-	if len(body.Networks) > 0 {
-		networkingConfig := &network.NetworkingConfig{EndpointsConfig: make(map[string]*network.EndpointSettings)}
-		for _, net := range body.Networks {
-			networkingConfig.EndpointsConfig[net] = &network.EndpointSettings{}
-		}
-		return networkingConfig, nil
-	}
-
-	return nil, nil
 }
 
 func (h *ContainerHandler) CreateContainer(ctx context.Context, input *CreateContainerInput) (*handlerutil.Out[container.Created], error) {
@@ -414,43 +220,119 @@ func (h *ContainerHandler) CreateContainer(ctx context.Context, input *CreateCon
 		return nil, err
 	}
 
-	config := buildContainerConfig(input.Body)
+	exposedPorts := network.PortSet{}
 	portBindings := network.PortMap{}
-	if applyLegacyPortBindingsErr := applyLegacyPortBindings(input.Body, config, portBindings); applyLegacyPortBindingsErr != nil {
-		return nil, huma.Error400BadRequest("Invalid port format: " + applyLegacyPortBindingsErr.Error())
+	for containerPort, hostPort := range input.Body.Ports {
+		port, parsePortErr := network.ParsePort(containerPort + "/tcp")
+		if parsePortErr != nil {
+			return nil, huma.Error400BadRequest("Invalid port format: " + parsePortErr.Error())
+		}
+		exposedPorts[port] = struct{}{}
+		portBindings[port] = []network.PortBinding{{HostPort: hostPort}}
 	}
-	if applyExposedPortsErr := applyExposedPorts(input.Body.ExposedPorts, config); applyExposedPortsErr != nil {
-		return nil, huma.Error400BadRequest("Invalid port format: " + applyExposedPortsErr.Error())
+	for portSpec := range input.Body.ExposedPorts {
+		port, parsePortErr := network.ParsePort(kit.Ternary(strings.Contains(portSpec, "/"), portSpec, portSpec+"/tcp"))
+		if parsePortErr != nil {
+			return nil, huma.Error400BadRequest("Invalid port format: " + parsePortErr.Error())
+		}
+		exposedPorts[port] = struct{}{}
 	}
 
-	hostConfig := buildHostConfigBase(input.Body, portBindings)
-	if applyHostConfigOverridesErr := applyHostConfigOverrides(input.Body, config, hostConfig, portBindings); applyHostConfigOverridesErr != nil {
-		return nil, huma.Error400BadRequest("Invalid port format: " + applyHostConfigOverridesErr.Error())
-	}
-	applyLegacyResourceLimits(input.Body, hostConfig)
-
-	networkingConfig, err := buildNetworkingConfig(input.Body)
+	hostConfig := kit.FromPtr(input.Body.HostConfig)
+	hostBindings, err := portMapFromCreate(hostConfig.PortBindings)
 	if err != nil {
-		return nil, huma.Error400BadRequest("Invalid network configuration: " + err.Error())
+		return nil, huma.Error400BadRequest("Invalid port format: " + err.Error())
+	}
+	for port, bindings := range hostBindings {
+		exposedPorts[port] = struct{}{}
+		if len(bindings) > 0 {
+			portBindings[port] = append(portBindings[port], bindings...)
+		}
 	}
 
-	containerJSON, err := h.containerService.CreateContainer(ctx, config, hostConfig, networkingConfig, input.Body.Name, *user, input.Body.Credentials)
+	endpoints := map[string]*network.EndpointSettings{}
+	for name, endpoint := range kit.FromPtr(input.Body.NetworkingConfig).EndpointsConfig {
+		ipam, ipamErr := endpointIPAMFromCreate(endpoint)
+		if ipamErr != nil {
+			return nil, huma.Error400BadRequest("Invalid network configuration: " + ipamErr.Error())
+		}
+		endpoints[name] = &network.EndpointSettings{Aliases: endpoint.Aliases, IPAMConfig: ipam}
+	}
+	if len(endpoints) == 0 {
+		for _, networkName := range input.Body.Networks {
+			endpoints[networkName] = &network.EndpointSettings{}
+		}
+	}
+
+	createLabels := map[string]string{"com.arcane.created": "true"}
+	maps.Copy(createLabels, input.Body.Labels)
+
+	containerJSON, err := h.containerService.CreateContainer(
+		ctx,
+		&dockercontainer.Config{
+			Image:           input.Body.Image,
+			Cmd:             kit.Ternary(len(input.Body.Command) > 0, input.Body.Command, input.Body.Cmd),
+			Entrypoint:      input.Body.Entrypoint,
+			WorkingDir:      input.Body.WorkingDir,
+			User:            input.Body.User,
+			Env:             kit.Ternary(len(input.Body.Environment) > 0, input.Body.Environment, input.Body.Env),
+			ExposedPorts:    exposedPorts,
+			Labels:          createLabels,
+			Healthcheck:     healthConfigFromCreate(input.Body.Healthcheck),
+			Hostname:        input.Body.Hostname,
+			Domainname:      input.Body.Domainname,
+			AttachStdout:    input.Body.AttachStdout,
+			AttachStderr:    input.Body.AttachStderr,
+			AttachStdin:     input.Body.AttachStdin,
+			Tty:             input.Body.Tty,
+			OpenStdin:       input.Body.OpenStdin,
+			StdinOnce:       input.Body.StdinOnce,
+			NetworkDisabled: input.Body.NetworkDisabled,
+		},
+		&dockercontainer.HostConfig{
+			Binds:        kit.Ternary(len(hostConfig.Binds) > 0, hostConfig.Binds, input.Body.Volumes),
+			NetworkMode:  dockercontainer.NetworkMode(hostConfig.NetworkMode),
+			PortBindings: portBindings,
+			RestartPolicy: dockercontainer.RestartPolicy{
+				Name:              dockercontainer.RestartPolicyMode(kit.Ternary(hostConfig.RestartPolicy != nil, kit.FromPtr(hostConfig.RestartPolicy).Name, input.Body.RestartPolicy)),
+				MaximumRetryCount: kit.FromPtr(hostConfig.RestartPolicy).MaximumRetryCount,
+			},
+			AutoRemove:      mo.PointerToOption(hostConfig.AutoRemove).OrElse(input.Body.AutoRemove),
+			CapAdd:          kit.Ternary(len(hostConfig.CapAdd) > 0, hostConfig.CapAdd, nil),
+			CapDrop:         kit.Ternary(len(hostConfig.CapDrop) > 0, hostConfig.CapDrop, nil),
+			Privileged:      mo.PointerToOption(hostConfig.Privileged).OrElse(input.Body.Privileged),
+			PublishAllPorts: kit.FromPtr(hostConfig.PublishAllPorts),
+			ReadonlyRootfs:  kit.FromPtr(hostConfig.ReadonlyRootfs),
+			Memory:          kit.Ternary(input.Body.Memory > 0, input.Body.Memory, max(hostConfig.Memory, 0)),
+			MemorySwap:      max(hostConfig.MemorySwap, 0),
+			NanoCPUs:        kit.Ternary(input.Body.CPUs > 0, int64(input.Body.CPUs*1e9), max(hostConfig.NanoCPUs, 0)),
+			CPUShares:       max(hostConfig.CPUShares, 0),
+			Mounts:          kit.Ternary(len(hostConfig.Mounts) > 0, mergeEditMounts(nil, hostConfig.Mounts), nil),
+		},
+		func() *network.NetworkingConfig {
+			if len(endpoints) == 0 {
+				return nil
+			}
+			return &network.NetworkingConfig{EndpointsConfig: endpoints}
+		}(),
+		input.Body.Name,
+		*user,
+		input.Body.Credentials,
+	)
 	if err != nil {
 		return nil, huma.Error500InternalServerError("Failed to create container: " + err.Error())
-	}
-
-	out := container.Created{
-		ID:      containerJSON.ID,
-		Name:    containerJSON.Name,
-		Image:   containerJSON.Config.Image,
-		Status:  string(containerJSON.State.Status),
-		Created: containerJSON.Created,
 	}
 
 	return &handlerutil.Out[container.Created]{
 		Body: base.ApiResponse[container.Created]{
 			Success: true,
-			Data:    out,
+			Data: container.Created{
+				ID:      containerJSON.ID,
+				Name:    containerJSON.Name,
+				Image:   containerJSON.Config.Image,
+				Status:  string(containerJSON.State.Status),
+				Created: containerJSON.Created,
+			},
 		},
 	}, nil
 }
@@ -472,17 +354,8 @@ func (h *ContainerHandler) GetContainer(ctx context.Context, input *GetContainer
 func (h *ContainerHandler) GetContainerProcesses(ctx context.Context, input *GetContainerInput) (*handlerutil.Out[container.Processes], error) {
 	processes, err := h.containerService.GetContainerProcesses(ctx, input.ContainerID)
 	if err != nil {
-		message := "Failed to retrieve container processes: " + err.Error()
-		switch {
-		case errdefs.IsNotFound(err):
-			return nil, huma.Error404NotFound(message)
-		case errdefs.IsConflict(err):
-			return nil, huma.Error409Conflict(message)
-		case errors.Is(err, context.DeadlineExceeded):
-			return nil, huma.Error504GatewayTimeout(message)
-		default:
-			return nil, huma.Error500InternalServerError(message)
-		}
+		apiErr := common.ToAPIError(err)
+		return nil, huma.NewError(apiErr.HTTPStatus(), "Failed to retrieve container processes: "+apiErr.Message)
 	}
 
 	return &handlerutil.Out[container.Processes]{
@@ -567,7 +440,6 @@ func (h *ContainerHandler) RestartContainer(ctx context.Context, input *Containe
 }
 
 func (h *ContainerHandler) KillContainer(ctx context.Context, input *KillContainerInput) (*handlerutil.Out[base.MessageResponse], error) {
-	signal := strings.TrimSpace(input.Signal)
 	return h.runContainerAction(ctx, &ContainerActionInput{EnvironmentID: input.EnvironmentID, ContainerID: input.ContainerID}, containerActionConfig{
 		ActivityType:    activitytypes.TypeContainerKill,
 		Step:            "Killing container",
@@ -575,7 +447,7 @@ func (h *ContainerHandler) KillContainer(ctx context.Context, input *KillContain
 		CompleteMessage: "Container killed",
 		SuccessMessage:  "Container killed successfully",
 		Action: func(runtimeCtx context.Context, containerID string, user usertypes.Actor) error {
-			return h.containerService.KillContainer(runtimeCtx, containerID, signal, user)
+			return h.containerService.KillContainer(runtimeCtx, containerID, strings.TrimSpace(input.Signal), user)
 		},
 		Error: func(err error) error {
 			return huma.Error500InternalServerError("Failed to kill container: " + err.Error())
@@ -613,16 +485,6 @@ func (h *ContainerHandler) UnpauseContainer(ctx context.Context, input *Containe
 			return huma.Error500InternalServerError("Failed to unpause container: " + err.Error())
 		},
 	})
-}
-
-type containerActionConfig struct {
-	ActivityType    activitytypes.Type
-	Step            string
-	StartMessage    string
-	CompleteMessage string
-	SuccessMessage  string
-	Action          func(context.Context, string, usertypes.Actor) error
-	Error           func(error) error
 }
 
 // containerActivityName returns the container's name for activity records, falling back to its ID.
@@ -732,25 +594,43 @@ func (h *ContainerHandler) RedeployContainer(ctx context.Context, input *Contain
 
 	// Fetch full container details to return (consistent with other endpoints)
 	details, inspectErr := h.containerService.GetContainerDetails(runtimeCtx, newContainerID)
-	if inspectErr == nil {
-		details.ActivityID = mo.EmptyableToOption(strings.TrimSpace(activityID)).ToPointer()
-
+	if inspectErr != nil {
+		// Container was redeployed successfully, but we couldn't fetch full details.
+		// Return minimal response with just the ID so frontend can still navigate.
 		return &handlerutil.Out[container.Details]{
 			Body: base.ApiResponse[container.Details]{
 				Success: true,
-				Data:    details,
+				Data: container.Details{
+					ID:         newContainerID,
+					ActivityID: mo.EmptyableToOption(strings.TrimSpace(activityID)).ToPointer(),
+				},
 			},
 		}, nil
 	}
 
-	// Container was redeployed successfully, but we couldn't fetch full details.
-	// Return minimal response with just the ID so frontend can still navigate.
 	return &handlerutil.Out[container.Details]{
 		Body: base.ApiResponse[container.Details]{
 			Success: true,
-			Data: container.Details{
-				ID:         newContainerID,
-				ActivityID: mo.EmptyableToOption(strings.TrimSpace(activityID)).ToPointer(),
+			Data: container.Details{ //exhaustruct:enforce
+				ID:                details.ID,
+				Name:              details.Name,
+				Image:             details.Image,
+				ImageID:           details.ImageID,
+				Created:           details.Created,
+				State:             details.State,
+				Config:            details.Config,
+				HostConfig:        details.HostConfig,
+				NetworkSettings:   details.NetworkSettings,
+				Ports:             details.Ports,
+				Mounts:            details.Mounts,
+				Labels:            details.Labels,
+				ComposeInfo:       details.ComposeInfo,
+				IconLightURL:      details.IconLightURL,
+				IconDarkURL:       details.IconDarkURL,
+				RedeployDisabled:  details.RedeployDisabled,
+				AutoUpdateEnabled: details.AutoUpdateEnabled,
+				UpdateInfo:        details.UpdateInfo,
+				ActivityID:        mo.EmptyableToOption(strings.TrimSpace(activityID)).ToPointer(),
 			},
 		},
 	}, nil
@@ -768,17 +648,6 @@ func (h *ContainerHandler) GetContainerEditConfig(ctx context.Context, input *Ge
 			Data:    editConfig,
 		},
 	}, nil
-}
-
-func editContainerHTTPError(err error) error {
-	switch {
-	case errors.Is(err, common.ErrConflict):
-		return huma.Error409Conflict(err.Error())
-	case errors.Is(err, common.ErrValidation):
-		return huma.Error400BadRequest(err.Error())
-	default:
-		return huma.Error500InternalServerError("Failed to edit container: " + err.Error())
-	}
 }
 
 func (h *ContainerHandler) EditContainer(ctx context.Context, input *EditContainerInput) (*handlerutil.Out[container.Details], error) {
@@ -814,32 +683,51 @@ func (h *ContainerHandler) EditContainer(ctx context.Context, input *EditContain
 	if err != nil {
 		activitylib.FlushWriter(activityWriter)
 		activitylib.CompleteHandlerActivity(runtimeCtx, h.activityService, activityID, "Container edit failed", err)
-		return nil, editContainerHTTPError(err)
+		apiErr := common.ToAPIError(err)
+		return nil, huma.NewError(apiErr.HTTPStatus(), apiErr.Message)
 	}
 	activitylib.FlushWriter(activityWriter)
 	activitylib.CompleteHandlerActivity(runtimeCtx, h.activityService, activityID, "Container edited", nil)
 
 	// Fetch full container details to return (consistent with redeploy)
 	details, inspectErr := h.containerService.GetContainerDetails(runtimeCtx, newContainerID)
-	if inspectErr == nil {
-		details.ActivityID = mo.EmptyableToOption(strings.TrimSpace(activityID)).ToPointer()
-
+	if inspectErr != nil {
+		// Container was recreated successfully, but we couldn't fetch full details.
+		// Return minimal response with just the ID so frontend can still navigate.
 		return &handlerutil.Out[container.Details]{
 			Body: base.ApiResponse[container.Details]{
 				Success: true,
-				Data:    details,
+				Data: container.Details{
+					ID:         newContainerID,
+					ActivityID: mo.EmptyableToOption(strings.TrimSpace(activityID)).ToPointer(),
+				},
 			},
 		}, nil
 	}
 
-	// Container was recreated successfully, but we couldn't fetch full details.
-	// Return minimal response with just the ID so frontend can still navigate.
 	return &handlerutil.Out[container.Details]{
 		Body: base.ApiResponse[container.Details]{
 			Success: true,
-			Data: container.Details{
-				ID:         newContainerID,
-				ActivityID: mo.EmptyableToOption(strings.TrimSpace(activityID)).ToPointer(),
+			Data: container.Details{ //exhaustruct:enforce
+				ID:                details.ID,
+				Name:              details.Name,
+				Image:             details.Image,
+				ImageID:           details.ImageID,
+				Created:           details.Created,
+				State:             details.State,
+				Config:            details.Config,
+				HostConfig:        details.HostConfig,
+				NetworkSettings:   details.NetworkSettings,
+				Ports:             details.Ports,
+				Mounts:            details.Mounts,
+				Labels:            details.Labels,
+				ComposeInfo:       details.ComposeInfo,
+				IconLightURL:      details.IconLightURL,
+				IconDarkURL:       details.IconDarkURL,
+				RedeployDisabled:  details.RedeployDisabled,
+				AutoUpdateEnabled: details.AutoUpdateEnabled,
+				UpdateInfo:        details.UpdateInfo,
+				ActivityID:        mo.EmptyableToOption(strings.TrimSpace(activityID)).ToPointer(),
 			},
 		},
 	}, nil
@@ -889,12 +777,9 @@ func (h *ContainerHandler) SetAutoUpdate(ctx context.Context, input *SetAutoUpda
 		return nil, huma.Error404NotFound("container not found")
 	}
 
-	excluded := !input.Body.Enabled
-	if setContainerAutoUpdateExclusionErr := h.settingsService.SetContainerAutoUpdateExclusionInternal(ctx, containerName, excluded); setContainerAutoUpdateExclusionErr != nil {
+	if setContainerAutoUpdateExclusionErr := h.settingsService.SetContainerAutoUpdateExclusionInternal(ctx, containerName, !input.Body.Enabled); setContainerAutoUpdateExclusionErr != nil {
 		return nil, huma.Error500InternalServerError("failed to update auto-update setting")
 	}
 
-	msg := kit.Ternary(excluded, "Auto-update disabled", "Auto-update enabled")
-
-	return handlerutil.MessageOutput(msg, ""), nil
+	return handlerutil.MessageOutput(kit.Ternary(input.Body.Enabled, "Auto-update enabled", "Auto-update disabled"), ""), nil
 }

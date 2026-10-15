@@ -8,7 +8,6 @@ import (
 	"net/netip"
 	"net/url"
 	"slices"
-	"sort"
 	"strings"
 
 	"github.com/getarcaneapp/arcane/types/v2/base"
@@ -72,43 +71,31 @@ func (s *NetworkService) GetNetworkTopology(ctx context.Context) (*networktypes.
 		return nil, fmt.Errorf("failed to list containers: %w", err)
 	}
 
-	containerInfoByID := buildTopologyContainerInfoInternal(containers)
+	containersByID := make(map[string]container.Summary, len(containers))
+	for _, rawContainer := range containers {
+		containersByID[rawContainer.ID] = rawContainer
+	}
 
 	networkList, err := compat.NetworkListWithCompatibility(ctx, dockerClient, client.NetworkListOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to list Docker networks: %w", err)
 	}
 
-	topology := &networktypes.Topology{
-		Nodes: make([]networktypes.TopologyNode, 0, len(networkList.Items)),
-		Edges: make([]networktypes.TopologyEdge, 0),
-	}
-	containerNodeIDs := make(map[string]struct{})
-	inspectedNetworks := make([]struct {
-		summary network.Summary
-		inspect network.Inspect
-	}, len(networkList.Items))
+	inspectedNetworks := make([]network.Inspect, len(networkList.Items))
 
 	g, groupCtx := errgroup.WithContext(ctx)
 	g.SetLimit(8)
 
-	for i := range networkList.Items {
-		rawNetwork := networkList.Items[i]
+	for i, rawNetwork := range networkList.Items {
 		g.Go(func() (workerErr error) {
 			defer utils.RecoverToError(&workerErr, "network worker")
 
-			inspected, networkInspectWithCompatibilityErr := compat.NetworkInspectWithCompatibility(groupCtx, dockerClient, rawNetwork.ID, client.NetworkInspectOptions{})
-			if networkInspectWithCompatibilityErr != nil {
-				return fmt.Errorf("failed to inspect network %s: %w", rawNetwork.Name, networkInspectWithCompatibilityErr)
+			inspected, inspectErr := compat.NetworkInspectWithCompatibility(groupCtx, dockerClient, rawNetwork.ID, client.NetworkInspectOptions{})
+			if inspectErr != nil {
+				return fmt.Errorf("failed to inspect network %s: %w", rawNetwork.Name, inspectErr)
 			}
 
-			inspectedNetworks[i] = struct {
-				summary network.Summary
-				inspect network.Inspect
-			}{
-				summary: rawNetwork,
-				inspect: inspected.Network,
-			}
+			inspectedNetworks[i] = inspected.Network
 			return nil
 		})
 	}
@@ -117,9 +104,11 @@ func (s *NetworkService) GetNetworkTopology(ctx context.Context) (*networktypes.
 		return nil, waitErr
 	}
 
-	for _, inspectedNetwork := range inspectedNetworks {
-		rawNetwork := inspectedNetwork.summary
-		topology.Nodes = append(topology.Nodes, networktypes.TopologyNode{
+	nodes := make([]networktypes.TopologyNode, 0, len(networkList.Items))
+	edges := make([]networktypes.TopologyEdge, 0)
+	containerNodeIDs := make(map[string]struct{})
+	for i, rawNetwork := range networkList.Items {
+		nodes = append(nodes, networktypes.TopologyNode{
 			ID:   rawNetwork.ID,
 			Name: rawNetwork.Name,
 			Type: networktypes.TopologyNodeTypeNetwork,
@@ -130,55 +119,42 @@ func (s *NetworkService) GetNetworkTopology(ctx context.Context) (*networktypes.
 			},
 		})
 
-		for containerID, endpoint := range inspectedNetwork.inspect.Containers {
-			info, ok := containerInfoByID[containerID]
-			if !ok {
-				info = topologyContainerInfo{Name: endpoint.Name}
-			}
-			info.Name = cmp.Or(info.Name, endpoint.Name)
-
+		for containerID, endpoint := range inspectedNetworks[i].Containers {
 			if _, exists := containerNodeIDs[containerID]; !exists {
-				topology.Nodes = append(topology.Nodes, networktypes.TopologyNode{
+				ctr := containersByID[containerID]
+				nodes = append(nodes, networktypes.TopologyNode{
 					ID:   containerID,
-					Name: info.Name,
+					Name: cmp.Or(kit.Ternary(len(ctr.Names) > 0, docker.ContainerNameFromNames(ctr.Names), ctr.ID), endpoint.Name),
 					Type: networktypes.TopologyNodeTypeContainer,
 					Metadata: networktypes.TopologyNodeMetadata{
-						Status: info.State,
-						Image:  info.Image,
+						Status: string(ctr.State),
+						Image:  ctr.Image,
 					},
 				})
 				containerNodeIDs[containerID] = struct{}{}
 			}
 
-			edge := networktypes.TopologyEdge{
-				ID:     fmt.Sprintf("%s:%s", rawNetwork.ID, containerID),
-				Source: rawNetwork.ID,
-				Target: containerID,
-			}
-			if endpoint.IPv4Address.IsValid() {
-				edge.IPv4Address = endpoint.IPv4Address.String()
-			}
-			if endpoint.IPv6Address.IsValid() {
-				edge.IPv6Address = endpoint.IPv6Address.String()
-			}
-
-			topology.Edges = append(topology.Edges, edge)
+			edges = append(edges, networktypes.TopologyEdge{
+				ID:          fmt.Sprintf("%s:%s", rawNetwork.ID, containerID),
+				Source:      rawNetwork.ID,
+				Target:      containerID,
+				IPv4Address: kit.Ternary(endpoint.IPv4Address.IsValid(), endpoint.IPv4Address.String(), ""),
+				IPv6Address: kit.Ternary(endpoint.IPv6Address.IsValid(), endpoint.IPv6Address.String(), ""),
+			})
 		}
 	}
 
-	sort.Slice(topology.Nodes, func(i, j int) bool {
-		left, right := topology.Nodes[i], topology.Nodes[j]
-		if left.Type != right.Type {
-			return left.Type < right.Type
-		}
-		return strings.ToLower(left.Name) < strings.ToLower(right.Name)
+	slices.SortFunc(nodes, func(a, b networktypes.TopologyNode) int {
+		return cmp.Or(cmp.Compare(a.Type, b.Type), strings.Compare(strings.ToLower(a.Name), strings.ToLower(b.Name)))
 	})
-	sort.Slice(topology.Edges, func(i, j int) bool {
-		left, right := topology.Edges[i], topology.Edges[j]
-		return kit.Ternary(left.Source != right.Source, left.Source < right.Source, left.Target < right.Target)
+	slices.SortFunc(edges, func(a, b networktypes.TopologyEdge) int {
+		return cmp.Or(strings.Compare(a.Source, b.Source), strings.Compare(a.Target, b.Target))
 	})
 
-	return topology, nil
+	return &networktypes.Topology{
+		Nodes: nodes,
+		Edges: edges,
+	}, nil
 }
 
 func (s *NetworkService) CreateNetwork(ctx context.Context, name string, options client.NetworkCreateOptions, user usertypes.Actor) (*network.CreateResponse, error) {
@@ -195,26 +171,18 @@ func (s *NetworkService) CreateNetwork(ctx context.Context, name string, options
 		return nil, fmt.Errorf("failed to create network: %w", err)
 	}
 
-	metadata := database.JSON{
+	if logErr := s.eventService.LogNetworkEvent(ctx, event.EventTypeNetworkCreate, response.ID, name, user.ID, user.Username, "0", database.JSON{
 		"action": "create",
 		"driver": options.Driver,
 		"name":   name,
-	}
-	if logErr := s.eventService.LogNetworkEvent(ctx, event.EventTypeNetworkCreate, response.ID, name, user.ID, user.Username, "0", metadata); logErr != nil {
+	}); logErr != nil {
 		slog.WarnContext(ctx, "could not log network creation action", "error", logErr)
 	}
 
-	warning := ""
-	if len(response.Warning) > 0 {
-		warning = strings.Join(response.Warning, "; ")
-	}
-
-	out := network.CreateResponse{
+	return &network.CreateResponse{
 		ID:      response.ID,
-		Warning: warning,
-	}
-
-	return &out, nil
+		Warning: strings.Join(response.Warning, "; "),
+	}, nil
 }
 
 func (s *NetworkService) RemoveNetwork(ctx context.Context, id string, user usertypes.Actor) error {
@@ -233,11 +201,10 @@ func (s *NetworkService) RemoveNetwork(ctx context.Context, id string, user user
 		return fmt.Errorf("failed to remove network: %w", networkRemoveErr)
 	}
 
-	metadata := database.JSON{
+	if logErr := s.eventService.LogNetworkEvent(ctx, event.EventTypeNetworkDelete, id, networkName, user.ID, user.Username, "0", database.JSON{
 		"action":    "delete",
 		"networkId": id,
-	}
-	if logErr := s.eventService.LogNetworkEvent(ctx, event.EventTypeNetworkDelete, id, networkName, user.ID, user.Username, "0", metadata); logErr != nil {
+	}); logErr != nil {
 		slog.WarnContext(ctx, "could not log network delete action", "error", logErr)
 	}
 
@@ -252,31 +219,29 @@ func (s *NetworkService) ConnectContainer(ctx context.Context, networkID string,
 		return fmt.Errorf("failed to connect to Docker: %w", err)
 	}
 
-	endpoint := &network.EndpointSettings{Aliases: req.Aliases}
-	ipv4 := strings.TrimSpace(req.IPv4Address)
-	ipv6 := strings.TrimSpace(req.IPv6Address)
-	if ipv4 != "" || ipv6 != "" {
-		ipam := &network.EndpointIPAMConfig{}
-		if ipv4 != "" {
-			addr, parseErr := netip.ParseAddr(ipv4)
-			if parseErr != nil {
-				return common.Classify(common.ErrValidation, fmt.Errorf("invalid IPv4 address %s: %w", ipv4, parseErr))
-			}
-			ipam.IPv4Address = addr
-		}
-		if ipv6 != "" {
-			addr, parseErr := netip.ParseAddr(ipv6)
-			if parseErr != nil {
-				return common.Classify(common.ErrValidation, fmt.Errorf("invalid IPv6 address %s: %w", ipv6, parseErr))
-			}
-			ipam.IPv6Address = addr
-		}
-		endpoint.IPAMConfig = ipam
+	ipv4, ipv4Err := netip.ParseAddr(strings.TrimSpace(req.IPv4Address))
+	if ipv4Err != nil && strings.TrimSpace(req.IPv4Address) != "" {
+		return common.Classify(common.ErrValidation, fmt.Errorf("invalid IPv4 address %s: %w", strings.TrimSpace(req.IPv4Address), ipv4Err))
+	}
+	ipv6, ipv6Err := netip.ParseAddr(strings.TrimSpace(req.IPv6Address))
+	if ipv6Err != nil && strings.TrimSpace(req.IPv6Address) != "" {
+		return common.Classify(common.ErrValidation, fmt.Errorf("invalid IPv6 address %s: %w", strings.TrimSpace(req.IPv6Address), ipv6Err))
 	}
 
 	if _, networkConnectErr := dockerClient.NetworkConnect(ctx, networkID, client.NetworkConnectOptions{
-		Container:      req.ContainerID,
-		EndpointConfig: endpoint,
+		Container: req.ContainerID,
+		EndpointConfig: &network.EndpointSettings{
+			Aliases: req.Aliases,
+			IPAMConfig: func() *network.EndpointIPAMConfig {
+				if !ipv4.IsValid() && !ipv6.IsValid() {
+					return nil
+				}
+				return &network.EndpointIPAMConfig{
+					IPv4Address: ipv4,
+					IPv6Address: ipv6,
+				}
+			}(),
+		},
 	}); networkConnectErr != nil {
 		s.eventService.LogErrorEvent(
 			ctx,
@@ -296,12 +261,11 @@ func (s *NetworkService) ConnectContainer(ctx context.Context, networkID string,
 		return fmt.Errorf("failed to connect container to network: %w", networkConnectErr)
 	}
 
-	metadata := database.JSON{
+	if logErr := s.eventService.LogNetworkEvent(ctx, event.EventTypeNetworkConnect, networkID, networkID, user.ID, user.Username, "0", database.JSON{
 		"action":      "connect",
 		"networkId":   networkID,
 		"containerId": req.ContainerID,
-	}
-	if logErr := s.eventService.LogNetworkEvent(ctx, event.EventTypeNetworkConnect, networkID, networkID, user.ID, user.Username, "0", metadata); logErr != nil {
+	}); logErr != nil {
 		slog.WarnContext(ctx, "could not log network connect action", "error", logErr)
 	}
 
@@ -338,13 +302,12 @@ func (s *NetworkService) DisconnectContainer(ctx context.Context, networkID stri
 		return fmt.Errorf("failed to disconnect container from network: %w", networkDisconnectErr)
 	}
 
-	metadata := database.JSON{
+	if logErr := s.eventService.LogNetworkEvent(ctx, event.EventTypeNetworkDisconnect, networkID, networkID, user.ID, user.Username, "0", database.JSON{
 		"action":      "disconnect",
 		"networkId":   networkID,
 		"containerId": req.ContainerID,
 		"force":       req.Force,
-	}
-	if logErr := s.eventService.LogNetworkEvent(ctx, event.EventTypeNetworkDisconnect, networkID, networkID, user.ID, user.Username, "0", metadata); logErr != nil {
+	}); logErr != nil {
 		slog.WarnContext(ctx, "could not log network disconnect action", "error", logErr)
 	}
 
@@ -357,23 +320,19 @@ func (s *NetworkService) PruneNetworks(ctx context.Context) (*network.PruneRepor
 		return nil, fmt.Errorf("failed to connect to Docker: %w", err)
 	}
 
-	filterArgs := make(client.Filters)
-
-	report, err := dockerClient.NetworkPrune(ctx, client.NetworkPruneOptions{Filters: filterArgs})
+	report, err := dockerClient.NetworkPrune(ctx, client.NetworkPruneOptions{Filters: make(client.Filters)})
 	if err != nil {
 		return nil, fmt.Errorf("failed to prune networks: %w", err)
 	}
-	pruneReport := report.Report
 
-	metadata := database.JSON{
+	if logErr := s.eventService.LogNetworkEvent(ctx, event.EventTypeNetworkDelete, "", "bulk_prune", usertypes.SystemUser.ID, usertypes.SystemUser.Username, "0", database.JSON{
 		"action":          "prune",
-		"networksDeleted": len(pruneReport.NetworksDeleted),
-	}
-	if logErr := s.eventService.LogNetworkEvent(ctx, event.EventTypeNetworkDelete, "", "bulk_prune", usertypes.SystemUser.ID, usertypes.SystemUser.Username, "0", metadata); logErr != nil {
+		"networksDeleted": len(report.Report.NetworksDeleted),
+	}); logErr != nil {
 		slog.WarnContext(ctx, "could not log network prune action", "error", logErr)
 	}
 
-	return &pruneReport, nil
+	return &report.Report, nil
 }
 
 func (s *NetworkService) ListNetworksPaginated(ctx context.Context, params pagination.QueryParams) ([]networktypes.Summary, pagination.Response, networktypes.UsageCounts, error) {
@@ -393,54 +352,30 @@ func (s *NetworkService) ListNetworksPaginated(ctx context.Context, params pagin
 	if err != nil {
 		return nil, pagination.Response{}, networktypes.UsageCounts{}, fmt.Errorf("failed to list Docker networks: %w", err)
 	}
-	rawNets := networkList.Items
 
-	items, err := s.convertToNetworkSummaries(rawNets, inUseByID, inUseByName)
-	if err != nil {
-		return nil, pagination.Response{}, networktypes.UsageCounts{}, err
-	}
-	config := s.buildNetworkPaginationConfig()
-	result := config.SearchOrderAndPaginate(items, params)
-	counts := s.calculateNetworkUsageCounts(items)
-	paginationResp := pagination.BuildResponse(result.TotalCount, result.TotalAvailable, params)
-
-	return result.Items, paginationResp, counts, nil
-}
-
-type topologyContainerInfo struct {
-	Name  string
-	Image string
-	State string
-}
-
-func buildTopologyContainerInfoInternal(containers []container.Summary) map[string]topologyContainerInfo {
-	infoByID := make(map[string]topologyContainerInfo, len(containers))
-	for _, rawContainer := range containers {
-		name := rawContainer.ID
-		if len(rawContainer.Names) > 0 {
-			name = docker.ContainerNameFromNames(rawContainer.Names)
+	items := make([]networktypes.Summary, 0, len(networkList.Items))
+	inUse := 0
+	for _, n := range networkList.Items {
+		netDto, mapErr := mapping.MapOne[network.Summary, networktypes.Summary](n)
+		if mapErr != nil {
+			return nil, pagination.Response{}, networktypes.UsageCounts{}, fmt.Errorf("failed to map network: %w", mapErr)
 		}
-		infoByID[rawContainer.ID] = topologyContainerInfo{
-			Name:  name,
-			Image: rawContainer.Image,
-			State: string(rawContainer.State),
-		}
-	}
-	return infoByID
-}
-
-func (s *NetworkService) convertToNetworkSummaries(rawNets []network.Summary, inUseByID, inUseByName map[string]bool) ([]networktypes.Summary, error) {
-	items := make([]networktypes.Summary, 0, len(rawNets))
-	for _, n := range rawNets {
-		netDto, err := mapping.MapOne[network.Summary, networktypes.Summary](n)
-		if err != nil {
-			return nil, fmt.Errorf("failed to map network: %w", err)
-		}
-		netDto.InUse = inUseByID[netDto.ID] || inUseByName[netDto.Name]
-		netDto.IsDefault = docker.IsDefaultNetwork(netDto.Name)
+		netDto.InUse = inUseByID[netDto.ID] || inUseByName[netDto.Name] // keep: enriches the mapped DTO
+		netDto.IsDefault = docker.IsDefaultNetwork(netDto.Name)         // keep: enriches the mapped DTO
 		items = append(items, netDto)
+		if netDto.InUse || netDto.IsDefault {
+			inUse++
+		}
 	}
-	return items, nil
+	result := s.buildNetworkPaginationConfig().SearchOrderAndPaginate(items, params)
+
+	return result.Items, pagination.BuildResponse(result.TotalCount, result.TotalAvailable, params), networktypes.UsageCounts{
+		Inuse: inUse,
+		// Only count non-default networks as unused
+		// Default networks (bridge, host, none, ingress) are never "unused"
+		Unused: len(items) - inUse,
+		Total:  len(items),
+	}, nil
 }
 
 func (s *NetworkService) AggregateNetworks(ctx context.Context, params pagination.QueryParams) (base.PaginatedWithCounts[networktypes.Summary, networktypes.UsageCounts], error) {
@@ -450,24 +385,27 @@ func (s *NetworkService) AggregateNetworks(ctx context.Context, params paginatio
 	}
 
 	pages := make([]pagination.EnvironmentPage[networktypes.Summary], 0, len(collection.Results))
-	counts := networktypes.UsageCounts{}
+	inUse, unused, total := 0, 0, 0
 	for _, result := range collection.Results {
-		page := result.Value
 		pages = append(pages, pagination.EnvironmentPage[networktypes.Summary]{
 			Environment:    result.Environment,
-			Items:          page.Data,
-			TotalAvailable: cmp.Or(page.Pagination.GrandTotalItems, page.Pagination.TotalItems),
+			Items:          result.Value.Data,
+			TotalAvailable: cmp.Or(result.Value.Pagination.GrandTotalItems, result.Value.Pagination.TotalItems),
 		})
-		counts.Inuse += page.Counts.Inuse
-		counts.Unused += page.Counts.Unused
-		counts.Total += page.Counts.Total
+		inUse += result.Value.Counts.Inuse
+		unused += result.Value.Counts.Unused
+		total += result.Value.Counts.Total
 	}
 	data, resp := pagination.MergeEnvironmentPages(s.buildNetworkPaginationConfig(), pages, params)
 
 	return base.PaginatedWithCounts[networktypes.Summary, networktypes.UsageCounts]{
-		Success:            true,
-		Data:               data,
-		Counts:             counts,
+		Success: true,
+		Data:    data,
+		Counts: networktypes.UsageCounts{
+			Inuse:  inUse,
+			Unused: unused,
+			Total:  total,
+		},
 		Pagination:         handlerutil.PaginationResponse(resp),
 		FailedEnvironments: collection.Failures,
 	}, nil
@@ -481,64 +419,80 @@ func (s *NetworkService) buildNetworkPaginationConfig() pagination.Config[networ
 			func(n networktypes.Summary) (string, error) { return n.Scope, nil },
 			func(n networktypes.Summary) (string, error) { return n.ID, nil },
 			func(n networktypes.Summary) (string, error) {
-				subnets, gateways := ipamValuesInternal(n)
+				subnets, gateways := ipamValues(n)
 				return strings.Join(append(subnets, gateways...), " "), nil
 			},
 		},
-		SortBindings:    s.buildNetworkSortBindings(),
-		FilterAccessors: s.buildNetworkFilterAccessors(),
+		SortBindings: []pagination.SortBinding[networktypes.Summary]{
+			{
+				Key: "name",
+				// Docker allows duplicate network names, so tie-break on ID to keep
+				// pagination deterministic.
+				Fn: func(a, b networktypes.Summary) int {
+					return cmp.Or(strings.Compare(a.Name, b.Name), strings.Compare(a.ID, b.ID))
+				},
+			},
+			{
+				Key: "driver",
+				Fn:  func(a, b networktypes.Summary) int { return strings.Compare(a.Driver, b.Driver) },
+			},
+			{
+				Key: "scope",
+				Fn:  func(a, b networktypes.Summary) int { return strings.Compare(a.Scope, b.Scope) },
+			},
+			{
+				Key: "created",
+				Fn:  func(a, b networktypes.Summary) int { return a.Created.Compare(b.Created) },
+			},
+			{
+				Key: "inUse",
+				Fn: func(a, b networktypes.Summary) int {
+					if (a.InUse || a.IsDefault) == (b.InUse || b.IsDefault) {
+						// Use name as secondary sort key for consistent ordering
+						return strings.Compare(a.Name, b.Name)
+					}
+					return kit.Ternary(a.InUse || a.IsDefault, -1, 1)
+				},
+			},
+			// Subnet and gateway compare sorted copies so IPAM entry order does
+			// not affect row order; the displayed entries are untouched.
+			{
+				Key: "subnet",
+				Fn: func(a, b networktypes.Summary) int {
+					subnetsA, _ := ipamValues(a)
+					subnetsB, _ := ipamValues(b)
+					return slices.CompareFunc(
+						slices.SortedFunc(slices.Values(subnetsA), kit.CompareSubnets),
+						slices.SortedFunc(slices.Values(subnetsB), kit.CompareSubnets),
+						kit.CompareSubnets,
+					)
+				},
+			},
+			{
+				Key: "gateway",
+				Fn: func(a, b networktypes.Summary) int {
+					_, gatewaysA := ipamValues(a)
+					_, gatewaysB := ipamValues(b)
+					return slices.CompareFunc(
+						slices.SortedFunc(slices.Values(gatewaysA), kit.CompareAddresses),
+						slices.SortedFunc(slices.Values(gatewaysB), kit.CompareAddresses),
+						kit.CompareAddresses,
+					)
+				},
+			},
+		},
+		FilterAccessors: []pagination.FilterAccessor[networktypes.Summary]{
+			{
+				Key: "inUse",
+				Fn: func(n networktypes.Summary, filterValue string) bool {
+					return kit.Ternary(filterValue == "true", n.InUse || n.IsDefault, filterValue != "false" || (!n.InUse && !n.IsDefault))
+				},
+			},
+		},
 	}
 }
 
-func (s *NetworkService) buildNetworkSortBindings() []pagination.SortBinding[networktypes.Summary] {
-	return []pagination.SortBinding[networktypes.Summary]{
-		{
-			Key: "name",
-			// Docker allows duplicate network names, so tie-break on ID to keep
-			// pagination deterministic.
-			Fn: func(a, b networktypes.Summary) int {
-				if c := strings.Compare(a.Name, b.Name); c != 0 {
-					return c
-				}
-				return strings.Compare(a.ID, b.ID)
-			},
-		},
-		{
-			Key: "driver",
-			Fn:  func(a, b networktypes.Summary) int { return strings.Compare(a.Driver, b.Driver) },
-		},
-		{
-			Key: "scope",
-			Fn:  func(a, b networktypes.Summary) int { return strings.Compare(a.Scope, b.Scope) },
-		},
-		{
-			Key: "created",
-			Fn:  s.compareNetworkCreated,
-		},
-		{
-			Key: "inUse",
-			Fn:  s.compareNetworkInUse,
-		},
-		{
-			Key: "subnet",
-			Fn: func(a, b networktypes.Summary) int {
-				subnetsA, _ := ipamValuesInternal(a)
-				subnetsB, _ := ipamValuesInternal(b)
-				return compareIPAMListsInternal(subnetsA, subnetsB, kit.CompareSubnets)
-			},
-		},
-		{
-			Key: "gateway",
-			Fn: func(a, b networktypes.Summary) int {
-				_, gatewaysA := ipamValuesInternal(a)
-				_, gatewaysB := ipamValuesInternal(b)
-				return compareIPAMListsInternal(gatewaysA, gatewaysB, kit.CompareAddresses)
-			},
-		},
-	}
-}
-
-func ipamValuesInternal(n networktypes.Summary) (subnets, gateways []string) {
+func ipamValues(n networktypes.Summary) (subnets, gateways []string) {
 	for _, cfg := range n.IPAM.Config {
 		if cfg.Subnet != "" {
 			subnets = append(subnets, cfg.Subnet)
@@ -548,57 +502,4 @@ func ipamValuesInternal(n networktypes.Summary) (subnets, gateways []string) {
 		}
 	}
 	return subnets, gateways
-}
-
-// compareIPAMListsInternal sorts copies of both lists so IPAM entry order does
-// not affect row order; the displayed entries are untouched.
-func compareIPAMListsInternal(a, b []string, compare func(x, y string) int) int {
-	sortedA := slices.SortedFunc(slices.Values(a), compare)
-	sortedB := slices.SortedFunc(slices.Values(b), compare)
-	return slices.CompareFunc(sortedA, sortedB, compare)
-}
-
-func (s *NetworkService) compareNetworkCreated(a, b networktypes.Summary) int {
-	if a.Created.Before(b.Created) {
-		return -1
-	}
-	return kit.Ternary(a.Created.After(b.Created), 1, 0)
-}
-
-func (s *NetworkService) compareNetworkInUse(a, b networktypes.Summary) int {
-	aInUse := a.InUse || a.IsDefault
-	bInUse := b.InUse || b.IsDefault
-
-	if aInUse == bInUse {
-		// Use name as secondary sort key for consistent ordering
-		return strings.Compare(a.Name, b.Name)
-	}
-	return kit.Ternary(aInUse, -1, 1)
-}
-
-func (s *NetworkService) buildNetworkFilterAccessors() []pagination.FilterAccessor[networktypes.Summary] {
-	return []pagination.FilterAccessor[networktypes.Summary]{
-		{
-			Key: "inUse",
-			Fn: func(n networktypes.Summary, filterValue string) bool {
-				return kit.Ternary(filterValue == "true", n.InUse || n.IsDefault, filterValue != "false" || (!n.InUse && !n.IsDefault))
-			},
-		},
-	}
-}
-
-func (s *NetworkService) calculateNetworkUsageCounts(items []networktypes.Summary) networktypes.UsageCounts {
-	counts := networktypes.UsageCounts{
-		Total: len(items),
-	}
-	for _, n := range items {
-		if n.InUse || n.IsDefault {
-			counts.Inuse++
-		} else {
-			// Only count non-default networks as unused
-			// Default networks (bridge, host, none, ingress) are never "unused"
-			counts.Unused++
-		}
-	}
-	return counts
 }

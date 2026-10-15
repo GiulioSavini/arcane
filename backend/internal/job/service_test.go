@@ -36,6 +36,20 @@ import (
 	francistest "github.com/getarcaneapp/arcane/backend/v2/pkg/utils/francis/testing"
 )
 
+type fakeJobScheduler struct {
+	jobs               map[string]scheduler.Job
+	runtimeStates      map[string]scheduler.JobRuntimeState
+	rescheduled        []string
+	rescheduleContexts []context.Context
+	rescheduleErr      error
+	busWatcherRuns     []string
+	busWatcherContexts []context.Context
+}
+
+type fakeJob struct {
+	name string
+}
+
 func setupSettingsTestDB(t *testing.T) *database.DB {
 	t.Helper()
 	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
@@ -78,7 +92,7 @@ func newJobServiceForTest(t *testing.T, db *database.DB, settingsService *settin
 		cfg,
 		newJobCoordinatorForTest(t, db),
 		role.NewRoleService(db),
-		environment.NewEnvironmentService(db, nil, nil, nil, nil, nil),
+		environment.NewEnvironmentService(db, http.DefaultClient, nil, nil, settingsService, nil),
 		activity.NewActivityService(db, settingsService),
 	)
 	service.SetScheduler(t.Context(), newFakeJobScheduler())
@@ -551,16 +565,6 @@ func findJobStatusByID(t *testing.T, jobs []jobschedule.JobStatus, id string) jo
 	return jobschedule.JobStatus{}
 }
 
-type fakeJobScheduler struct {
-	jobs               map[string]scheduler.Job
-	runtimeStates      map[string]scheduler.JobRuntimeState
-	rescheduled        []string
-	rescheduleContexts []context.Context
-	rescheduleErr      error
-	busWatcherRuns     []string
-	busWatcherContexts []context.Context
-}
-
 func newFakeJobScheduler(jobIDs ...string) *fakeJobScheduler {
 	jobs := make(map[string]scheduler.Job, len(jobIDs))
 	for _, jobID := range jobIDs {
@@ -603,10 +607,6 @@ func (s *fakeJobScheduler) RunBusWatcherNow(ctx context.Context, watcherID strin
 	return nil
 }
 
-type fakeJob struct {
-	name string
-}
-
 func (j fakeJob) Name() string {
 	return j.name
 }
@@ -634,7 +634,7 @@ func newJobActivityTestService(t *testing.T) (*JobService, *activity.ActivitySer
 		&config.Config{},
 		newJobCoordinatorForTest(t, db),
 		role.NewRoleService(db),
-		environment.NewEnvironmentService(db, nil, nil, nil, nil, nil),
+		environment.NewEnvironmentService(db, http.DefaultClient, nil, nil, settingsService, nil),
 		activities,
 	)
 	svc.SetScheduler(t.Context(), newFakeJobScheduler())
@@ -939,7 +939,7 @@ func TestJobActivityRestartRepairsFailedProjection(t *testing.T) {
 		&config.Config{},
 		svc.runs,
 		role.NewRoleService(db),
-		environment.NewEnvironmentService(db, nil, nil, nil, nil, nil),
+		environment.NewEnvironmentService(db, http.DefaultClient, nil, nil, svc.settings, nil),
 		activities,
 	)
 	restarted.SetScheduler(ctx, newFakeJobScheduler())
@@ -1134,9 +1134,9 @@ func TestResolveRemoteRunConfirmsOwnerAfterLostResponse(t *testing.T) {
 				ApiUrl:  server.URL,
 				Enabled: true,
 			}).Error)
-			environments := environment.NewEnvironmentService(db, server.Client(), nil, nil, nil, nil)
 			settingsService, err := newSettingsServiceForTest(t, t.Context(), db)
 			require.NoError(t, err)
+			environments := environment.NewEnvironmentService(db, server.Client(), nil, nil, settingsService, nil)
 			svc := NewJobService(
 				db,
 				settingsService,

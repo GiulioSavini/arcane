@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"maps"
 	"net/http"
 	"strings"
 	"time"
@@ -16,6 +15,7 @@ import (
 	"github.com/getarcaneapp/arcane/types/v2/backup"
 	"github.com/getarcaneapp/arcane/types/v2/containerregistry"
 	"github.com/getarcaneapp/arcane/types/v2/gitops"
+	kit "go.getarcane.app/kit/pkg"
 	"go.getarcane.app/sys/crypto"
 
 	"github.com/getarcaneapp/arcane/backend/v2/internal/database"
@@ -40,20 +40,6 @@ type Service struct {
 	syncGate        *utils.SyncGate
 }
 
-// New builds the remote transport. syncGate is owned by the parent so it can
-// forget delivery state when an environment reconnects.
-func New(db *database.DB, httpClient *http.Client, settingsService *settings.SettingsService, syncGate *utils.SyncGate) *Service {
-	return &Service{
-		db: db,
-		client: remenv.NewClient(httpClient, remenv.TunnelTransportFuncs{
-			EnsureAvailableFunc: ensureTunnelAvailableInternal,
-			DoFunc:              doTunnelRequestInternal,
-		}),
-		settingsService: settingsService,
-		syncGate:        syncGate,
-	}
-}
-
 // Target is a validated remote environment endpoint; build it with NewTarget.
 type Target struct {
 	id          string
@@ -61,6 +47,50 @@ type Target struct {
 	isEdge      bool
 	accessToken *string
 	targetURL   string
+}
+
+// New builds the remote transport. syncGate is owned by the parent so it can
+// forget delivery state when an environment reconnects.
+func New(db *database.DB, httpClient *http.Client, settingsService *settings.SettingsService, syncGate *utils.SyncGate) *Service {
+	return &Service{
+		db: db,
+		client: remenv.NewClient(httpClient, remenv.TunnelTransportFuncs{
+			EnsureAvailableFunc: func(ctx context.Context, envID string) error {
+				if edge.HasActiveTunnel(envID) {
+					return nil
+				}
+				if _, ok := edge.RequestTunnelAndWait(ctx, envID, edge.DefaultTunnelDemandTTL, edge.DefaultTunnelAcquireTimeout()).Get(); ok {
+					return nil
+				}
+				return remenv.ErrEnvironmentUnavailable
+			},
+			DoFunc: func(ctx context.Context, envID, method, path string, headers map[string]string, body []byte) (*remenv.Response, error) {
+				tunnel, ok := edge.GetRegistry().Get(envID).Get()
+				if !ok {
+					return nil, fmt.Errorf("no active tunnel for environment %s: %w", envID, remenv.ErrEnvironmentUnavailable)
+				}
+				if tunnel.Conn.IsClosed() {
+					return nil, fmt.Errorf("tunnel for environment %s is closed: %w", envID, remenv.ErrEnvironmentUnavailable)
+				}
+
+				statusCode, respHeaders, respBody, err := edge.ProxyRequest(ctx, tunnel, method, path, "", headers, body)
+				if err != nil {
+					if errors.Is(err, edge.ErrTunnelConnectionClosed) {
+						err = errors.Join(remenv.ErrEnvironmentUnavailable, err)
+					}
+					return nil, fmt.Errorf("tunnel request failed: %w", err)
+				}
+
+				return &remenv.Response{
+					StatusCode: statusCode,
+					Body:       respBody,
+					Headers:    respHeaders,
+				}, nil
+			},
+		}),
+		settingsService: settingsService,
+		syncGate:        syncGate,
+	}
 }
 
 // NewTarget validates a remote environment's endpoint. The local environment
@@ -90,41 +120,7 @@ func NewTarget(id, name, apiURL string, isEdge bool, accessToken *string) (*Targ
 
 // Context bounds a proxied request by the configured proxy timeout.
 func (s *Service) Context(ctx context.Context) (context.Context, context.CancelFunc) {
-	if s != nil && s.settingsService != nil {
-		cfg := s.settingsService.GetSettingsConfig()
-		return context.WithTimeout(ctx, timeouts.GetDuration(cfg.ProxyRequestTimeout.AsInt(), timeouts.DefaultProxyRequest))
-	}
-
-	return context.WithTimeout(ctx, timeouts.DefaultProxyRequest)
-}
-
-func buildRemoteRequestInternal(
-	target *Target,
-	method string,
-	path string,
-	body []byte,
-	headers map[string]string,
-) (remenv.Request, error) {
-	if target == nil {
-		return remenv.Request{}, errors.New("remote environment target is required")
-	}
-
-	requestHeaders := make(map[string]string, len(headers)+2)
-	maps.Copy(requestHeaders, headers)
-	if len(body) > 0 && method != http.MethodGet && requestHeaders["Content-Type"] == "" {
-		requestHeaders["Content-Type"] = "application/json"
-	}
-	remenv.ApplyAgentTokenHeaderMap(requestHeaders, target.accessToken)
-
-	return remenv.Request{
-		EnvironmentID: target.id,
-		IsEdge:        target.isEdge,
-		Method:        method,
-		URL:           target.targetURL + path,
-		Path:          path,
-		Headers:       requestHeaders,
-		Body:          body,
-	}, nil
+	return context.WithTimeout(ctx, timeouts.GetDuration(s.settingsService.GetSettingsConfig().ProxyRequestTimeout.AsInt(), timeouts.DefaultProxyRequest))
 }
 
 // Execute sends one request to the target agent.
@@ -137,16 +133,24 @@ func (s *Service) Execute(
 ) (*remenv.Response, error) {
 	// Forward the activity batch ID so bulk actions proxied to a remote
 	// environment group the same way they do locally.
-	var headers map[string]string
+	requestHeaders := make(map[string]string, 3)
 	if batchID := utils.ActivityBatchIDFromContext(ctx); batchID != "" {
-		headers = map[string]string{middleware.HeaderActivityBatchID: batchID}
+		requestHeaders[middleware.HeaderActivityBatchID] = batchID
 	}
-	request, err := buildRemoteRequestInternal(target, method, path, body, headers)
-	if err != nil {
-		return nil, err
+	if len(body) > 0 && method != http.MethodGet {
+		requestHeaders["Content-Type"] = "application/json"
 	}
+	remenv.ApplyAgentTokenHeaderMap(requestHeaders, target.accessToken)
 
-	resp, err := s.client.Do(ctx, request)
+	resp, err := s.client.Do(ctx, remenv.Request{
+		EnvironmentID: target.id,
+		IsEdge:        target.isEdge,
+		Method:        method,
+		URL:           target.targetURL + path,
+		Path:          path,
+		Headers:       requestHeaders,
+		Body:          body,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to send request to environment %s: %w", target.name, err)
 	}
@@ -191,38 +195,28 @@ func (s *Service) SyncRegistries(ctx context.Context, target *Target) error {
 				return containerregistry.Sync{}, false, fmt.Errorf("normalize registry type for sync %s: %w", reg.ID, typeErr)
 			}
 
-			syncItem := containerregistry.Sync{
-				ID:              reg.ID,
-				URL:             reg.URL,
-				Description:     reg.Description,
-				Insecure:        reg.Insecure,
-				Enabled:         reg.Enabled,
-				RegistryType:    registryType,
-				RepositoryNames: reg.RepositoryNames,
-				CreatedAt:       reg.CreatedAt,
-				UpdatedAt:       reg.UpdatedAt,
+			decrypted, err := crypto.Decrypt(kit.Ternary(registryType == registry.RegistryTypeECR, reg.AWSSecretAccessKey, reg.Token))
+			if err != nil {
+				return containerregistry.Sync{}, false, fmt.Errorf("failed to decrypt %s for registry %s for sync: %w",
+					kit.Ternary(registryType == registry.RegistryTypeECR, "ECR secret", "token"), reg.ID, err)
 			}
 
-			if registryType == registry.RegistryTypeECR {
-				decryptedSecret, err := crypto.Decrypt(reg.AWSSecretAccessKey)
-				if err != nil {
-					return containerregistry.Sync{}, false, fmt.Errorf("failed to decrypt ECR secret for registry %s for sync: %w", reg.ID, err)
-				}
-
-				syncItem.AWSAccessKeyID = reg.AWSAccessKeyID
-				syncItem.AWSSecretAccessKey = decryptedSecret
-				syncItem.AWSRegion = reg.AWSRegion
-			} else {
-				decryptedToken, err := crypto.Decrypt(reg.Token)
-				if err != nil {
-					return containerregistry.Sync{}, false, fmt.Errorf("failed to decrypt token for registry %s for sync: %w", reg.ID, err)
-				}
-
-				syncItem.Username = reg.Username
-				syncItem.Token = decryptedToken
-			}
-
-			return syncItem, true, nil
+			return containerregistry.Sync{
+				ID:                 reg.ID,
+				URL:                reg.URL,
+				Username:           kit.Ternary(registryType == registry.RegistryTypeECR, "", reg.Username),
+				Token:              kit.Ternary(registryType == registry.RegistryTypeECR, "", decrypted),
+				Description:        reg.Description,
+				Insecure:           reg.Insecure,
+				Enabled:            reg.Enabled,
+				RegistryType:       registryType,
+				RepositoryNames:    reg.RepositoryNames,
+				AWSAccessKeyID:     kit.Ternary(registryType == registry.RegistryTypeECR, reg.AWSAccessKeyID, ""),
+				AWSSecretAccessKey: kit.Ternary(registryType == registry.RegistryTypeECR, decrypted, ""),
+				AWSRegion:          kit.Ternary(registryType == registry.RegistryTypeECR, reg.AWSRegion, ""),
+				CreatedAt:          reg.CreatedAt,
+				UpdatedAt:          reg.UpdatedAt,
+			}, true, nil
 		},
 		func(items []containerregistry.Sync) containerregistry.SyncRequest {
 			return containerregistry.SyncRequest{Registries: items}
@@ -250,56 +244,51 @@ func (s *Service) SyncS3Destinations(ctx context.Context, target *Target) error 
 func (s *Service) SyncRepositories(ctx context.Context, target *Target) error {
 	return s.fanOutSyncToEnvironment(ctx, target, "git repositories", "/api/git-repositories/sync",
 		func(repo gitrepo.GitRepository) (gitops.RepositorySync, bool, error) {
-			item := gitops.RepositorySync{
+			decrypt := func(value, what string) (string, error) {
+				if value == "" {
+					return "", nil
+				}
+				plain, err := crypto.Decrypt(value)
+				if err != nil {
+					return "", fmt.Errorf("failed to decrypt %s for repository %s for sync: %w", what, repo.ID, err)
+				}
+				return plain, nil
+			}
+			token, err := decrypt(repo.Token, "token")
+			if err != nil {
+				return gitops.RepositorySync{}, false, err
+			}
+			sshKey, err := decrypt(repo.SSHKey, "SSH key")
+			if err != nil {
+				return gitops.RepositorySync{}, false, err
+			}
+			signingKey, err := decrypt(repo.SigningKey, "signing key")
+			if err != nil {
+				return gitops.RepositorySync{}, false, err
+			}
+			passphrase, err := decrypt(repo.SigningKeyPassphrase, "signing key passphrase")
+			if err != nil {
+				return gitops.RepositorySync{}, false, err
+			}
+
+			return gitops.RepositorySync{
 				ID:                     repo.ID,
 				Name:                   repo.Name,
 				URL:                    repo.URL,
 				AuthType:               repo.AuthType,
 				Username:               repo.Username,
+				Token:                  token,
+				SSHKey:                 sshKey,
 				SSHHostKeyVerification: repo.SSHHostKeyVerification,
 				CommitAuthorName:       repo.CommitAuthorName,
 				CommitAuthorEmail:      repo.CommitAuthorEmail,
+				SigningKey:             signingKey,
+				SigningKeyPassphrase:   passphrase,
 				Description:            repo.Description,
 				Enabled:                repo.Enabled,
 				CreatedAt:              repo.CreatedAt,
-			}
-			if repo.UpdatedAt != nil {
-				item.UpdatedAt = *repo.UpdatedAt
-			}
-
-			if repo.Token != "" {
-				decryptedToken, err := crypto.Decrypt(repo.Token)
-				if err != nil {
-					return gitops.RepositorySync{}, false, fmt.Errorf("failed to decrypt token for repository %s for sync: %w", repo.ID, err)
-				}
-				item.Token = decryptedToken
-			}
-
-			if repo.SSHKey != "" {
-				decryptedSSHKey, err := crypto.Decrypt(repo.SSHKey)
-				if err != nil {
-					return gitops.RepositorySync{}, false, fmt.Errorf("failed to decrypt SSH key for repository %s for sync: %w", repo.ID, err)
-				}
-				item.SSHKey = decryptedSSHKey
-			}
-
-			if repo.SigningKey != "" {
-				decryptedSigningKey, err := crypto.Decrypt(repo.SigningKey)
-				if err != nil {
-					return gitops.RepositorySync{}, false, fmt.Errorf("failed to decrypt signing key for repository %s for sync: %w", repo.ID, err)
-				}
-				item.SigningKey = decryptedSigningKey
-			}
-
-			if repo.SigningKeyPassphrase != "" {
-				decryptedPassphrase, err := crypto.Decrypt(repo.SigningKeyPassphrase)
-				if err != nil {
-					return gitops.RepositorySync{}, false, fmt.Errorf("failed to decrypt signing key passphrase for repository %s for sync: %w", repo.ID, err)
-				}
-				item.SigningKeyPassphrase = decryptedPassphrase
-			}
-
-			return item, true, nil
+				UpdatedAt:              kit.FromPtr(repo.UpdatedAt),
+			}, true, nil
 		},
 		func(items []gitops.RepositorySync) gitops.RepositorySyncRequest {
 			return gitops.RepositorySyncRequest{Repositories: items}
@@ -319,7 +308,6 @@ func (s *Service) fanOutSyncToEnvironment[Model, Item, Request any](
 	toSyncItem func(Model) (Item, bool, error),
 	wrap func([]Item) Request,
 ) error {
-	environmentID := target.id
 	var records []Model
 	if loadRecordsErr := s.db.WithContext(ctx).Find(&records).Error; loadRecordsErr != nil {
 		return fmt.Errorf("failed to get %s: %w", kind, loadRecordsErr)
@@ -340,18 +328,18 @@ func (s *Service) fanOutSyncToEnvironment[Model, Item, Request any](
 	if err != nil {
 		return fmt.Errorf("failed to marshal sync request: %w", err)
 	}
-	unchanged, finishDelivery, err := s.syncGate.Begin(ctx, environmentID, path, reqBody)
+	unchanged, finishDelivery, err := s.syncGate.Begin(ctx, target.id, path, reqBody)
 	if err != nil {
 		return fmt.Errorf("sync cancelled while waiting for an in-flight delivery: %w", err)
 	}
 	if unchanged {
-		slog.DebugContext(ctx, "Skipping sync; payload unchanged since last delivery", "kind", kind, "environmentId", environmentID, "environmentName", target.name)
+		slog.DebugContext(ctx, "Skipping sync; payload unchanged since last delivery", "kind", kind, "environmentId", target.id, "environmentName", target.name)
 		return nil
 	}
 	delivered := false
 	defer func() { finishDelivery(delivered) }()
 
-	slog.InfoContext(ctx, "Starting sync to environment", "kind", kind, "environmentId", environmentID, "environmentName", target.name, "apiUrl", target.targetURL)
+	slog.InfoContext(ctx, "Starting sync to environment", "kind", kind, "environmentId", target.id, "environmentName", target.name, "apiUrl", target.targetURL)
 
 	reqCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
@@ -373,50 +361,7 @@ func (s *Service) fanOutSyncToEnvironment[Model, Item, Request any](
 	}
 	delivered = true
 
-	slog.InfoContext(ctx, "Successfully synced to environment", "kind", kind, "environmentId", environmentID, "environmentName", target.name)
+	slog.InfoContext(ctx, "Successfully synced to environment", "kind", kind, "environmentId", target.id, "environmentName", target.name)
 
 	return nil
-}
-
-func doTunnelRequestInternal(
-	ctx context.Context,
-	envID string,
-	method string,
-	path string,
-	headers map[string]string,
-	body []byte,
-) (*remenv.Response, error) {
-	tunnel, ok := edge.GetRegistry().Get(envID).Get()
-	if !ok {
-		return nil, fmt.Errorf("no active tunnel for environment %s: %w", envID, remenv.ErrEnvironmentUnavailable)
-	}
-	if tunnel.Conn.IsClosed() {
-		return nil, fmt.Errorf("tunnel for environment %s is closed: %w", envID, remenv.ErrEnvironmentUnavailable)
-	}
-
-	statusCode, respHeaders, respBody, err := edge.ProxyRequest(ctx, tunnel, method, path, "", headers, body)
-	if err != nil {
-		if errors.Is(err, edge.ErrTunnelConnectionClosed) {
-			err = errors.Join(remenv.ErrEnvironmentUnavailable, err)
-		}
-		return nil, fmt.Errorf("tunnel request failed: %w", err)
-	}
-
-	return &remenv.Response{
-		StatusCode: statusCode,
-		Body:       respBody,
-		Headers:    respHeaders,
-	}, nil
-}
-
-func ensureTunnelAvailableInternal(ctx context.Context, envID string) error {
-	if edge.HasActiveTunnel(envID) {
-		return nil
-	}
-
-	if _, ok := edge.RequestTunnelAndWait(ctx, envID, edge.DefaultTunnelDemandTTL, edge.DefaultTunnelAcquireTimeout()).Get(); ok {
-		return nil
-	}
-
-	return remenv.ErrEnvironmentUnavailable
 }

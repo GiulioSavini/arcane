@@ -119,7 +119,32 @@ func (s *Service) GenerateMTLS(ctx context.Context, edgeCfg *edge.Config, envID,
 	if generatedAssets == nil {
 		return nil, "", ""
 	}
-	s.logGeneratedMTLSEvents(ctx, envID, envName, generatedAssets)
+	if generatedAssets.CAGenerated {
+		if _, caEventErr := s.eventService.CreateEvent(ctx, event.CreateEventRequest{
+			Type:        event.EventTypeEnvironmentMTLSCAGenerated,
+			Severity:    event.EventSeverityInfo,
+			Title:       "Edge mTLS CA generated",
+			Description: "Arcane generated a new edge mTLS certificate authority",
+			Metadata:    database.JSON{"kind": "ca"},
+		}); caEventErr != nil {
+			slog.WarnContext(ctx, "Failed to create edge mTLS CA generation event", "error", caEventErr)
+		}
+	}
+	if generatedAssets.CertIssued {
+		if _, certEventErr := s.eventService.CreateEvent(ctx, event.CreateEventRequest{
+			Type:          event.EventTypeEnvironmentMTLSCertIssued,
+			Severity:      event.EventSeverityInfo,
+			Title:         "Edge mTLS certificate issued",
+			Description:   fmt.Sprintf("Arcane issued an edge mTLS client certificate for environment '%s'", envName),
+			ResourceType:  new("environment"),
+			ResourceID:    new(envID),
+			ResourceName:  new(envName),
+			EnvironmentID: new(envID),
+			Metadata:      database.JSON{"kind": "client"},
+		}); certEventErr != nil {
+			slog.WarnContext(ctx, "Failed to create edge mTLS certificate issuance event", "environmentId", envID, "error", certEventErr)
+		}
+	}
 
 	mtlsDockerRun := strings.Join([]string{
 		"docker run -d \\",
@@ -159,39 +184,6 @@ func (s *Service) GenerateMTLS(ctx context.Context, edgeCfg *edge.Config, envID,
 	}, "\n")
 
 	return generatedAssets, mtlsDockerRun, mtlsDockerCompose
-}
-
-func (s *Service) logGeneratedMTLSEvents(ctx context.Context, envID, envName string, assets *edge.GeneratedMTLSAssets) {
-	if s == nil || s.eventService == nil || assets == nil {
-		return
-	}
-	if assets.CAGenerated {
-		if _, err := s.eventService.CreateEvent(ctx, event.CreateEventRequest{
-			Type:        event.EventTypeEnvironmentMTLSCAGenerated,
-			Severity:    event.EventSeverityInfo,
-			Title:       "Edge mTLS CA generated",
-			Description: "Arcane generated a new edge mTLS certificate authority",
-			Metadata:    database.JSON{"kind": "ca"},
-		}); err != nil {
-			slog.WarnContext(ctx, "Failed to create edge mTLS CA generation event", "error", err)
-		}
-	}
-	if assets.CertIssued {
-		envIDCopy := envID
-		if _, err := s.eventService.CreateEvent(ctx, event.CreateEventRequest{
-			Type:          event.EventTypeEnvironmentMTLSCertIssued,
-			Severity:      event.EventSeverityInfo,
-			Title:         "Edge mTLS certificate issued",
-			Description:   fmt.Sprintf("Arcane issued an edge mTLS client certificate for environment '%s'", envName),
-			ResourceType:  new("environment"),
-			ResourceID:    &envIDCopy,
-			ResourceName:  new(envName),
-			EnvironmentID: &envIDCopy,
-			Metadata:      database.JSON{"kind": "client"},
-		}); err != nil {
-			slog.WarnContext(ctx, "Failed to create edge mTLS certificate issuance event", "environmentId", envID, "error", err)
-		}
-	}
 }
 
 func AgentHostPort(agentURL string) string {

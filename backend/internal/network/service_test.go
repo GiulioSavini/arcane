@@ -43,14 +43,40 @@ func networkScopeContext(t *testing.T, target string, bodies map[string]any) (co
 
 func TestAggregateNetworksMergesEnvironments(t *testing.T) {
 	bodies := map[string]any{
-		"a": base.PaginatedWithCounts[networktypes.Summary, networktypes.UsageCounts]{Success: true, Data: []networktypes.Summary{
-			{ID: "a1", Name: "bridge", InUse: true},
-			{ID: "a2", Name: "frontend"},
-		}, Counts: networktypes.UsageCounts{Inuse: 1, Unused: 1, Total: 2}, Pagination: base.PaginationResponse{TotalItems: 2, GrandTotalItems: 3}},
-		"b": base.PaginatedWithCounts[networktypes.Summary, networktypes.UsageCounts]{Success: true, Data: []networktypes.Summary{
-			{ID: "b1", Name: "backend", InUse: true},
-			{ID: "b2", Name: "bridge", InUse: true},
-		}, Counts: networktypes.UsageCounts{Inuse: 2, Total: 2}, Pagination: base.PaginationResponse{TotalItems: 2}},
+		"a": base.PaginatedWithCounts[networktypes.Summary, networktypes.UsageCounts]{
+			Success: true,
+			Data: []networktypes.Summary{
+				{
+					ID:    "a1",
+					Name:  "bridge",
+					InUse: true,
+				},
+				{ID: "a2", Name: "frontend"},
+			},
+			Counts: networktypes.UsageCounts{
+				Inuse:  1,
+				Unused: 1,
+				Total:  2,
+			},
+			Pagination: base.PaginationResponse{TotalItems: 2, GrandTotalItems: 3},
+		},
+		"b": base.PaginatedWithCounts[networktypes.Summary, networktypes.UsageCounts]{
+			Success: true,
+			Data: []networktypes.Summary{
+				{
+					ID:    "b1",
+					Name:  "backend",
+					InUse: true,
+				},
+				{
+					ID:    "b2",
+					Name:  "bridge",
+					InUse: true,
+				},
+			},
+			Counts:     networktypes.UsageCounts{Inuse: 2, Total: 2},
+			Pagination: base.PaginationResponse{TotalItems: 2},
+		},
 	}
 	rowLabels := func(items []networktypes.Summary) []string {
 		out := make([]string, 0, len(items))
@@ -73,7 +99,11 @@ func TestAggregateNetworksMergesEnvironments(t *testing.T) {
 		require.Equal(t, int64(5), body.Pagination.GrandTotalItems)
 		require.Equal(t, int64(2), body.Pagination.TotalPages)
 		require.Equal(t, 2, body.Pagination.CurrentPage)
-		require.Equal(t, networktypes.UsageCounts{Inuse: 3, Unused: 1, Total: 4}, body.Counts)
+		require.Equal(t, networktypes.UsageCounts{
+			Inuse:  3,
+			Unused: 1,
+			Total:  4,
+		}, body.Counts)
 		require.Equal(t, []base.EnvironmentFailure{{Environment: base.EnvironmentRef{ID: "c", Name: "c"}, Message: "environment offline"}}, body.FailedEnvironments)
 		for _, id := range []string{"a", "b"} {
 			stored, ok := queries.Load(id)
