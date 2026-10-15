@@ -20,7 +20,7 @@ import (
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/scheduler/jobcontext"
 )
 
-func newTestServiceInternal(t *testing.T, server *httptest.Server, pending func(context.Context) ([]updater.ImageUpdateRecord, error)) *Service {
+func newTestService(t *testing.T, server *httptest.Server, pending func(context.Context) ([]updater.ImageUpdateRecord, error)) *Service {
 	t.Helper()
 	dockerClient, err := client.New(client.WithHost(server.URL), client.WithAPIVersion("1.41"), client.WithHTTPClient(server.Client()))
 	require.NoError(t, err)
@@ -92,7 +92,7 @@ func TestFrozenTargetsPreserveAllSelectedContainers(t *testing.T) {
 		http.NotFound(w, r)
 	}))
 	defer server.Close()
-	svc := newTestServiceInternal(t, server, func(context.Context) ([]updater.ImageUpdateRecord, error) { return pending, nil })
+	svc := newTestService(t, server, func(context.Context) ([]updater.ImageUpdateRecord, error) { return pending, nil })
 	var evidence []byte
 	ctx := jobcontext.WithExecution(t.Context(), scheduler.Run{ID: "run"}, func(target scheduler.TargetOutcome) error {
 		if target.ID == "auto-update" {
@@ -102,7 +102,7 @@ func TestFrozenTargetsPreserveAllSelectedContainers(t *testing.T) {
 	})
 	frozenCtx, err := svc.FreezePending(ctx, scheduler.Run{ID: "run"}, nil)
 	require.NoError(t, err)
-	plan := frozenCtx.Value(frozenPendingKeyInternal{}).(*frozenUpdatePlanInternal)
+	plan := frozenCtx.Value(frozenPendingKey{}).(*frozenUpdatePlan)
 	require.Len(t, plan.Records, 2)
 	require.Equal(t, "a", plan.Records[0].ContainerID)
 	require.Equal(t, "b", plan.Records[1].ContainerID)
@@ -115,9 +115,23 @@ func TestFrozenTargetConfirmsReplacementAndRejectsUnknownEffect(t *testing.T) {
 		name, id, image      string
 		confirmed, unchanged bool
 	}{
-		{"replacement", "new", "sha256:desired", true, false},
-		{"unchanged", "old", "sha256:baseline", false, true},
-		{"unknown replacement", "new", "sha256:other", false, false},
+		{
+			name:      "replacement",
+			id:        "new",
+			image:     "sha256:desired",
+			confirmed: true,
+		},
+		{
+			name:      "unchanged",
+			id:        "old",
+			image:     "sha256:baseline",
+			unchanged: true,
+		},
+		{
+			name:  "unknown replacement",
+			id:    "new",
+			image: "sha256:other",
+		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -152,7 +166,7 @@ func TestFrozenTargetConfirmsReplacementAndRejectsUnknownEffect(t *testing.T) {
 				}
 			}))
 			defer server.Close()
-			svc := newTestServiceInternal(t, server, nil)
+			svc := newTestService(t, server, nil)
 			confirmed, unchanged, err := svc.ConfirmTarget(
 				t.Context(),
 				arcaneupdater.FrozenUpdateTarget{
@@ -174,14 +188,43 @@ func TestFrozenTargetConfirmsReplacementAndRejectsUnknownEffect(t *testing.T) {
 func TestFreezePendingExcludesFailedChecksAndIsolatesFreezeFailures(t *testing.T) {
 	desired := "sha256:desired"
 	pending := []updater.ImageUpdateRecord{
-		{ID: "app", Repository: "registry.example.com/app", Tag: "latest", HasUpdate: true, LatestDigest: &desired},
-		{ID: "unresolvable", Repository: "registry.example.com/unresolvable", Tag: "latest", HasUpdate: true},
-		{ID: "unchecked", Repository: "registry.example.com/unchecked", Tag: "latest", HasUpdate: true, LatestDigest: &desired},
+		{
+			ID:           "app",
+			Repository:   "registry.example.com/app",
+			Tag:          "latest",
+			HasUpdate:    true,
+			LatestDigest: &desired,
+		},
+		{
+			ID:         "unresolvable",
+			Repository: "registry.example.com/unresolvable",
+			Tag:        "latest",
+			HasUpdate:  true,
+		},
+		{
+			ID:           "unchecked",
+			Repository:   "registry.example.com/unchecked",
+			Tag:          "latest",
+			HasUpdate:    true,
+			LatestDigest: &desired,
+		},
 	}
 	running := []container.Summary{
-		{ID: "app", Names: []string{"/app"}, Image: "registry.example.com/app:latest"},
-		{ID: "unresolvable", Names: []string{"/unresolvable"}, Image: "registry.example.com/unresolvable:latest"},
-		{ID: "unchecked", Names: []string{"/unchecked"}, Image: "registry.example.com/unchecked:latest"},
+		{
+			ID:    "app",
+			Names: []string{"/app"},
+			Image: "registry.example.com/app:latest",
+		},
+		{
+			ID:    "unresolvable",
+			Names: []string{"/unresolvable"},
+			Image: "registry.example.com/unresolvable:latest",
+		},
+		{
+			ID:    "unchecked",
+			Names: []string{"/unchecked"},
+			Image: "registry.example.com/unchecked:latest",
+		},
 	}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -192,8 +235,11 @@ func TestFreezePendingExcludesFailedChecksAndIsolatesFreezeFailures(t *testing.T
 		for _, summary := range running {
 			if strings.HasSuffix(r.URL.Path, "/containers/"+summary.ID+"/json") {
 				assert.NoError(t, json.MarshalWrite(w, container.InspectResponse{
-					ID: summary.ID, Name: summary.Names[0], Image: "sha256:old",
-					Config: &container.Config{Image: summary.Image}, State: &container.State{StartedAt: "baseline"},
+					ID:     summary.ID,
+					Name:   summary.Names[0],
+					Image:  "sha256:old",
+					Config: &container.Config{Image: summary.Image},
+					State:  &container.State{StartedAt: "baseline"},
 				}))
 				return
 			}
@@ -201,7 +247,7 @@ func TestFreezePendingExcludesFailedChecksAndIsolatesFreezeFailures(t *testing.T
 		http.NotFound(w, r)
 	}))
 	defer server.Close()
-	svc := newTestServiceInternal(t, server, func(context.Context) ([]updater.ImageUpdateRecord, error) { return pending, nil })
+	svc := newTestService(t, server, func(context.Context) ([]updater.ImageUpdateRecord, error) { return pending, nil })
 	targets := map[string]scheduler.TargetOutcome{}
 	ctx := jobcontext.WithExecution(t.Context(), scheduler.Run{ID: "run"}, func(target scheduler.TargetOutcome) error {
 		targets[target.ID] = target
@@ -210,7 +256,7 @@ func TestFreezePendingExcludesFailedChecksAndIsolatesFreezeFailures(t *testing.T
 
 	frozenCtx, err := svc.FreezePending(ctx, scheduler.Run{ID: "run"}, map[string]bool{"registry.example.com/unchecked:latest": true})
 	require.NoError(t, err)
-	plan := frozenCtx.Value(frozenPendingKeyInternal{}).(*frozenUpdatePlanInternal)
+	plan := frozenCtx.Value(frozenPendingKey{}).(*frozenUpdatePlan)
 	require.Len(t, plan.Targets, 1)
 	require.Equal(t, "app", plan.Targets[0].ContainerID)
 	require.Equal(t, scheduler.Queued, targets["app"].Status)
@@ -221,25 +267,54 @@ func TestFreezePendingExcludesFailedChecksAndIsolatesFreezeFailures(t *testing.T
 
 func TestResumePlanConfirmsRedeliveredChangeWithoutReapplying(t *testing.T) {
 	target := arcaneupdater.FrozenUpdateTarget{
-		ContainerID: "old", ContainerName: "app", BaselineImageID: "sha256:baseline", BaselineStartedAt: "baseline",
-		DesiredImageRef: "registry.example.com/app:latest", DesiredDigest: "sha256:desired",
+		ContainerID:       "old",
+		ContainerName:     "app",
+		BaselineImageID:   "sha256:baseline",
+		BaselineStartedAt: "baseline",
+		DesiredImageRef:   "registry.example.com/app:latest",
+		DesiredDigest:     "sha256:desired",
 	}
-	raw, err := json.Marshal(frozenUpdatePlanInternal{
-		Records: []updater.ImageUpdateRecord{{ID: "image", ContainerID: "old", Repository: "registry.example.com/app", Tag: "latest", HasUpdate: true}},
+	raw, err := json.Marshal(frozenUpdatePlan{
+		Records: []updater.ImageUpdateRecord{{
+			ContainerID: "old",
+			ID:          "image",
+			Repository:  "registry.example.com/app",
+			Tag:         "latest",
+			HasUpdate:   true,
+		}},
 		Targets: []arcaneupdater.FrozenUpdateTarget{target},
 	})
 	require.NoError(t, err)
 	run := scheduler.Run{ID: "run", Outcome: scheduler.Outcome{Targets: []scheduler.TargetOutcome{
-		{ID: "auto-update", ResourceType: "update-batch", Status: scheduler.Running, RecoveryData: raw},
-		{ID: "old", ResourceType: "container", Status: scheduler.Running},
+		{
+			ID:           "auto-update",
+			ResourceType: "update-batch",
+			Status:       scheduler.Running,
+			RecoveryData: raw,
+		},
+		{
+			ID:           "old",
+			ResourceType: "container",
+			Status:       scheduler.Running,
+		},
 	}}}
 	for _, test := range []struct {
 		name, id, image string
 		remaining       int
 		status          scheduler.RunStatus
 	}{
-		{"applied before the redelivery", "new", "sha256:desired", 0, scheduler.Succeeded},
-		{"not yet applied", "old", "sha256:baseline", 1, ""},
+		{
+			name:   "applied before the redelivery",
+			id:     "new",
+			image:  "sha256:desired",
+			status: scheduler.Succeeded,
+		},
+		{
+			name:      "not yet applied",
+			id:        "old",
+			image:     "sha256:baseline",
+			remaining: 1,
+		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -251,14 +326,18 @@ func TestResumePlanConfirmsRedeliveredChangeWithoutReapplying(t *testing.T) {
 					assert.NoError(t, json.MarshalWrite(w, image.InspectResponse{ID: "sha256:desired"}))
 				case strings.Contains(r.URL.Path, "/containers/"):
 					assert.NoError(t, json.MarshalWrite(w, container.InspectResponse{
-						ID: test.id, Name: "/app", Image: test.image, Config: &container.Config{}, State: &container.State{StartedAt: "baseline"},
+						ID:     test.id,
+						Name:   "/app",
+						Image:  test.image,
+						Config: &container.Config{},
+						State:  &container.State{StartedAt: "baseline"},
 					}))
 				default:
 					http.NotFound(w, r)
 				}
 			}))
 			defer server.Close()
-			svc := newTestServiceInternal(t, server, nil)
+			svc := newTestService(t, server, nil)
 			var status scheduler.RunStatus
 			ctx := jobcontext.WithExecution(t.Context(), run, func(progress scheduler.TargetOutcome) error {
 				status = progress.Status

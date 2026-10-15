@@ -1,14 +1,15 @@
 package updater
 
 import (
+	"cmp"
 	"context"
-	"errors"
 	"net/http"
 
 	"github.com/danielgtaylor/huma/v2"
 	"github.com/getarcaneapp/arcane/types/v2/base"
 	"github.com/getarcaneapp/arcane/types/v2/project"
 	"github.com/getarcaneapp/arcane/types/v2/updater"
+	kit "go.getarcane.app/kit/pkg"
 	"go.getarcane.app/kit/pkg/mapping"
 
 	"github.com/getarcaneapp/arcane/backend/v2/internal/common"
@@ -49,18 +50,10 @@ type GetUpdaterHistoryInput struct {
 
 // RunUpdater applies pending container updates.
 func (h *UpdaterHandler) RunUpdater(ctx context.Context, input *RunUpdaterInput) (*handlerutil.Out[*updater.Result], error) {
-	options := updater.Options{}
-	if input.Body != nil {
-		options = *input.Body
-	}
-
-	runtimeCtx := utils.ActivityRuntimeContext(ctx, h.appCtx)
-	out, err := h.updaterService.ApplyPending(runtimeCtx, options)
+	out, err := h.updaterService.ApplyPending(utils.ActivityRuntimeContext(ctx, h.appCtx), kit.FromPtr(input.Body))
 	if err != nil {
-		if errors.Is(err, common.ErrBadRequest) {
-			return nil, huma.Error400BadRequest("Failed to run updater: " + err.Error())
-		}
-		return nil, huma.Error500InternalServerError("Failed to run updater: " + err.Error())
+		apiErr := common.ToAPIError(err)
+		return nil, huma.NewError(apiErr.HTTPStatus(), "Failed to run updater: "+apiErr.Message)
 	}
 
 	return &handlerutil.Out[*updater.Result]{
@@ -73,24 +66,17 @@ func (h *UpdaterHandler) RunUpdater(ctx context.Context, input *RunUpdaterInput)
 
 // GetUpdaterStatus returns the current status of the updater.
 func (h *UpdaterHandler) GetUpdaterStatus(ctx context.Context, input *GetUpdaterStatusInput) (*handlerutil.Out[updater.Status], error) {
-	status := h.updaterService.GetStatus()
-
 	return &handlerutil.Out[updater.Status]{
 		Body: base.ApiResponse[updater.Status]{
 			Success: true,
-			Data:    status,
+			Data:    h.updaterService.GetStatus(),
 		},
 	}, nil
 }
 
 // GetUpdaterHistory returns the history of update operations.
 func (h *UpdaterHandler) GetUpdaterHistory(ctx context.Context, input *GetUpdaterHistoryInput) (*handlerutil.Out[[]updater.AutoUpdateRecord], error) {
-	limit := input.Limit
-	if limit <= 0 {
-		limit = 50
-	}
-
-	history, err := h.updaterService.GetHistory(ctx, limit)
+	history, err := h.updaterService.GetHistory(ctx, cmp.Or(max(input.Limit, 0), 50))
 	if err != nil {
 		return nil, huma.Error500InternalServerError("Failed to get updater history: " + err.Error())
 	}
@@ -117,7 +103,10 @@ func (h *UpdaterHandler) updateContainer(ctx context.Context, input *UpdateConta
 		}
 		return &updateContainerOutput{
 			Status: http.StatusAccepted,
-			Body:   base.ApiResponse[any]{Success: true, Data: acceptedActivity},
+			Body: base.ApiResponse[any]{
+				Success: true,
+				Data:    acceptedActivity,
+			},
 		}, nil
 	}
 	out, err := h.updaterService.UpdateSingleContainer(runtimeCtx, input.ContainerID)
@@ -140,5 +129,10 @@ func (h *UpdaterHandler) CheckProjectUpdates(ctx context.Context, input *updater
 	if err != nil {
 		return nil, err
 	}
-	return &handlerutil.Out[*project.UpdateInfo]{Body: base.ApiResponse[*project.UpdateInfo]{Success: true, Data: result}}, nil
+	return &handlerutil.Out[*project.UpdateInfo]{
+		Body: base.ApiResponse[*project.UpdateInfo]{
+			Success: true,
+			Data:    result,
+		},
+	}, nil
 }

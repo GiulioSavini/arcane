@@ -16,7 +16,6 @@ import (
 	"github.com/compose-spec/compose-go/v2/types"
 	"github.com/containerd/errdefs"
 	activitytypes "github.com/getarcaneapp/arcane/types/v2/activity"
-	"github.com/getarcaneapp/arcane/types/v2/containerregistry"
 	imageupdatetypes "github.com/getarcaneapp/arcane/types/v2/imageupdate"
 	projecttypes "github.com/getarcaneapp/arcane/types/v2/project"
 	"github.com/getarcaneapp/arcane/types/v2/scheduler"
@@ -62,6 +61,18 @@ import (
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/utils/imageref"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/utils/notifications"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/utils/userctx"
+)
+
+var (
+	errUpdateBusy = errors.New("another container update is running")
+
+	containerEventTypes = map[string]event.EventType{
+		"container_stop":   event.EventTypeContainerStop,
+		"container_delete": event.EventTypeContainerDelete,
+		"container_create": event.EventTypeContainerCreate,
+		"container_start":  event.EventTypeContainerStart,
+		"container_update": event.EventTypeContainerUpdate,
+	}
 )
 
 // UpdaterService is Arcane's handler-facing service for the standalone updater engine.
@@ -135,18 +146,6 @@ type (
 	}
 )
 
-var (
-	errUpdateBusy = errors.New("another container update is running")
-
-	containerEventTypes = map[string]event.EventType{
-		"container_stop":   event.EventTypeContainerStop,
-		"container_delete": event.EventTypeContainerDelete,
-		"container_create": event.EventTypeContainerCreate,
-		"container_start":  event.EventTypeContainerStart,
-		"container_update": event.EventTypeContainerUpdate,
-	}
-)
-
 // NewUpdaterService constructs the Arcane updater facade.
 func NewUpdaterService(
 	db *database.DB,
@@ -182,19 +181,16 @@ func NewUpdaterService(
 			SystemUser:             usertypes.SystemUser,
 		},
 	}
-	// A nil registry service must reach the engine as a nil interface, not a typed nil.
-	var digestResolver updater.RegistryDigestResolver
-	if registries != nil {
-		digestResolver = registries
-	}
+	// keep: recovery callbacks bind to the allocated service
 	service.recovery = recovery.NewService(
 		service.DockerClient,
-		func() updater.RegistryDigestResolver { return digestResolver },
+		func() updater.RegistryDigestResolver { return registries },
 		service.PendingImageUpdates,
 		activityIDFromContext,
 		service.acquireUpdate,
 		service.ApplyPending,
 	)
+	// keep: execution callbacks bind to the allocated service and its recovery
 	service.execution = execution.NewService(execution.Dependencies{
 		Config:           cfg,
 		Roles:            roles,
@@ -214,7 +210,7 @@ func NewUpdaterService(
 		PendingStore:           service,
 		RunRecorder:            service,
 		Settings:               service,
-		RegistryDigestResolver: digestResolver,
+		RegistryDigestResolver: registries,
 		RegistryTagLister:      service,
 		ProjectUpdater:         service,
 		SelfUpdater:            service,
@@ -228,6 +224,7 @@ func NewUpdaterService(
 	if err != nil {
 		return nil, fmt.Errorf("configure updater engine: %w", err)
 	}
+	// keep: the engine is configured with the allocated service
 	service.engine = engine
 	events.SetDockerUpdatingContainers(func() []string { return engine.Status().ContainerIDs })
 	return service, nil
@@ -244,40 +241,42 @@ func (s *UpdaterService) ApplyPending(ctx context.Context, options arcaneupdater
 	defer release()
 	start := time.Now()
 	batchCompleted := false
-	activityID := ""
-	if s.deps.Activity != nil {
-		started, startErr := s.deps.Activity.StartActivity(ctx, activitylib.StartRequest{
-			EnvironmentID: "0",
-			Type:          activitytypes.TypeAutoUpdate,
-			Queue:         true,
-			ResourceType:  new("system"),
-			ResourceName:  new("Auto update"),
-			Step:          "Planning updates",
-			LatestMessage: "Auto-update run started",
-			Metadata:      database.JSON{"dryRun": options.DryRun},
-		})
-		if startErr != nil {
-			slog.DebugContext(ctx, "failed to start auto-update activity", "error", startErr)
-		} else {
-			activityID = started.ID
-			ctx = contextWithActivityID(s.deps.Activity.Track(ctx, activityID), activityID)
-		}
+	started, startErr := s.deps.Activity.StartActivity(ctx, activitylib.StartRequest{
+		EnvironmentID: "0",
+		Type:          activitytypes.TypeAutoUpdate,
+		Queue:         true,
+		ResourceType:  new("system"),
+		ResourceName:  new("Auto update"),
+		Step:          "Planning updates",
+		LatestMessage: "Auto-update run started",
+		Metadata:      database.JSON{"dryRun": options.DryRun},
+	})
+	if startErr != nil {
+		slog.DebugContext(ctx, "failed to start auto-update activity", "error", startErr)
+	}
+	activityID := kit.FromPtr(started).ID
+	if activityID != "" {
+		ctx = contextWithActivityID(s.deps.Activity.Track(ctx, activityID), activityID)
 	}
 	out = &arcaneupdater.Result{Items: []arcaneupdater.ResourceResult{}}
 	progress := &updateProgress{}
 	ctx = context.WithValue(ctx, updateProgressKey{}, progress)
 
 	defer func() {
+		// keep: stamps the named result on every return path
 		out.Duration = cmp.Or(out.Duration, time.Since(start).String())
+		// keep: stamps the named result on every return path
 		out.ActivityID = mo.EmptyableToOption(activityID).ToPointer()
 		err = progress.completeBatch(ctx, options, out, batchCompleted, err)
-		failure := ""
-		if err != nil {
-			failure = err.Error()
-		} else if out.Failed > 0 {
-			failure = fmt.Sprintf("%d update action(s) failed", out.Failed)
-		}
-		s.completeAutoUpdateActivity(ctx, activityID, "Auto-update run completed", failure)
+		s.completeAutoUpdateActivity(ctx, activityID, "Auto-update run completed", func() string {
+			switch {
+			case err != nil:
+				return err.Error()
+			case out.Failed > 0:
+				return fmt.Sprintf("%d update action(s) failed", out.Failed)
+			}
+			return ""
+		}())
 	}()
 
 	if activityID != "" {
@@ -303,7 +302,7 @@ func (s *UpdaterService) applyBatch(ctx context.Context, options arcaneupdater.O
 		batch.Lock()
 		entries := batch.entries
 		batch.Unlock()
-		if len(entries) == 0 || s.deps.Notifications == nil {
+		if len(entries) == 0 {
 			return
 		}
 		if err := s.deps.Notifications.SendBatchContainerUpdateNotification(ctx, entries); err != nil {
@@ -330,18 +329,17 @@ func (s *UpdaterService) applyBatch(ctx context.Context, options arcaneupdater.O
 		}
 	} else {
 		moduleResult, engineErr := s.engine.ApplyPending(runCtx, updater.Options{Force: options.ForceUpdate, DryRun: options.DryRun})
-		if moduleResult != nil {
-			*out = *resultFromModule(moduleResult)
-			s.logResultItems(ctx, out)
-		} else if engineErr == nil {
-			engineErr = errors.New("updater returned no batch result")
+		if moduleResult == nil {
+			return cmp.Or(engineErr, errors.New("updater returned no batch result"))
 		}
+		*out = *resultFromModule(moduleResult)
+		s.logResultItems(ctx, out)
 		if engineErr != nil {
 			return engineErr
 		}
 	}
 
-	if !options.DryRun && s.deps.ImageUpdates != nil {
+	if !options.DryRun {
 		s.appendAutoUpdateActivityMessage(ctx, activityID, "Cleaning up update records", "Cleaning up", 95)
 		if cleanupErr := s.deps.ImageUpdates.CleanupOrphanedRecords(runCtx); cleanupErr != nil {
 			slog.WarnContext(ctx, "cleanup orphaned update records failed", "error", cleanupErr)
@@ -361,14 +359,18 @@ func (s *UpdaterService) applyBatch(ctx context.Context, options arcaneupdater.O
 	return nil
 }
 
-// scopedContainerIDs resolves the requested containers, projects, or images to container IDs.
-func (s *UpdaterService) scopedContainerIDs(ctx context.Context, options arcaneupdater.Options) ([]string, error) {
-	requested := kit.TrimNonEmpty(options.ResourceIds)
-	scope := strings.ToLower(strings.TrimSpace(options.Type))
-	containerIDs := requested
-	switch {
-	case len(requested) == 0, scope == "", scope == "container":
-	case scope == "project", scope == "image":
+// applyScopedUpdates updates each requested container through the engine's single-container path.
+func (s *UpdaterService) applyScopedUpdates(ctx context.Context, options arcaneupdater.Options, out *arcaneupdater.Result) error {
+	// scopedContainerIDs resolves the requested containers, projects, or images to container IDs.
+	containerIDs, err := func() ([]string, error) {
+		requested := kit.TrimNonEmpty(options.ResourceIds)
+		scope := strings.ToLower(strings.TrimSpace(options.Type))
+		switch {
+		case len(requested) == 0, scope == "", scope == "container":
+			return requested, nil
+		case scope != "project" && scope != "image":
+			return nil, fmt.Errorf("unsupported scoped update type %q", options.Type)
+		}
 		// Projects match by lowercase Compose project name; images by ID or normalized reference.
 		wanted := make(map[string]bool, len(requested)*2)
 		for _, ref := range requested {
@@ -377,7 +379,7 @@ func (s *UpdaterService) scopedContainerIDs(ctx context.Context, options arcaneu
 				continue
 			}
 			name, discovered := strings.CutPrefix(ref, "compose:")
-			if !discovered && s.deps.Projects != nil {
+			if !discovered {
 				if project, lookupErr := s.deps.Projects.GetProjectFromDatabaseByID(ctx, ref); lookupErr == nil && project != nil {
 					name = cmp.Or(strings.TrimSpace(kit.FromPtr(project.ComposeProjectName)), strings.TrimSpace(project.Name), name)
 				}
@@ -385,33 +387,22 @@ func (s *UpdaterService) scopedContainerIDs(ctx context.Context, options arcaneu
 			wanted[strings.ToLower(strings.TrimSpace(name))] = true
 		}
 		delete(wanted, "")
-		if s.deps.Docker == nil {
-			return nil, errors.New("docker service unavailable")
+		containers, _, _, _, listErr := s.deps.Docker.GetAllContainers(ctx)
+		if listErr != nil {
+			return nil, fmt.Errorf("list containers: %w", listErr)
 		}
-		containers, _, _, _, err := s.deps.Docker.GetAllContainers(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("list containers: %w", err)
-		}
-		containerIDs = nil
+		var matched []string
 		for _, summary := range containers {
-			matched := wanted[summary.ImageID] || wanted[refs.NormalizeImageUpdateRef(summary.Image)]
-			if scope == "project" {
-				project := strings.ToLower(strings.TrimSpace(docker.ComposeProjectLabel(summary.Labels)))
-				matched = docker.ComposeServiceLabel(summary.Labels) != "" && wanted[project]
-			}
-			if matched {
-				containerIDs = append(containerIDs, summary.ID)
+			if kit.Ternary(
+				scope == "project",
+				docker.ComposeServiceLabel(summary.Labels) != "" && wanted[strings.ToLower(strings.TrimSpace(docker.ComposeProjectLabel(summary.Labels)))],
+				wanted[summary.ImageID] || wanted[refs.NormalizeImageUpdateRef(summary.Image)],
+			) {
+				matched = append(matched, summary.ID)
 			}
 		}
-	default:
-		return nil, fmt.Errorf("unsupported scoped update type %q", options.Type)
-	}
-	return containerIDs, nil
-}
-
-// applyScopedUpdates updates each requested container through the engine's single-container path.
-func (s *UpdaterService) applyScopedUpdates(ctx context.Context, options arcaneupdater.Options, out *arcaneupdater.Result) error {
-	containerIDs, err := s.scopedContainerIDs(ctx, options)
+		return matched, nil
+	}()
 	if err != nil {
 		return err
 	}
@@ -419,74 +410,98 @@ func (s *UpdaterService) applyScopedUpdates(ctx context.Context, options arcaneu
 		return common.ErrUpdaterNoContainersMatched
 	}
 
-	engineOpts := updater.Options{Force: options.ForceUpdate, DryRun: options.DryRun}
-	var engineErrs []error
+	var (
+		items                                        = out.Items
+		checked, updated, restarted, skipped, failed int
+		engineErrs                                   []error
+		completed                                    bool
+	)
+	defer func() {
+		*out = arcaneupdater.Result{ //exhaustruct:enforce
+			Success:    kit.Ternary(completed, out.Failed+failed == 0, out.Success),
+			Checked:    out.Checked + checked,
+			Updated:    out.Updated + updated,
+			Restarted:  out.Restarted + restarted,
+			Skipped:    out.Skipped + skipped,
+			Failed:     out.Failed + failed,
+			StartTime:  out.StartTime,
+			EndTime:    out.EndTime,
+			Duration:   out.Duration,
+			Items:      items,
+			ActivityID: out.ActivityID,
+		}
+	}()
 	for _, containerID := range containerIDs {
-		target := scheduler.TargetOutcome{ID: containerID, ResourceType: "container", Status: scheduler.Running}
-		if progressErr := jobcontext.Progress(ctx, target); progressErr != nil {
+		if progressErr := jobcontext.Progress(ctx, scheduler.TargetOutcome{
+			ID:           containerID,
+			ResourceType: "container",
+			Status:       scheduler.Running,
+		}); progressErr != nil {
 			return progressErr
 		}
-		moduleResult, engineErr := s.engine.UpdateContainer(ctx, containerID, engineOpts)
-		target.Status = scheduler.NeedsAttention
-		if moduleResult != nil {
-			partial := resultFromModule(moduleResult)
-			out.Checked += partial.Checked
-			out.Updated += partial.Updated
-			out.Restarted += partial.Restarted
-			out.Skipped += partial.Skipped
-			out.Failed += partial.Failed
-			out.Items = append(out.Items, partial.Items...)
-			target.Status = scheduler.Succeeded
-			if partial.Failed > 0 {
-				target.Status = scheduler.Failed
-			} else if partial.Skipped > 0 {
-				target.Status = scheduler.Skipped
-			}
-		}
+		moduleResult, engineErr := s.engine.UpdateContainer(ctx, containerID, updater.Options{Force: options.ForceUpdate, DryRun: options.DryRun})
+		partial := resultFromModule(moduleResult)
+		checked += partial.Checked
+		updated += partial.Updated
+		restarted += partial.Restarted
+		skipped += partial.Skipped
+		failed += partial.Failed
+		items = append(items, partial.Items...)
 		if engineErr != nil {
-			out.Failed++
-			out.Items = append(out.Items, arcaneupdater.ResourceResult{
+			failed++
+			items = append(items, arcaneupdater.ResourceResult{
 				ResourceID:   containerID,
 				ResourceType: "container",
 				Status:       arcaneupdater.StatusFailed,
 				Error:        engineErr.Error(),
 			})
 			engineErrs = append(engineErrs, fmt.Errorf("%s: %w", containerID, engineErr))
-			target.Status = scheduler.Failed
-			target.Message = engineErr.Error()
 		}
-		if progressErr := jobcontext.Progress(ctx, target); progressErr != nil {
+		if progressErr := jobcontext.Progress(ctx, scheduler.TargetOutcome{
+			ID:           containerID,
+			ResourceType: "container",
+			Status: func() scheduler.RunStatus {
+				switch {
+				case engineErr != nil, partial.Failed > 0:
+					return scheduler.Failed
+				case moduleResult == nil:
+					return scheduler.NeedsAttention
+				case partial.Skipped > 0:
+					return scheduler.Skipped
+				}
+				return scheduler.Succeeded
+			}(),
+			Message: func() string {
+				if engineErr == nil {
+					return ""
+				}
+				return engineErr.Error()
+			}(),
+		}); progressErr != nil {
 			return errors.Join(progressErr, errors.Join(engineErrs...))
 		}
 	}
-	s.logResultItems(ctx, out)
-	out.Success = out.Failed == 0
+	s.logResultItems(ctx, &arcaneupdater.Result{Items: items})
+	completed = true
 	// Like the unscoped engine error, these surface after every container was attempted.
 	return errors.Join(engineErrs...)
 }
 
 // UpdateSingleContainer updates a single container by ID to the latest available image.
 func (s *UpdaterService) UpdateSingleContainer(ctx context.Context, containerID string) (out *arcaneupdater.Result, err error) {
-	activityID, workCtx := "", ctx
-	if s.deps.Activity != nil {
-		localActivity, trackedCtx, startErr := s.deps.Activity.StartTrackedActivity(ctx, s.singleContainerActivityRequest(ctx, containerID))
-		if startErr != nil {
-			return nil, fmt.Errorf("start container update activity: %w", startErr)
-		}
-		activityID, workCtx = localActivity.ID, trackedCtx
+	started, workCtx, err := s.deps.Activity.StartTrackedActivity(ctx, s.singleContainerActivityRequest(ctx, containerID))
+	if err != nil {
+		return nil, fmt.Errorf("start container update activity: %w", err)
 	}
 	defer func() {
-		s.finishSingleContainerUpdate(workCtx, activityID, out, err)
+		s.finishSingleContainerUpdate(workCtx, started.ID, out, err)
 	}()
 	defer utils.RecoverToError(&err, "single container update")
-	return s.runSingleContainerUpdate(workCtx, containerID, activityID)
+	return s.runSingleContainerUpdate(workCtx, containerID, started.ID)
 }
 
 // AcceptSingleContainerUpdate submits a cancellable container-update workflow and returns its activity.
 func (s *UpdaterService) AcceptSingleContainerUpdate(ctx context.Context, containerID string) (*activitytypes.Activity, error) {
-	if s.deps.Activity == nil {
-		return nil, errors.New("asynchronous container updates unavailable")
-	}
 	activityID, err := s.execution.Submit(ctx, containerID, s.singleContainerActivityRequest(ctx, containerID))
 	if err != nil {
 		return nil, err
@@ -508,11 +523,13 @@ func (s *UpdaterService) runSingleContainerUpdate(ctx context.Context, container
 	start := time.Now()
 	out = &arcaneupdater.Result{Items: []arcaneupdater.ResourceResult{}}
 	defer func() {
+		// keep: stamps the named result on every return path
 		out.Duration = cmp.Or(out.Duration, time.Since(start).String())
+		// keep: stamps the named result on every return path
 		out.ActivityID = mo.EmptyableToOption(activityID).ToPointer()
 	}()
 	ctx = contextWithActivityID(ctx, activityID)
-	if s.deps.Activity != nil && activityID != "" {
+	if activityID != "" {
 		if slotErr := s.deps.Activity.AwaitActivitySlotBounded(ctx, activityID, "0"); slotErr != nil {
 			return out, slotErr
 		}
@@ -588,33 +605,28 @@ func (s *UpdaterService) BeginProjectUpdate(projectID string) func() {
 }
 
 func (s *UpdaterService) recordAutoUpdateEvent(ctx context.Context, severity event.EventSeverity, metadata database.JSON) {
-	if s.deps.Events == nil {
-		return
-	}
-	phase, _ := metadata["phase"].(string)
-	title, subject := kit.Ternary(phase != "", "Auto-update: "+phase, "Auto-update"), ""
-	switch phase {
-	case "start":
-		title = "Auto-update run started"
-	case "complete":
-		title = "Auto-update run completed"
-	case "image_pull", "image":
-		title, subject = "Auto-update: image pull", cmp.Or(kit.ToString(metadata["imageNew"]), kit.ToString(metadata["imageOld"]))
-	case "image_prune":
-		title, subject = "Auto-update: image prune", kit.ToString(metadata["imageId"])
-	case "container":
-		title = "Auto-update: container"
-		subject = cmp.Or(kit.ToString(metadata["resourceName"]), kit.ToString(metadata["container"]), kit.ToString(metadata["containerId"]))
-	case "project":
-		title, subject = "Auto-update: project", cmp.Or(kit.ToString(metadata["projectName"]), kit.ToString(metadata["projectId"]))
-	}
-	if subject != "" {
-		title += " " + subject
-	}
+	title, subject := func() (string, string) {
+		phase := kit.As(metadata["phase"], "")
+		switch phase {
+		case "start":
+			return "Auto-update run started", ""
+		case "complete":
+			return "Auto-update run completed", ""
+		case "image_pull", "image":
+			return "Auto-update: image pull", cmp.Or(kit.ToString(metadata["imageNew"]), kit.ToString(metadata["imageOld"]))
+		case "image_prune":
+			return "Auto-update: image prune", kit.ToString(metadata["imageId"])
+		case "container":
+			return "Auto-update: container", cmp.Or(kit.ToString(metadata["resourceName"]), kit.ToString(metadata["container"]), kit.ToString(metadata["containerId"]))
+		case "project":
+			return "Auto-update: project", cmp.Or(kit.ToString(metadata["projectName"]), kit.ToString(metadata["projectId"]))
+		}
+		return kit.Ternary(phase != "", "Auto-update: "+phase, "Auto-update"), ""
+	}()
 	_, err := s.deps.Events.CreateEvent(ctx, event.CreateEventRequest{
 		Type:          event.EventTypeSystemAutoUpdate,
 		Severity:      severity,
-		Title:         title,
+		Title:         title + kit.Ternary(subject != "", " "+subject, ""),
 		ResourceType:  new("system"),
 		ResourceName:  new("auto_updater"),
 		EnvironmentID: new("0"),
@@ -627,18 +639,12 @@ func (s *UpdaterService) recordAutoUpdateEvent(ctx context.Context, severity eve
 
 // DockerClient returns Arcane's configured Docker client for the updater engine.
 func (s *UpdaterService) DockerClient(ctx context.Context) (*client.Client, error) {
-	if s == nil || s.deps.Docker == nil {
-		return nil, common.Classify(common.ErrUnavailable, errors.New("docker service unavailable"))
-	}
 	return s.deps.Docker.GetClient(ctx)
 }
 
 // PullImage pulls an image through Arcane's image service, bounded by the
 // dockerImagePullTimeout setting so a stuck pull cannot hold the auto-update run.
 func (s *UpdaterService) PullImage(ctx context.Context, imageRef string, progress io.Writer) error {
-	if s == nil || s.deps.ImagePuller == nil {
-		return common.Classify(common.ErrUnavailable, errors.New("image service unavailable"))
-	}
 	pulledRef, err := s.recovery.PreparePull(ctx, imageRef)
 	if err != nil {
 		return err
@@ -646,18 +652,12 @@ func (s *UpdaterService) PullImage(ctx context.Context, imageRef string, progres
 	writer := activitylib.NewWriter(ctx, s.deps.Activity, activityIDFromContext(ctx), progress, "Pulling updated images")
 	defer activitylib.FlushWriter(writer)
 
-	pullTimeoutSeconds := 0
-	if s.deps.Settings != nil {
-		pullTimeoutSeconds = s.deps.Settings.GetSettingsConfig().DockerImagePullTimeout.AsInt()
-	}
-	pullCtx, cancelPull := context.WithTimeout(ctx, timeouts.GetDuration(pullTimeoutSeconds, timeouts.DefaultDockerImagePull))
+	pullCtx, cancelPull := context.WithTimeout(ctx, timeouts.GetDuration(s.deps.Settings.GetSettingsConfig().DockerImagePullTimeout.AsInt(), timeouts.DefaultDockerImagePull))
 	defer cancelPull()
 
-	var credentials []containerregistry.Credential
-	if s.deps.Projects != nil {
-		if credentials, err = s.deps.Projects.ResolveRegistryCredentials(pullCtx); err != nil {
-			return fmt.Errorf("resolve registry credentials: %w", err)
-		}
+	credentials, err := s.deps.Projects.ResolveRegistryCredentials(pullCtx)
+	if err != nil {
+		return fmt.Errorf("resolve registry credentials: %w", err)
 	}
 	pull := func(ctx context.Context) error {
 		return s.deps.ImagePuller.PullImage(ctx, pulledRef, writer, s.deps.SystemUser, credentials)
@@ -686,10 +686,6 @@ func (s *UpdaterService) PendingImageUpdates(ctx context.Context) ([]updater.Ima
 	if records, ok := s.recovery.FrozenRecords(ctx); ok {
 		return records, nil
 	}
-	if s == nil || s.deps.DB == nil {
-		return nil, common.Classify(common.ErrUnavailable, errors.New("database unavailable"))
-	}
-
 	var records []imageupdate.ImageUpdateRecord
 	if err := s.deps.DB.WithContext(ctx).Where("has_update = ? AND project_id = ?", true, "").Find(&records).Error; err != nil {
 		return nil, fmt.Errorf("query pending image updates: %w", err)
@@ -697,10 +693,8 @@ func (s *UpdaterService) PendingImageUpdates(ctx context.Context) ([]updater.Ima
 
 	// Flush "Updates Available" notifications before the engine clears these records (#3132);
 	// a flush that cannot decide what to send aborts so the records survive for retry.
-	if s.deps.ImageUpdates != nil {
-		if err := s.deps.ImageUpdates.SendBatchUpdateNotifications(ctx); err != nil {
-			return nil, err
-		}
+	if err := s.deps.ImageUpdates.SendBatchUpdateNotifications(ctx); err != nil {
+		return nil, err
 	}
 	s.appendAutoUpdateActivityMessage(ctx, activityIDFromContext(ctx), fmt.Sprintf("Found %d pending image update records", len(records)), "Planning updates", 10)
 
@@ -709,23 +703,27 @@ func (s *UpdaterService) PendingImageUpdates(ctx context.Context) ([]updater.Ima
 	if err := s.deps.DB.WithContext(ctx).Model(&imageupdate.ImageUpdateRecord{}).Where("container_id <> ?", "").Limit(1).Count(&scopedCount).Error; err != nil {
 		return nil, err
 	}
-	var running []container.Summary
-	if scopedCount > 0 {
-		dockerClient, err := s.DockerClient(ctx)
-		if err != nil {
-			return nil, err
+	running, err := func() ([]container.Summary, error) {
+		if scopedCount == 0 {
+			return nil, nil
 		}
-		listed, err := dockerClient.ContainerList(ctx, client.ContainerListOptions{})
-		if err != nil {
-			return nil, err
+		dockerClient, clientErr := s.DockerClient(ctx)
+		if clientErr != nil {
+			return nil, clientErr
 		}
-		running = listed.Items
+		listed, listErr := dockerClient.ContainerList(ctx, client.ContainerListOptions{})
+		if listErr != nil {
+			return nil, listErr
+		}
+		return listed.Items, nil
+	}()
+	if err != nil {
+		return nil, err
 	}
-	out := make([]updater.ImageUpdateRecord, 0, len(records))
-	for _, record := range records {
-		converted := updater.ImageUpdateRecord{
+	converted := func(record imageupdate.ImageUpdateRecord, containerID string) updater.ImageUpdateRecord {
+		return updater.ImageUpdateRecord{
+			ContainerID:    containerID,
 			ID:             record.ID,
-			ContainerID:    record.ContainerID,
 			Repository:     record.Repository,
 			Tag:            record.Tag,
 			HasUpdate:      record.HasUpdate,
@@ -737,17 +735,19 @@ func (s *UpdaterService) PendingImageUpdates(ctx context.Context) ([]updater.Ima
 			CheckTime:      record.CheckTime,
 			LastError:      record.LastError,
 		}
+	}
+	out := make([]updater.ImageUpdateRecord, 0, len(records))
+	for _, record := range records {
 		if scopedCount == 0 || record.ContainerID != "" {
-			out = append(out, converted)
+			out = append(out, converted(record, record.ContainerID))
 			continue
 		}
 		for _, cnt := range running {
 			resolved, policyErr := tagpolicy.Resolve(cnt.Image, updater.DefaultLabelPolicy().TagPolicy(cnt.Labels))
-			if policyErr != nil || resolved.Strategy == "tag" || refs.NormalizeImageUpdateRef(cnt.Image) != refs.NormalizeImageUpdateRef(converted.ImageRef()) {
+			if policyErr != nil || resolved.Strategy == "tag" || refs.NormalizeImageUpdateRef(cnt.Image) != refs.NormalizeImageUpdateRef(converted(record, "").ImageRef()) {
 				continue
 			}
-			converted.ContainerID = cnt.ID
-			out = append(out, converted)
+			out = append(out, converted(record, cnt.ID))
 		}
 	}
 	return out, nil
@@ -755,12 +755,6 @@ func (s *UpdaterService) PendingImageUpdates(ctx context.Context) ([]updater.Ima
 
 // ClearImageUpdateRecord clears a pending image update record after it is handled.
 func (s *UpdaterService) ClearImageUpdateRecord(ctx context.Context, record updater.ImageUpdateRecord) error {
-	if s == nil {
-		return common.Classify(common.ErrUnavailable, errors.New("updater service unavailable"))
-	}
-	if s.deps.DB == nil {
-		return nil
-	}
 	query := s.deps.DB.WithContext(ctx).Model(&imageupdate.ImageUpdateRecord{})
 	if record.ContainerID == "" || strings.HasPrefix(record.ID, "container::") {
 		query = query.Where("container_id = ?", record.ContainerID)
@@ -797,17 +791,11 @@ func (s *UpdaterService) ClearImageUpdateRecord(ctx context.Context, record upda
 
 // ExcludedContainers returns auto-update exclusions from Arcane settings.
 func (s *UpdaterService) ExcludedContainers(ctx context.Context) ([]string, error) {
-	if s == nil || s.deps.Settings == nil {
-		return nil, nil
-	}
 	return kit.Unique(kit.TrimNonEmpty(strings.Split(s.deps.Settings.GetStringSetting(ctx, "autoUpdateExcludedContainers", ""), ","))), nil
 }
 
 // ProjectByComposeName resolves an Arcane project from a Docker Compose project name.
 func (s *UpdaterService) ProjectByComposeName(ctx context.Context, composeName string) (updater.ComposeProject, error) {
-	if s == nil || s.deps.Projects == nil {
-		return updater.ComposeProject{}, common.Classify(common.ErrUnavailable, errors.New("project service unavailable"))
-	}
 	project, err := s.deps.Projects.GetProjectByComposeName(ctx, composeName)
 	if err != nil {
 		return updater.ComposeProject{}, err
@@ -820,9 +808,6 @@ func (s *UpdaterService) ProjectByComposeName(ctx context.Context, composeName s
 
 // UpdateServices redeploys selected services through Arcane's project service.
 func (s *UpdaterService) UpdateServices(ctx context.Context, projectID string, services []string) error {
-	if s == nil || s.deps.Projects == nil {
-		return common.Classify(common.ErrUnavailable, errors.New("project service unavailable"))
-	}
 	return s.deps.Projects.UpdateProjectServices(ctx, projectID, services, s.deps.SystemUser, false)
 }
 
@@ -830,32 +815,39 @@ func (s *UpdaterService) UpdateServices(ctx context.Context, projectID string, s
 func (s *UpdaterService) TriggerSelfUpdate(ctx context.Context, target updater.SelfUpdateTarget) error {
 	// The frozen digest is only what gets pulled; the recreated container keeps
 	// the selected tag so later runs do not treat it as an immutable reference.
-	if target.NewImageRef != "" {
-		pinned, err := s.recovery.PreparePull(ctx, target.NewImageRef)
-		if err != nil {
-			return err
+	pullImageRef, pullErr := func() (string, error) {
+		if target.NewImageRef == "" {
+			return target.PullImageRef, nil
 		}
-		target.PullImageRef = pinned
-	}
-	if s == nil || s.deps.SelfUpgrade == nil {
-		instanceType := cmp.Or(strings.TrimSpace(target.InstanceType), "server")
-		return fmt.Errorf("%s self-update requires CLI upgrade service", instanceType)
+		return s.recovery.PreparePull(ctx, target.NewImageRef)
+	}()
+	if pullErr != nil {
+		return pullErr
 	}
 
 	// A server self-update stops this process before the run completes, so the
 	// activity is flagged first and startup reconciliation finalizes it.
-	if activityID := activityIDFromContext(ctx); target.InstanceType != "agent" && activityID != "" && s.deps.Activity != nil {
-		message := "Self-update initiated — Arcane will restart"
-		if target.NewImageRef != "" {
-			message += " with " + target.NewImageRef
-		}
-		s.appendAutoUpdateActivityMessage(ctx, activityID, message, "Self-update", 90)
+	if activityID := activityIDFromContext(ctx); target.InstanceType != "agent" && activityID != "" {
+		s.appendAutoUpdateActivityMessage(
+			ctx,
+			activityID,
+			"Self-update initiated — Arcane will restart"+kit.Ternary(target.NewImageRef != "", " with "+target.NewImageRef, ""),
+			"Self-update",
+			90,
+		)
 		if err := s.deps.Activity.PatchActivityMetadata(ctx, activityID, database.JSON{"selfUpdateTriggered": true}); err != nil {
 			slog.DebugContext(ctx, "failed to mark self-update on activity", "activityId", activityID, "error", err)
 		}
 	}
 
-	if _, err := s.deps.SelfUpgrade.TriggerUpgradeViaCLI(ctx, s.deps.SystemUser, target); err != nil {
+	if _, err := s.deps.SelfUpgrade.TriggerUpgradeViaCLI(ctx, s.deps.SystemUser, updater.SelfUpdateTarget{ //exhaustruct:enforce
+		ContainerID:   target.ContainerID,
+		ContainerName: target.ContainerName,
+		InstanceType:  target.InstanceType,
+		Labels:        target.Labels,
+		NewImageRef:   target.NewImageRef,
+		PullImageRef:  pullImageRef,
+	}); err != nil {
 		return fmt.Errorf("CLI upgrade failed: %w", err)
 	}
 	if progress, ok := ctx.Value(updateProgressKey{}).(*updateProgress); ok {
@@ -870,9 +862,6 @@ func (s *UpdaterService) TriggerSelfUpdate(ctx context.Context, target updater.S
 // Notify buffers the container update notification inside an update batch, which sends
 // them as one notification when it ends; outside a batch it sends immediately.
 func (s *UpdaterService) Notify(ctx context.Context, localNotification updater.Notification) error {
-	if s == nil || s.deps.Notifications == nil {
-		return nil
-	}
 	if buffer, ok := ctx.Value(containerUpdateBatchContextKey{}).(*containerUpdateBatch); ok {
 		buffer.Lock()
 		buffer.entries = append(buffer.entries, notifications.ContainerUpdateBatchEntry{
@@ -895,14 +884,7 @@ func (s *UpdaterService) Notify(ctx context.Context, localNotification updater.N
 
 // RecordEvent records updater lifecycle events in Arcane's event stream.
 func (s *UpdaterService) RecordEvent(ctx context.Context, evt updater.Event) error {
-	if s == nil {
-		return nil
-	}
-
 	if eventType, ok := containerEventTypes[evt.Phase]; ok {
-		if s.deps.Events == nil {
-			return nil
-		}
 		return s.deps.Events.LogContainerEvent(
 			ctx,
 			eventType,
@@ -934,31 +916,24 @@ func contextWithActivityID(ctx context.Context, activityID string) context.Conte
 }
 
 func activityIDFromContext(ctx context.Context) string {
-	if ctx == nil {
-		return ""
-	}
-	activityID, _ := ctx.Value(activityIDContextKey{}).(string)
-	return activityID
+	return kit.As(ctx.Value(activityIDContextKey{}), "")
 }
 
 // singleContainerActivityRequest describes a container update's activity, named after the container when it can be inspected.
 func (s *UpdaterService) singleContainerActivityRequest(ctx context.Context, containerID string) activitylib.StartRequest {
-	name := containerID
-	lookupCtx, cancelLookup := context.WithTimeout(ctx, 2*time.Second)
-	if dockerClient, dockerErr := s.DockerClient(lookupCtx); dockerErr == nil {
-		if inspected, inspectErr := compat.ContainerInspectWithCompatibility(lookupCtx, dockerClient, containerID, client.ContainerInspectOptions{}); inspectErr == nil {
-			name = cmp.Or(strings.TrimPrefix(inspected.Container.Name, "/"), containerID)
+	name := func() string {
+		lookupCtx, cancelLookup := context.WithTimeout(ctx, 2*time.Second)
+		defer cancelLookup()
+		dockerClient, dockerErr := s.DockerClient(lookupCtx)
+		if dockerErr != nil {
+			return containerID
 		}
-	}
-	cancelLookup()
-	user, _ := userctx.CurrentUserFromContext(ctx)
-	if initiator, ok := utils.UpdateInitiatorFromContext(ctx); ok {
-		user = &usertypes.Actor{Username: initiator.Username}
-		user.ID = initiator.UserID
-		if initiator.DisplayName != "" {
-			user.DisplayName = &initiator.DisplayName
+		inspected, inspectErr := compat.ContainerInspectWithCompatibility(lookupCtx, dockerClient, containerID, client.ContainerInspectOptions{})
+		if inspectErr != nil {
+			return containerID
 		}
-	}
+		return cmp.Or(strings.TrimPrefix(inspected.Container.Name, "/"), containerID)
+	}()
 	return activitylib.StartRequest{
 		EnvironmentID: "0",
 		Type:          activitytypes.TypeAutoUpdate,
@@ -967,7 +942,18 @@ func (s *UpdaterService) singleContainerActivityRequest(ctx context.Context, con
 		ResourceType:  new("container"),
 		ResourceID:    &containerID,
 		ResourceName:  &name,
-		StartedBy:     user,
+		StartedBy: func() *usertypes.Actor {
+			initiator, ok := utils.UpdateInitiatorFromContext(ctx)
+			if !ok {
+				user, _ := userctx.CurrentUserFromContext(ctx)
+				return user
+			}
+			return &usertypes.Actor{
+				ID:          initiator.UserID,
+				Username:    initiator.Username,
+				DisplayName: mo.EmptyableToOption(initiator.DisplayName).ToPointer(),
+			}
+		}(),
 		Step:          "Updating container",
 		LatestMessage: "Container update started",
 		Metadata:      database.JSON{"containerID": containerID},
@@ -975,7 +961,7 @@ func (s *UpdaterService) singleContainerActivityRequest(ctx context.Context, con
 }
 
 func (s *UpdaterService) finishSingleContainerUpdate(ctx context.Context, activityID string, result *arcaneupdater.Result, runErr error) {
-	if s.deps.Activity == nil || activityID == "" {
+	if activityID == "" {
 		return
 	}
 	outcome := s.recordSingleContainerUpdate(ctx, activityID, result, runErr)
@@ -984,25 +970,37 @@ func (s *UpdaterService) finishSingleContainerUpdate(ctx context.Context, activi
 
 // recordSingleContainerUpdate saves a container update's result on its activity and summarizes it as an outcome.
 func (s *UpdaterService) recordSingleContainerUpdate(ctx context.Context, activityID string, result *arcaneupdater.Result, runErr error) scheduler.Outcome {
-	metadata, containerName := database.JSON{}, ""
-	if result != nil {
-		metadata = database.JSON{"updated": result.Updated, "restarted": result.Restarted, "skipped": result.Skipped, "failed": result.Failed}
-		if len(result.Items) > 0 {
-			item := result.Items[0]
-			metadata["updateOutcome"] = item.Status
-			if containerName = item.ResourceName; containerName != "" {
-				metadata["containerName"] = containerName
-			}
-			if item.Error != "" {
-				metadata["updateReason"] = item.Error
-			}
+	item := func() arcaneupdater.ResourceResult {
+		if items := kit.FromPtr(result).Items; len(items) > 0 {
+			return items[0]
 		}
+		return arcaneupdater.ResourceResult{}
+	}()
+	metadata := func() database.JSON {
+		if result == nil {
+			return database.JSON{}
+		}
+		return database.JSON{
+			"updated":   result.Updated,
+			"restarted": result.Restarted,
+			"skipped":   result.Skipped,
+			"failed":    result.Failed,
+		}
+	}()
+	if len(kit.FromPtr(result).Items) > 0 {
+		metadata["updateOutcome"] = item.Status
 	}
-	if s.deps.Activity != nil && activityID != "" {
+	if item.ResourceName != "" {
+		metadata["containerName"] = item.ResourceName
+	}
+	if item.Error != "" {
+		metadata["updateReason"] = item.Error
+	}
+	if activityID != "" {
 		writeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 		defer cancel()
-		if containerName != "" {
-			if _, err := s.deps.Activity.UpdateActivity(writeCtx, activityID, activitylib.UpdateRequest{ResourceName: &containerName}); err != nil {
+		if item.ResourceName != "" {
+			if _, err := s.deps.Activity.UpdateActivity(writeCtx, activityID, activitylib.UpdateRequest{ResourceName: &item.ResourceName}); err != nil {
 				slog.WarnContext(writeCtx, "failed to update container activity name", "activityId", activityID, "error", err)
 			}
 		}
@@ -1011,31 +1009,39 @@ func (s *UpdaterService) recordSingleContainerUpdate(ctx context.Context, activi
 		}
 	}
 	if runErr == nil && result != nil && result.Failed == 0 {
-		message := "Container already current"
-		switch {
-		case result.Updated > 0 || result.Restarted > 0:
-			message = "Container updated"
-		case len(result.Items) > 0 && result.Items[0].Status == string(updater.StatusSkipped) && result.Items[0].Error != "":
-			message = "Container update skipped: " + result.Items[0].Error
-		case result.Skipped > 0:
-			message = "Container update skipped"
+		return scheduler.Outcome{
+			Status: scheduler.Succeeded,
+			Message: func() string {
+				switch {
+				case result.Updated > 0 || result.Restarted > 0:
+					return "Container updated"
+				case item.Status == string(updater.StatusSkipped) && item.Error != "":
+					return "Container update skipped: " + item.Error
+				case result.Skipped > 0:
+					return "Container update skipped"
+				}
+				return "Container already current"
+			}(),
 		}
-		return scheduler.Outcome{Status: scheduler.Succeeded, Message: message}
 	}
-	switch {
-	case runErr != nil:
-	case result == nil:
-		runErr = errors.New("container update produced no result")
-	case len(result.Items) > 0 && result.Items[0].Error != "":
-		runErr = errors.New(result.Items[0].Error)
-	default:
-		runErr = fmt.Errorf("%d update action(s) failed", result.Failed)
+	return scheduler.Outcome{
+		Status: scheduler.Failed,
+		Message: func() string {
+			switch {
+			case runErr != nil:
+				return runErr.Error()
+			case result == nil:
+				return "container update produced no result"
+			case item.Error != "":
+				return item.Error
+			}
+			return fmt.Sprintf("%d update action(s) failed", result.Failed)
+		}(),
 	}
-	return scheduler.Outcome{Status: scheduler.Failed, Message: runErr.Error()}
 }
 
 func (s *UpdaterService) appendAutoUpdateActivityMessage(ctx context.Context, activityID, message, step string, progress int) {
-	if s.deps.Activity == nil || activityID == "" {
+	if activityID == "" {
 		return
 	}
 	if _, err := s.deps.Activity.AppendMessage(ctx, activityID, activitylib.AppendMessageRequest{
@@ -1051,20 +1057,20 @@ func (s *UpdaterService) appendAutoUpdateActivityMessage(ctx context.Context, ac
 // completeAutoUpdateActivity ends the activity with message, or as failed when failure is set;
 // a failure caused by cancelling the activity ends it as cancelled.
 func (s *UpdaterService) completeAutoUpdateActivity(ctx context.Context, activityID, message, failure string) {
-	if s.deps.Activity == nil || activityID == "" {
+	if activityID == "" {
 		return
 	}
-	status := activitytypes.StatusSuccess
-	var errMessage *string
-	switch {
-	case failure == "":
-	case activitylib.CancelledByContext(ctx):
-		status, message = activitytypes.StatusCancelled, "Auto-update cancelled"
-	default:
-		status, message, errMessage = activitytypes.StatusFailed, failure, &failure
-	}
+	status, completion, errMessage := func() (activitytypes.Status, string, *string) {
+		switch {
+		case failure == "":
+			return activitytypes.StatusSuccess, message, nil
+		case activitylib.CancelledByContext(ctx):
+			return activitytypes.StatusCancelled, "Auto-update cancelled", nil
+		}
+		return activitytypes.StatusFailed, failure, &failure
+	}()
 	// A lost terminal write strands the activity as running, so it is written past cancellation and logged loudly.
-	if _, err := s.deps.Activity.CompleteActivity(context.WithoutCancel(ctx), activityID, status, message, errMessage); err != nil {
+	if _, err := s.deps.Activity.CompleteActivity(context.WithoutCancel(ctx), activityID, status, completion, errMessage); err != nil {
 		slog.ErrorContext(ctx, "failed to complete auto-update activity", "activityId", activityID, "error", err)
 	}
 }
@@ -1081,20 +1087,9 @@ func resultFromModule(result *updater.Result) *arcaneupdater.Result {
 		}
 		return map[string]string{"main": ref}
 	}
-	out := &arcaneupdater.Result{
-		Success:   result.Success,
-		Checked:   result.Checked,
-		Updated:   result.Updated,
-		Restarted: result.Restarted,
-		Skipped:   result.Skipped,
-		Failed:    result.Failed,
-		StartTime: kit.Ternary(result.StartTime.IsZero(), "", result.StartTime.UTC().Format(time.RFC3339)),
-		EndTime:   kit.Ternary(result.EndTime.IsZero(), "", result.EndTime.UTC().Format(time.RFC3339)),
-		Duration:  result.Duration().String(),
-		Items:     make([]arcaneupdater.ResourceResult, 0, len(result.Items)),
-	}
+	items := make([]arcaneupdater.ResourceResult, 0, len(result.Items))
 	for _, item := range result.Items {
-		out.Items = append(out.Items, arcaneupdater.ResourceResult{
+		items = append(items, arcaneupdater.ResourceResult{
 			ResourceID:      item.ResourceID,
 			ResourceName:    item.ResourceName,
 			ResourceType:    string(item.ResourceType),
@@ -1107,22 +1102,26 @@ func resultFromModule(result *updater.Result) *arcaneupdater.Result {
 			Details:         item.Details,
 		})
 	}
-	return out
+	return &arcaneupdater.Result{
+		Success:   result.Success,
+		Checked:   result.Checked,
+		Updated:   result.Updated,
+		Restarted: result.Restarted,
+		Skipped:   result.Skipped,
+		Failed:    result.Failed,
+		StartTime: kit.Ternary(result.StartTime.IsZero(), "", result.StartTime.UTC().Format(time.RFC3339)),
+		EndTime:   kit.Ternary(result.EndTime.IsZero(), "", result.EndTime.UTC().Format(time.RFC3339)),
+		Duration:  result.Duration().String(),
+		Items:     items,
+	}
 }
 
 func (s *UpdaterService) logResultItems(ctx context.Context, result *arcaneupdater.Result) {
-	if result == nil {
-		return
-	}
 	for _, item := range result.Items {
-		severity := event.EventSeverityInfo
-		switch item.Status {
-		case string(updater.StatusFailed):
-			severity = event.EventSeverityError
-		case string(updater.StatusUpdated):
-			severity = event.EventSeveritySuccess
-		}
-		s.recordAutoUpdateEvent(ctx, severity, database.JSON{
+		s.recordAutoUpdateEvent(ctx, cmp.Or(map[string]event.EventSeverity{
+			string(updater.StatusFailed):  event.EventSeverityError,
+			string(updater.StatusUpdated): event.EventSeveritySuccess,
+		}[item.Status], event.EventSeverityInfo), database.JSON{
 			"phase":        item.ResourceType,
 			"resourceId":   item.ResourceID,
 			"resourceName": item.ResourceName,
@@ -1147,13 +1146,11 @@ func (s *UpdaterService) CollectUsedImages(ctx context.Context) (map[string]stru
 		successfulSources++
 	}
 
-	if s.deps.Projects != nil {
-		if err := s.collectUsedImagesFromProjects(ctx, out); err != nil {
-			errs = append(errs, err)
-			slog.DebugContext(ctx, "collectUsedImages: failed collecting from projects", "error", err)
-		} else {
-			successfulSources++
-		}
+	if err := s.collectUsedImagesFromProjects(ctx, out); err != nil {
+		errs = append(errs, err)
+		slog.DebugContext(ctx, "collectUsedImages: failed collecting from projects", "error", err)
+	} else {
+		successfulSources++
 	}
 
 	if successfulSources == 0 {
@@ -1169,10 +1166,7 @@ func (s *UpdaterService) collectUsedImagesFromContainers(ctx context.Context, ou
 	if err != nil {
 		return err
 	}
-	var excludedContainers map[string]bool
-	if s.deps.Settings != nil {
-		excludedContainers = docker.ExcludedContainerNameSet(s.deps.Settings.GetStringSetting(ctx, "autoUpdateExcludedContainers", ""))
-	}
+	excludedContainers := docker.ExcludedContainerNameSet(s.deps.Settings.GetStringSetting(ctx, "autoUpdateExcludedContainers", ""))
 	listResult, err := dcli.ContainerList(ctx, client.ContainerListOptions{})
 	if err != nil {
 		return err
@@ -1201,20 +1195,19 @@ func (s *UpdaterService) collectUsedImagesFromContainers(ctx context.Context, ou
 			slog.DebugContext(ctx, "collectUsedImagesFromContainers: container inspect failed", "containerId", summary.ID, "error", inspectErr)
 			continue
 		}
-		inspect := inspectResult.Container
-		if inspect.Config != nil && labels.IsUpdateDisabled(inspect.Config.Labels) {
+		if labels.IsUpdateDisabled(kit.FromPtr(inspectResult.Container.Config).Labels) {
 			slog.DebugContext(ctx, "collectUsedImagesFromContainers: container inspect labels opted out", "containerId", summary.ID)
 			continue
 		}
-		if imageInspect, imageErr := dcli.ImageInspect(ctx, inspect.Image); imageErr == nil {
+		if imageInspect, imageErr := dcli.ImageInspect(ctx, inspectResult.Container.Image); imageErr == nil {
 			for _, tag := range imageInspect.RepoTags {
 				if strings.TrimSpace(tag) != "" && tag != "<none>:<none>" {
-					addNormalizedImageUpdateRef(ctx, out, tag, "normalizedTagsForContainer repo tag", "imageId", inspect.Image)
+					addNormalizedImageUpdateRef(ctx, out, tag, "normalizedTagsForContainer repo tag", "imageId", inspectResult.Container.Image)
 				}
 			}
 		}
-		if inspect.Config != nil && inspect.Config.Image != "" {
-			addNormalizedImageUpdateRef(ctx, out, inspect.Config.Image, "normalizedTagsForContainer config image", "imageId", inspect.Image)
+		if configImage := kit.FromPtr(inspectResult.Container.Config).Image; configImage != "" {
+			addNormalizedImageUpdateRef(ctx, out, configImage, "normalizedTagsForContainer config image", "imageId", inspectResult.Container.Image)
 		}
 	}
 	return nil
@@ -1228,13 +1221,13 @@ func (s *UpdaterService) collectUsedImagesFromProjects(ctx context.Context, out 
 
 	activeProjectNames := map[string]struct{}{}
 	for _, project := range allProjects {
-		name := strings.TrimSpace(project.Name)
-		running := project.Status == projectpkg.ProjectStatusRunning || project.Status == projectpkg.ProjectStatusPartiallyRunning
-		if project.IsArchived || !running || name == "" {
+		if project.IsArchived ||
+			(project.Status != projectpkg.ProjectStatusRunning && project.Status != projectpkg.ProjectStatusPartiallyRunning) ||
+			strings.TrimSpace(project.Name) == "" {
 			continue
 		}
-		activeProjectNames[name] = struct{}{}
-		if normalized := projects.NormalizeProjectName(name); normalized != "" {
+		activeProjectNames[strings.TrimSpace(project.Name)] = struct{}{}
+		if normalized := projects.NormalizeProjectName(strings.TrimSpace(project.Name)); normalized != "" {
 			activeProjectNames[normalized] = struct{}{}
 		}
 	}
@@ -1242,13 +1235,9 @@ func (s *UpdaterService) collectUsedImagesFromProjects(ctx context.Context, out 
 		return nil
 	}
 
-	var dockerClient client.APIClient
-	if s.deps.Docker != nil {
-		cli, cliErr := s.deps.Docker.GetClient(ctx)
-		if cliErr != nil {
-			return cliErr
-		}
-		dockerClient = cli
+	dockerClient, err := s.deps.Docker.GetClient(ctx)
+	if err != nil {
+		return err
 	}
 	composeContainers, err := projects.ListGlobalComposeContainers(ctx, dockerClient, s.deps.Docker.DockerHost())
 	if err != nil {
@@ -1277,7 +1266,7 @@ func addNormalizedImageUpdateRef(ctx context.Context, out map[string]struct{}, i
 }
 
 func (s *UpdaterService) acquireUpdate(ctx context.Context) (context.Context, func(), error) {
-	if s.admission == nil || ctx.Value(updateAdmissionKey{}) == s {
+	if ctx.Value(updateAdmissionKey{}) == s {
 		return ctx, func() {}, nil
 	}
 	lease, admitted, err := s.admission.TryAcquire(ctx, scheduler.AdmissionKey{Scope: "updater"})
@@ -1292,73 +1281,70 @@ func (s *UpdaterService) acquireUpdate(ctx context.Context) (context.Context, fu
 
 // RecordUpdateRun persists one updater resource result into Arcane history.
 func (s *UpdaterService) RecordUpdateRun(ctx context.Context, result updater.ResourceResult) error {
-	var recordErr error
-	if s != nil && s.deps.DB != nil {
-		now := time.Now()
-		record := &AutoUpdateRecord{
-			ResourceID:      result.ResourceID,
-			ResourceType:    string(result.ResourceType),
-			ResourceName:    result.ResourceName,
-			Status:          AutoUpdateStatus(result.Status),
-			StartTime:       now,
-			EndTime:         &now,
-			UpdateAvailable: result.UpdateAvailable || result.Status == updater.StatusUpdated || result.Status == updater.StatusUpdateAvailable,
-			UpdateApplied:   result.UpdateApplied,
-		}
-		if result.OldImage != "" {
-			record.OldImageVersions = database.JSON{"main": result.OldImage}
-		}
-		if result.NewImage != "" {
-			record.NewImageVersions = database.JSON{"main": result.NewImage}
-		}
-		if len(result.Details) > 0 {
-			record.Details = maps.Clone(result.Details)
-		}
-		if result.Error != "" {
-			record.Error = &result.Error
-		}
-		recordErr = s.deps.DB.WithContext(ctx).Create(record).Error
-	}
+	now := time.Now()
+	recordErr := s.deps.DB.WithContext(ctx).Create(&AutoUpdateRecord{
+		ResourceID:       result.ResourceID,
+		ResourceType:     string(result.ResourceType),
+		ResourceName:     result.ResourceName,
+		Status:           AutoUpdateStatus(result.Status),
+		StartTime:        now,
+		EndTime:          &now,
+		UpdateAvailable:  result.UpdateAvailable || result.Status == updater.StatusUpdated || result.Status == updater.StatusUpdateAvailable,
+		UpdateApplied:    result.UpdateApplied,
+		OldImageVersions: kit.Ternary(result.OldImage != "", database.JSON{"main": result.OldImage}, nil),
+		NewImageVersions: kit.Ternary(result.NewImage != "", database.JSON{"main": result.NewImage}, nil),
+		Error:            mo.EmptyableToOption(result.Error).ToPointer(),
+		Details:          kit.Ternary(len(result.Details) > 0, maps.Clone(result.Details), nil),
+	}).Error
 	name := cmp.Or(strings.TrimSpace(result.ResourceName), result.ResourceID)
-	message := name + ": " + string(result.Status)
-	level := activitytypes.MessageLevelInfo
-	status := scheduler.NeedsAttention
-	switch result.Status {
-	case updater.StatusUpdated, updater.StatusRestarted, updater.StatusUpToDate:
-		status = scheduler.Succeeded
-		if result.Status != updater.StatusUpToDate && result.OldImage != "" && result.NewImage != "" && result.OldImage != result.NewImage {
-			message += " (" + result.OldImage + " -> " + result.NewImage + ")"
-		}
-	case updater.StatusSkipped:
-		status = scheduler.Skipped
-	case updater.StatusChecked, updater.StatusUpdateAvailable:
-		status = scheduler.NeedsAttention
-	case updater.StatusFailed:
-		status = scheduler.Failed
-		level = activitytypes.MessageLevelError
-	}
-	if reason := strings.TrimSpace(result.Error); reason != "" {
-		if level == activitytypes.MessageLevelError {
-			message = name + ": " + reason
-		} else {
-			message += " (" + reason + ")"
-		}
-	}
+	status := cmp.Or(map[updater.ResourceStatus]scheduler.RunStatus{
+		updater.StatusUpdated:   scheduler.Succeeded,
+		updater.StatusRestarted: scheduler.Succeeded,
+		updater.StatusUpToDate:  scheduler.Succeeded,
+		updater.StatusSkipped:   scheduler.Skipped,
+		updater.StatusFailed:    scheduler.Failed,
+	}[result.Status], scheduler.NeedsAttention)
 	activityID := activityIDFromContext(ctx)
-	if activityID != "" && s != nil && s.deps.Activity != nil {
-		if _, appendErr := s.deps.Activity.AppendMessage(ctx, activityID, activitylib.AppendMessageRequest{Level: level, Message: message, Step: "Applying updates"}); appendErr != nil {
+	if activityID != "" {
+		if _, appendErr := s.deps.Activity.AppendMessage(ctx, activityID, activitylib.AppendMessageRequest{
+			Level: kit.Ternary(result.Status == updater.StatusFailed, activitytypes.MessageLevelError, activitytypes.MessageLevelInfo),
+			Message: func() string {
+				reason := strings.TrimSpace(result.Error)
+				if result.Status == updater.StatusFailed && reason != "" {
+					return name + ": " + reason
+				}
+				return name + ": " + string(result.Status) +
+					kit.Ternary(
+						(result.Status == updater.StatusUpdated || result.Status == updater.StatusRestarted) &&
+							result.OldImage != "" && result.NewImage != "" && result.OldImage != result.NewImage,
+						" ("+result.OldImage+" -> "+result.NewImage+")",
+						"",
+					) +
+					kit.Ternary(reason != "", " ("+reason+")", "")
+			}(),
+			Step: "Applying updates",
+		}); appendErr != nil {
 			slog.DebugContext(ctx, "failed to append update result activity message", "activityId", activityID, "resource", name, "error", appendErr)
 		}
 	}
-	progressMessage := result.Error
-	var evidenceErr error
-	if status == scheduler.Succeeded {
-		if evidenceErr = s.recovery.VerifyResult(ctx, result.ResourceID); evidenceErr != nil {
-			status, progressMessage = scheduler.NeedsAttention, evidenceErr.Error()
+	evidenceErr := func() error {
+		if status != scheduler.Succeeded {
+			return nil
 		}
-	}
-	target := scheduler.TargetOutcome{ID: result.ResourceID, ResourceType: string(result.ResourceType), Status: status, Message: progressMessage, ActivityID: activityID}
-	err := errors.Join(recordErr, jobcontext.Progress(ctx, target), evidenceErr)
+		return s.recovery.VerifyResult(ctx, result.ResourceID)
+	}()
+	err := errors.Join(recordErr, jobcontext.Progress(ctx, scheduler.TargetOutcome{
+		ID:           result.ResourceID,
+		ResourceType: string(result.ResourceType),
+		Status:       kit.Ternary(evidenceErr != nil, scheduler.NeedsAttention, status),
+		Message: func() string {
+			if evidenceErr != nil {
+				return evidenceErr.Error()
+			}
+			return result.Error
+		}(),
+		ActivityID: activityID,
+	}), evidenceErr)
 	if progress, ok := ctx.Value(updateProgressKey{}).(*updateProgress); ok && err != nil {
 		progress.mu.Lock()
 		progress.err = errors.Join(progress.err, err)
@@ -1371,88 +1357,90 @@ func (p *updateProgress) completeBatch(ctx context.Context, options arcaneupdate
 	activityID := activityIDFromContext(ctx)
 	p.mu.Lock()
 	err = errors.Join(err, p.err)
-	recordingFailed := p.err != nil
+	recordingFailed := p.err != nil || (!batchCompleted && err == nil)
 	previous, durableRun := jobcontext.Run(ctx)
 	selfTriggered := p.selfTriggered && durableRun
 	selfID := p.selfID
 	p.mu.Unlock()
-	status := scheduler.Succeeded
 	if !batchCompleted && err == nil {
 		err = errors.New("update batch ended without a confirmed result")
-		recordingFailed = true
 	}
-	if err != nil || out.Failed > 0 {
-		status = scheduler.Partial
-	}
-	if recordingFailed {
-		status = scheduler.NeedsAttention
-	}
+	status := func() scheduler.RunStatus {
+		switch {
+		case recordingFailed || selfTriggered:
+			return scheduler.NeedsAttention
+		case err != nil || out.Failed > 0:
+			return scheduler.Partial
+		}
+		return scheduler.Succeeded
+	}()
 	if selfTriggered {
-		selfTarget := scheduler.TargetOutcome{
+		err = errors.Join(err, jobcontext.Progress(ctx, scheduler.TargetOutcome{
 			ID:           selfID,
 			ResourceType: "container",
 			Status:       scheduler.NeedsAttention,
 			ActivityID:   activityID,
 			Message:      "Self-update completion requires review",
-		}
-		err = errors.Join(err, jobcontext.Progress(ctx, selfTarget), errors.New("self-update was triggered but completion requires review"))
-		status = scheduler.NeedsAttention
+		}), errors.New("self-update was triggered but completion requires review"))
 	}
-	// A scoped rerun of a durable run is a retry unless that run already recorded a finished batch.
-	batchType := "update-batch"
-	if durableRun && len(options.ResourceIds) > 0 && !slices.ContainsFunc(previous.Outcome.Targets, func(target scheduler.TargetOutcome) bool {
-		return target.ID == "auto-update" && target.ResourceType == "update-batch" && (target.Status == scheduler.Succeeded || target.Status == scheduler.Partial)
-	}) {
-		batchType = "update-retry"
-	}
-	if !batchCompleted {
-		batchType = "update-interrupted"
-	}
-	checkpoint := scheduler.TargetOutcome{ID: "auto-update", ResourceType: batchType, Status: status, ActivityID: activityID}
-	if err != nil {
-		checkpoint.Message = err.Error()
-	}
-	checkpointErr := jobcontext.Progress(ctx, checkpoint)
+	checkpointErr := jobcontext.Progress(ctx, scheduler.TargetOutcome{
+		ID: "auto-update",
+		ResourceType: func() string {
+			switch {
+			case !batchCompleted:
+				return "update-interrupted"
+			// A scoped rerun of a durable run is a retry unless that run already recorded a finished batch.
+			case durableRun && len(options.ResourceIds) > 0 && !slices.ContainsFunc(previous.Outcome.Targets, func(target scheduler.TargetOutcome) bool {
+				return target.ID == "auto-update" && target.ResourceType == "update-batch" && (target.Status == scheduler.Succeeded || target.Status == scheduler.Partial)
+			}):
+				return "update-retry"
+			}
+			return "update-batch"
+		}(),
+		Status: status,
+		Message: func() string {
+			if err == nil {
+				return ""
+			}
+			return err.Error()
+		}(),
+		ActivityID: activityID,
+	})
 	err = errors.Join(err, checkpointErr)
 	if err != nil {
+		// keep: the caller's result reports the failed batch
 		out.Success = false
 	}
 	if recordingFailed || selfTriggered || checkpointErr != nil {
-		err = &scheduler.OutcomeError{Outcome: scheduler.Outcome{Status: scheduler.NeedsAttention, Message: err.Error(), ActivityID: activityID}, Cause: err}
+		return &scheduler.OutcomeError{
+			Outcome: scheduler.Outcome{
+				Status:     scheduler.NeedsAttention,
+				Message:    err.Error(),
+				ActivityID: activityID,
+			},
+			Cause: err,
+		}
 	}
 	return err
 }
 
 // ListTags supplies Arcane's registry credentials to the updater's tag checker.
 func (s *UpdaterService) ListTags(ctx context.Context, imageRef string) ([]string, error) {
-	if s.deps.RegistryDigestResolver == nil {
-		return nil, errors.New("registry service unavailable")
-	}
-	var credentials []containerregistry.Credential
-	if s.deps.Projects != nil {
-		resolved, err := s.deps.Projects.ResolveRegistryCredentials(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("resolve registry credentials: %w", err)
-		}
-		credentials = resolved
+	credentials, err := s.deps.Projects.ResolveRegistryCredentials(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("resolve registry credentials: %w", err)
 	}
 	return s.deps.RegistryDigestResolver.ListImageTags(ctx, imageRef, credentials)
 }
 
 // UpdateServiceImages persists and redeploys the selected Compose service images.
 func (s *UpdaterService) UpdateServiceImages(ctx context.Context, projectID string, changes map[string]updatertypes.ServiceImageChange) error {
-	if s.deps.Projects == nil {
-		return errors.New("project service unavailable")
-	}
 	s.appendAutoUpdateActivityMessage(ctx, activityIDFromContext(ctx), "Updating Compose image references", "Persisting image updates", 50)
 	return s.deps.Projects.UpdateProjectServiceImages(ctx, projectID, changes, s.deps.SystemUser)
 }
 
 // CheckProjectUpdates checks effective Compose service policies without deploying containers.
 func (s *UpdaterService) CheckProjectUpdates(ctx context.Context, projectID string) (*projecttypes.UpdateInfo, error) {
-	if s.deps.Projects == nil || s.deps.DB == nil || s.engine == nil {
-		return nil, errors.New("project update checker unavailable")
-	}
 	details, err := s.deps.Projects.GetProjectDetails(ctx, projectID, projecttypes.DetailsOptions{IncludeServiceConfigs: true})
 	if err != nil {
 		return nil, err
@@ -1482,58 +1470,75 @@ func (s *UpdaterService) CheckProjectUpdates(ctx context.Context, projectID stri
 }
 
 func (s *UpdaterService) checkProjectService(ctx context.Context, projectID string, service types.ServiceConfig) imageupdate.ImageUpdateRecord {
-	record := imageupdate.ImageUpdateRecord{
-		ID:          "project::" + projectID + "::" + service.Name,
-		ProjectID:   projectID,
-		ServiceName: service.Name,
-		PolicyKey:   imageref.UpdatePolicyKey(service.Image, service.Labels),
-		CheckTime:   time.Now().UTC(),
-	}
+	checkTime := time.Now().UTC()
 	parsed, err := refs.NormalizeReference(service.Image)
 	if err != nil {
-		record.LastError = new(err.Error())
-		return record
-	}
-	record.Repository = parsed.RegistryHost + "/" + parsed.Repository
-	record.Tag = parsed.Tag
-	record.CurrentVersion = parsed.Tag
-	if service.Build != nil {
-		record.UpdateType = imageupdate.UpdateTypeLocal
-		return record
-	}
-	// Disabling automatic installation keeps the preview check; only the
-	// update-check label opts a service out of monitoring.
-	if imageref.IsUpdateCheckDisabled(service.Labels) {
-		return record
-	}
-	check, err := s.engine.CheckImageUpdate(ctx, updatertypes.CheckRequest{ImageRef: service.Image, Policy: updater.DefaultLabelPolicy().TagPolicy(service.Labels)})
-	if err != nil {
-		if errdefs.IsNotFound(err) {
-			record.UpdateType = imageupdate.UpdateTypeNotPulled
-		} else {
-			record.LastError = new(err.Error())
+		return imageupdate.ImageUpdateRecord{
+			ProjectID:   projectID,
+			ServiceName: service.Name,
+			PolicyKey:   imageref.UpdatePolicyKey(service.Image, service.Labels),
+			CheckTime:   checkTime,
+			LastError:   new(err.Error()),
+			ID:          "project::" + projectID + "::" + service.Name,
 		}
-		return record
 	}
-	record.HasUpdate = check.UpdateAvailable
-	record.UpdateType = check.UpdateType
-	record.CurrentVersion = cmp.Or(check.CurrentVersion, record.CurrentVersion)
-	if check.CurrentDigest != "" {
-		record.CurrentDigest = new(check.CurrentDigest)
-	}
-	if check.TargetDigest != "" {
-		record.LatestDigest = new(check.TargetDigest)
-	}
-	if check.TargetRef != "" {
+	check, checkErr := func() (updatertypes.CheckResult, error) {
+		// Disabling automatic installation keeps the preview check; only the
+		// update-check label opts a service out of monitoring.
+		if service.Build != nil || imageref.IsUpdateCheckDisabled(service.Labels) {
+			return updatertypes.CheckResult{}, nil
+		}
+		result, resultErr := s.engine.CheckImageUpdate(ctx, updatertypes.CheckRequest{
+			ImageRef: service.Image,
+			Policy:   updater.DefaultLabelPolicy().TagPolicy(service.Labels),
+		})
+		if resultErr != nil {
+			return updatertypes.CheckResult{}, resultErr
+		}
+		return result, nil
+	}()
+	latestVersion, targetErr := func() (*string, error) {
+		if check.TargetRef == "" {
+			return nil, nil
+		}
 		target, parseErr := refs.NormalizeReference(check.TargetRef)
 		if parseErr != nil {
-			record.HasUpdate = false
-			record.LastError = new(parseErr.Error())
-		} else {
-			record.LatestVersion = new(target.Tag)
+			return nil, parseErr
 		}
+		return new(target.Tag), nil
+	}()
+	return imageupdate.ImageUpdateRecord{
+		ProjectID:     projectID,
+		ServiceName:   service.Name,
+		PolicyKey:     imageref.UpdatePolicyKey(service.Image, service.Labels),
+		CheckTime:     checkTime,
+		LatestVersion: latestVersion,
+		CurrentDigest: mo.EmptyableToOption(check.CurrentDigest).ToPointer(),
+		LatestDigest:  mo.EmptyableToOption(check.TargetDigest).ToPointer(),
+		LastError: func() *string {
+			switch {
+			case checkErr != nil && !errdefs.IsNotFound(checkErr):
+				return new(checkErr.Error())
+			case targetErr != nil:
+				return new(targetErr.Error())
+			}
+			return nil
+		}(),
+		ID:         "project::" + projectID + "::" + service.Name,
+		Repository: parsed.RegistryHost + "/" + parsed.Repository,
+		Tag:        parsed.Tag,
+		UpdateType: func() string {
+			switch {
+			case service.Build != nil:
+				return imageupdate.UpdateTypeLocal
+			case errdefs.IsNotFound(checkErr):
+				return imageupdate.UpdateTypeNotPulled
+			}
+			return check.UpdateType
+		}(),
+		CurrentVersion: cmp.Or(check.CurrentVersion, parsed.Tag),
+		HasUpdate:      check.UpdateAvailable && targetErr == nil,
 	}
-	return record
 }
 
 // RegisterWorkflows defines the auto-update workflow (fresh candidate check, frozen plan without
@@ -1576,6 +1581,7 @@ func (s *UpdaterService) RegisterWorkflows(engine *flow.Engine) error {
 	if err != nil {
 		return err
 	}
+	// keep: the workflow handle exists only once the shared service registers it
 	s.autoUpdate = autoUpdate
 	return s.execution.RegisterWorkflows(engine)
 }
@@ -1661,25 +1667,50 @@ func (s *UpdaterService) applyAutoUpdate(ctx context.Context, t flow.Task) (any,
 	if err != nil {
 		return nil, common.Classify(common.ErrUnavailable, err)
 	}
-	applied := autoUpdateApplied{Unresolved: unresolved, Completed: true}
-	if remaining > 0 {
-		if applyErr := s.applyBatch(ctx, arcaneupdater.Options{}, &applied.Result); applyErr != nil {
-			// A shutdown hands the task back so the redelivery finishes the remaining frozen targets.
-			if ctx.Err() != nil {
-				return nil, ctx.Err()
-			}
-			applied.Error, applied.Completed = applyErr.Error(), false
+	var result arcaneupdater.Result
+	applyErr := func() error {
+		if remaining == 0 {
+			return nil
 		}
+		return s.applyBatch(ctx, arcaneupdater.Options{}, &result)
+	}()
+	// A shutdown hands the task back so the redelivery finishes the remaining frozen targets.
+	if applyErr != nil && ctx.Err() != nil {
+		return nil, ctx.Err()
 	}
-	applied.Result.Items = nil
-	applied.Result.Duration = time.Since(start).String()
 	progress.mu.Lock()
-	if progress.err != nil {
-		applied.RecordingError = progress.err.Error()
-	}
-	applied.SelfTriggered, applied.SelfID = progress.selfTriggered, progress.selfID
-	progress.mu.Unlock()
-	return applied, nil
+	defer progress.mu.Unlock()
+	return autoUpdateApplied{
+		Result: arcaneupdater.Result{ //exhaustruct:enforce
+			Success:    result.Success,
+			Checked:    result.Checked,
+			Updated:    result.Updated,
+			Restarted:  result.Restarted,
+			Skipped:    result.Skipped,
+			Failed:     result.Failed,
+			StartTime:  result.StartTime,
+			EndTime:    result.EndTime,
+			Duration:   time.Since(start).String(),
+			Items:      nil,
+			ActivityID: result.ActivityID,
+		},
+		Error: func() string {
+			if applyErr == nil {
+				return ""
+			}
+			return applyErr.Error()
+		}(),
+		RecordingError: func() string {
+			if progress.err == nil {
+				return ""
+			}
+			return progress.err.Error()
+		}(),
+		SelfTriggered: progress.selfTriggered,
+		SelfID:        progress.selfID,
+		Unresolved:    unresolved,
+		Completed:     applyErr == nil,
+	}, nil
 }
 
 // finalizeAutoUpdate records the batch checkpoint and returns the run outcome.
@@ -1691,30 +1722,44 @@ func (s *UpdaterService) finalizeAutoUpdate(ctx context.Context, t flow.Task) (a
 	activityID := t.ActivityID()
 	ctx = contextWithActivityID(ctx, activityID)
 	if applied.Busy {
-		status, message := scheduler.Skipped, "Another update is active"
-		if applied.Started {
-			status, message = scheduler.Failed, "Another update is active; the remaining targets were not updated"
-		}
-		batch := scheduler.TargetOutcome{ID: "auto-update", ResourceType: "update-batch", Status: status, ActivityID: activityID, Message: message}
-		if err := jobcontext.Progress(ctx, batch); err != nil {
+		status := kit.Ternary(applied.Started, scheduler.Failed, scheduler.Skipped)
+		message := kit.Ternary(applied.Started, "Another update is active; the remaining targets were not updated", "Another update is active")
+		if err := jobcontext.Progress(ctx, scheduler.TargetOutcome{
+			ID:           "auto-update",
+			ResourceType: "update-batch",
+			Status:       status,
+			ActivityID:   activityID,
+			Message:      message,
+		}); err != nil {
 			return nil, common.Classify(common.ErrUnavailable, err)
 		}
-		return scheduler.Outcome{Status: status, Message: message, ActivityID: activityID}, nil
+		return scheduler.Outcome{
+			Status:     status,
+			Message:    message,
+			ActivityID: activityID,
+		}, nil
 	}
-	progress := &updateProgress{selfTriggered: applied.SelfTriggered, selfID: applied.SelfID}
-	if applied.RecordingError != "" {
-		progress.err = errors.New(applied.RecordingError)
-	}
-	var applyErr error
-	if applied.Error != "" {
-		applyErr = errors.New(applied.Error)
-	}
-	result := &applied.Result
 	// Containers that could not be planned never reached apply, so they count as failed here.
 	run, _ := jobcontext.Run(ctx)
 	unplanned := s.recovery.Unplanned(run)
-	result.Failed += len(unplanned)
-	err := progress.completeBatch(ctx, arcaneupdater.Options{}, result, applied.Completed, applyErr)
+	result := &arcaneupdater.Result{ //exhaustruct:enforce
+		Success:    applied.Result.Success,
+		Checked:    applied.Result.Checked,
+		Updated:    applied.Result.Updated,
+		Restarted:  applied.Result.Restarted,
+		Skipped:    applied.Result.Skipped,
+		Failed:     applied.Result.Failed + len(unplanned),
+		StartTime:  applied.Result.StartTime,
+		EndTime:    applied.Result.EndTime,
+		Duration:   applied.Result.Duration,
+		Items:      applied.Result.Items,
+		ActivityID: applied.Result.ActivityID,
+	}
+	err := (&updateProgress{
+		err:           kit.Ternary(applied.RecordingError != "", errors.New(applied.RecordingError), nil),
+		selfTriggered: applied.SelfTriggered,
+		selfID:        applied.SelfID,
+	}).completeBatch(ctx, arcaneupdater.Options{}, result, applied.Completed, kit.Ternary(applied.Error != "", errors.New(applied.Error), nil))
 	slog.InfoContext(ctx, "auto-update run completed",
 		"checked", result.Checked,
 		"updated", result.Updated,
@@ -1722,24 +1767,26 @@ func (s *UpdaterService) finalizeAutoUpdate(ctx context.Context, t flow.Task) (a
 		"skipped", result.Skipped,
 		"failed", result.Failed,
 	)
-	outcome := scheduler.Outcome{Status: scheduler.Succeeded, Message: "Auto-update run completed", ActivityID: activityID}
-	if result.Failed > 0 || err != nil {
-		outcome.Status = scheduler.Partial
-		outcome.Message = "Some updates failed"
-		if err != nil {
-			outcome.Message += ": " + err.Error()
+	status, message := func() (scheduler.RunStatus, string) {
+		if outcomeErr, ok := errors.AsType[*scheduler.OutcomeError](err); ok {
+			return outcomeErr.Outcome.Status, outcomeErr.Outcome.Message
 		}
-	}
-	outcome.Targets = append(outcome.Targets, unplanned...)
-	if applied.Unresolved {
-		outcome.Status = scheduler.Failed
-		outcome.Message = "Some target outcomes could not be confirmed"
-	}
-	if outcomeErr, ok := errors.AsType[*scheduler.OutcomeError](err); ok {
-		outcome.Status = outcomeErr.Outcome.Status
-		outcome.Message = outcomeErr.Outcome.Message
-	}
-	return outcome, nil
+		switch {
+		case applied.Unresolved:
+			return scheduler.Failed, "Some target outcomes could not be confirmed"
+		case err != nil:
+			return scheduler.Partial, "Some updates failed: " + err.Error()
+		case result.Failed > 0:
+			return scheduler.Partial, "Some updates failed"
+		}
+		return scheduler.Succeeded, "Auto-update run completed"
+	}()
+	return scheduler.Outcome{
+		Status:     status,
+		Message:    message,
+		ActivityID: activityID,
+		Targets:    unplanned,
+	}, nil
 }
 
 // ValidateAutoUpdateRetry allows a retry only while frozen targets remain unsettled.

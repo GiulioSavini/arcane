@@ -49,9 +49,12 @@ func RegisterUpdater(api huma.API, updaterService *UpdaterService, appCtx handle
 	}
 
 	middleware.RegisterWithPermission(api, huma.Operation{
-		OperationID: "check-project-updates", Method: http.MethodPost,
-		Path:    "/environments/{id}/updater/projects/{projectId}/check",
-		Summary: "Check project service updates", Tags: []string{"Updater"}, Security: handlerutil.DefaultOperationSecurity(),
+		OperationID: "check-project-updates",
+		Method:      http.MethodPost,
+		Path:        "/environments/{id}/updater/projects/{projectId}/check",
+		Summary:     "Check project service updates",
+		Tags:        []string{"Updater"},
+		Security:    handlerutil.DefaultOperationSecurity(),
 	}, authz.PermImageUpdatesCheck, h.CheckProjectUpdates)
 	middleware.RegisterWithPermission(api, huma.Operation{
 		OperationID: "run-updater",

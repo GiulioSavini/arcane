@@ -11,6 +11,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 
@@ -25,8 +26,15 @@ import (
 	"github.com/moby/buildkit/util/attestation"
 	"github.com/moby/moby/client"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	"go.getarcane.app/kit/pkg"
 
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane/registryauth"
+)
+
+const (
+	dockerAttestationManifestArtifactType = "application/vnd.docker.attestation.manifest.v1+json"
+	inTotoLayerMediaType                  = "application/vnd.in-toto+json"
+	inTotoPredicateTypeAnnotation         = "in-toto.io/predicate-type"
 )
 
 // zstdDecoder is shared because DecodeAll is safe for concurrent use and a decoder is costly to build.
@@ -38,6 +46,30 @@ type Service struct {
 	registryAuth func(ctx context.Context, registryHost string) (string, error)
 }
 
+type Query struct {
+	Platform         string
+	PredicateType    string
+	IncludeStatement bool
+}
+
+type reference struct {
+	ImageRef      string
+	SubjectDigest string
+	Empty         bool
+}
+
+type subject struct {
+	Descriptor v1.Descriptor
+	Digest     string
+	Platform   string
+}
+
+type attestationStatementEnvelope struct {
+	Type          string                     `json:"_type"`
+	PredicateType string                     `json:"predicateType"`
+	Subject       []image.AttestationSubject `json:"subject"`
+}
+
 func NewService(
 	dockerClient func(ctx context.Context) (*client.Client, error),
 	registryAuth func(ctx context.Context, registryHost string) (string, error),
@@ -45,42 +77,32 @@ func NewService(
 	return &Service{dockerClient: dockerClient, registryAuth: registryAuth}
 }
 
-type Query struct {
-	Platform         string
-	PredicateType    string
-	IncludeStatement bool
-}
-
-type referenceInternal struct {
-	ImageRef      string
-	SubjectDigest string
-	Empty         bool
-}
-
-type subjectInternal struct {
-	Descriptor v1.Descriptor
-	Digest     string
-	Platform   string
-}
-
 // GetImageAttestations returns in-toto attestations attached to a local image or registry reference.
 func (s *Service) GetImageAttestations(ctx context.Context, imageName string, query Query) (*image.AttestationList, error) {
-	resolution, err := s.resolveImageAttestationReferenceInternal(ctx, imageName)
+	resolution, err := s.resolveImageAttestationReference(ctx, imageName)
 	if err != nil {
 		return nil, err
 	}
-
-	out := &image.AttestationList{
-		ImageRef:      resolution.ImageRef,
-		SubjectDigest: resolution.SubjectDigest,
-		Platform:      strings.TrimSpace(query.Platform),
-		Attestations:  []image.Attestation{},
-	}
 	if resolution.Empty {
-		return out, nil
+		return &image.AttestationList{
+			ImageRef:      resolution.ImageRef,
+			SubjectDigest: resolution.SubjectDigest,
+			Platform:      strings.TrimSpace(query.Platform),
+			Attestations:  []image.Attestation{},
+		}, nil
 	}
 
-	platform, hasPlatform, err := parseAttestationPlatformInternal(query.Platform)
+	platform, hasPlatform, err := func() (ocispec.Platform, bool, error) {
+		value := strings.TrimSpace(query.Platform)
+		if value == "" {
+			return ocispec.Platform{}, false, nil
+		}
+		parsed, parseErr := platforms.Parse(value)
+		if parseErr != nil {
+			return ocispec.Platform{}, false, fmt.Errorf("invalid platform %q: %w", value, parseErr)
+		}
+		return parsed, true, nil
+	}()
 	if err != nil {
 		return nil, err
 	}
@@ -90,87 +112,133 @@ func (s *Service) GetImageAttestations(ctx context.Context, imageName string, qu
 		return nil, fmt.Errorf("parse image reference %q: %w", resolution.ImageRef, err)
 	}
 
-	remoteOptions := s.remoteOptionsForImageRefInternal(ctx, resolution.ImageRef)
+	remoteOptions := s.remoteOptionsForImageRef(ctx, resolution.ImageRef)
 	remoteDescriptor, err := remote.Get(ref, remoteOptions...)
 	if err != nil {
 		return nil, fmt.Errorf("get image manifest %q: %w", resolution.ImageRef, err)
 	}
 
-	if out.SubjectDigest == "" {
-		out.SubjectDigest = remoteDescriptor.Digest.String()
-	}
-
-	index, subjects, err := subjectsInternal(remoteDescriptor, platform, hasPlatform)
+	index, targets, err := subjects(remoteDescriptor, platform, hasPlatform)
 	if err != nil {
 		return nil, err
 	}
-	if hasPlatform && len(subjects) > 0 {
-		out.SubjectDigest = subjects[0].Digest
-		out.Platform = subjects[0].Platform
-	}
 
 	attestations := make([]image.Attestation, 0)
-	for _, subject := range subjects {
-		referrerAttestations, readReferrerAttestationsErr := s.readReferrerAttestationsInternal(ctx, ref.Context(), subject, remoteOptions, query)
+	for _, target := range targets {
+		referrerAttestations, readReferrerAttestationsErr := s.readReferrerAttestations(ctx, ref.Context(), target, remoteOptions, query)
 		if readReferrerAttestationsErr != nil {
 			return nil, readReferrerAttestationsErr
 		}
 		attestations = append(attestations, referrerAttestations...)
 	}
 
-	if index != nil {
-		inlineAttestations, readInlineAttestationsErr := readInlineAttestationsInternal(ctx, index, subjects, query)
-		if readInlineAttestationsErr != nil {
-			return nil, readInlineAttestationsErr
+	if index != nil && len(targets) > 0 {
+		indexManifest, indexManifestErr := index.IndexManifest()
+		if indexManifestErr != nil {
+			return nil, fmt.Errorf("read image index manifest for inline attestations: %w", indexManifestErr)
 		}
-		attestations = append(attestations, inlineAttestations...)
-	}
 
-	out.Attestations = dedupeAttestationsInternal(attestations)
-	return out, nil
-}
+		subjectByDigest := make(map[string]subject, len(targets))
+		for _, target := range targets {
+			subjectByDigest[target.Digest] = target
+		}
 
-func (s *Service) resolveImageAttestationReferenceInternal(ctx context.Context, imageName string) (referenceInternal, error) {
-	imageName = strings.TrimSpace(imageName)
-	if imageName == "" {
-		return referenceInternal{}, errors.New("image name is required")
-	}
-
-	if s.dockerClient != nil {
-		dockerClient, err := s.dockerClient(ctx)
-		if err == nil {
-			inspect, inspectErr := dockerClient.ImageInspect(ctx, imageName)
-			if inspectErr == nil {
-				imageRef := firstUsableImageReferenceInternal(inspect.RepoDigests, inspect.RepoTags)
-				if imageRef == "" {
-					return referenceInternal{ImageRef: imageName, Empty: true}, nil
-				}
-				return referenceInternal{
-					ImageRef:      imageRef,
-					SubjectDigest: digestFromReferenceInternal(imageRef),
-				}, nil
+		for _, descriptor := range indexManifest.Manifests {
+			referenceDigest := strings.TrimSpace(descriptor.Annotations[attestation.DockerAnnotationReferenceDigest])
+			target, ok := subjectByDigest[referenceDigest]
+			if (descriptor.Annotations[attestation.DockerAnnotationReferenceType] != attestation.DockerAnnotationReferenceTypeDefault &&
+				descriptor.ArtifactType != dockerAttestationManifestArtifactType) || (referenceDigest != "" && !ok) {
+				continue
 			}
+
+			attestationImage, imageErr := index.Image(descriptor.Digest)
+			if imageErr != nil {
+				return nil, fmt.Errorf("read inline attestation image %s: %w", descriptor.Digest.String(), imageErr)
+			}
+
+			items, imageErr := readAttestationImage(ctx, attestationImage, descriptor, kit.Ternary(referenceDigest == "", targets[0].Platform, target.Platform), query)
+			if imageErr != nil {
+				return nil, imageErr
+			}
+			attestations = append(attestations, items...)
 		}
 	}
 
-	if isLikelyLocalImageIDInternal(imageName) {
-		return referenceInternal{}, fmt.Errorf("image %q does not have a registry reference", imageName)
-	}
-	if _, err := name.ParseReference(imageName, name.WeakValidation); err != nil {
-		return referenceInternal{}, fmt.Errorf("image %q does not have a registry reference: %w", imageName, err)
-	}
-	return referenceInternal{
-		ImageRef:      imageName,
-		SubjectDigest: digestFromReferenceInternal(imageName),
+	seen := make(map[string]struct{}, len(attestations))
+	return &image.AttestationList{
+		ImageRef: resolution.ImageRef,
+		SubjectDigest: func() string {
+			if hasPlatform && len(targets) > 0 {
+				return targets[0].Digest
+			}
+			return cmp.Or(resolution.SubjectDigest, remoteDescriptor.Digest.String())
+		}(),
+		Platform: func() string {
+			if hasPlatform && len(targets) > 0 {
+				return targets[0].Platform
+			}
+			return strings.TrimSpace(query.Platform)
+		}(),
+		Attestations: slices.DeleteFunc(attestations, func(item image.Attestation) bool {
+			key := strings.Join([]string{
+				item.Digest,
+				item.PredicateType,
+				item.Platform,
+			}, "|")
+			_, duplicate := seen[key]
+			seen[key] = struct{}{}
+			return duplicate
+		}),
 	}, nil
 }
 
-func (s *Service) remoteOptionsForImageRefInternal(ctx context.Context, imageRef string) []remote.Option {
-	options := make([]remote.Option, 0, 2)
-	options = append(options, remote.WithContext(ctx))
-	if s.registryAuth == nil {
-		return options
+func (s *Service) resolveImageAttestationReference(ctx context.Context, imageName string) (reference, error) {
+	imageName = strings.TrimSpace(imageName)
+	if imageName == "" {
+		return reference{}, errors.New("image name is required")
 	}
+
+	if dockerClient, err := s.dockerClient(ctx); err == nil {
+		if inspect, inspectErr := dockerClient.ImageInspect(ctx, imageName); inspectErr == nil {
+			imageRef := func() string {
+				for _, candidate := range slices.Concat(
+					slices.DeleteFunc(slices.Clone(inspect.RepoDigests), func(repoDigest string) bool { return !strings.Contains(repoDigest, "@sha256:") }),
+					inspect.RepoTags,
+				) {
+					if trimmed := strings.TrimSpace(candidate); trimmed != "" && !strings.Contains(trimmed, "<none>") {
+						return trimmed
+					}
+				}
+				return ""
+			}()
+			if imageRef == "" {
+				return reference{ImageRef: imageName, Empty: true}, nil
+			}
+			_, subjectDigest, _ := strings.Cut(imageRef, "@")
+			return reference{
+				ImageRef:      imageRef,
+				SubjectDigest: subjectDigest,
+			}, nil
+		}
+	}
+
+	if strings.HasPrefix(imageName, "sha256:") || (len(imageName) == 64 && !strings.ContainsFunc(imageName, func(r rune) bool {
+		return (r < '0' || r > '9') && (r < 'a' || r > 'f') && (r < 'A' || r > 'F')
+	})) {
+		return reference{}, fmt.Errorf("image %q does not have a registry reference", imageName)
+	}
+	if _, err := name.ParseReference(imageName, name.WeakValidation); err != nil {
+		return reference{}, fmt.Errorf("image %q does not have a registry reference: %w", imageName, err)
+	}
+	_, subjectDigest, _ := strings.Cut(imageName, "@")
+	return reference{
+		ImageRef:      imageName,
+		SubjectDigest: subjectDigest,
+	}, nil
+}
+
+func (s *Service) remoteOptionsForImageRef(ctx context.Context, imageRef string) []remote.Option {
+	options := []remote.Option{remote.WithContext(ctx)}
 
 	registryHost, err := registryauth.GetRegistryAddress(imageRef)
 	if err != nil {
@@ -193,26 +261,23 @@ func (s *Service) remoteOptionsForImageRefInternal(ctx context.Context, imageRef
 		return options
 	}
 
-	options = append(options, remote.WithAuth(authn.FromConfig(authn.AuthConfig{
+	return append(options, remote.WithAuth(authn.FromConfig(authn.AuthConfig{
 		Username:      dockerAuth.Username,
 		Password:      dockerAuth.Password,
 		Auth:          dockerAuth.Auth,
 		IdentityToken: dockerAuth.IdentityToken,
 		RegistryToken: dockerAuth.RegistryToken,
 	})))
-	return options
 }
 
-func subjectsInternal(descriptor *remote.Descriptor, platform ocispec.Platform, hasPlatform bool) (v1.ImageIndex, []subjectInternal, error) {
-	root := subjectInternal{
+func subjects(descriptor *remote.Descriptor, platform ocispec.Platform, hasPlatform bool) (v1.ImageIndex, []subject, error) {
+	root := subject{
 		Descriptor: descriptor.Descriptor,
 		Digest:     descriptor.Digest.String(),
+		Platform:   kit.Ternary(hasPlatform, platforms.Format(platform), ""),
 	}
 	if !descriptor.MediaType.IsIndex() {
-		if hasPlatform {
-			root.Platform = platforms.Format(platform)
-		}
-		return nil, []subjectInternal{root}, nil
+		return nil, []subject{root}, nil
 	}
 
 	index, err := descriptor.ImageIndex()
@@ -225,71 +290,61 @@ func subjectsInternal(descriptor *remote.Descriptor, platform ocispec.Platform, 
 		return nil, nil, fmt.Errorf("read image index manifest %s: %w", descriptor.Digest.String(), err)
 	}
 
-	subjects := make([]subjectInternal, 0, len(indexManifest.Manifests)+1)
+	candidates := make([]subject, 0, len(indexManifest.Manifests)+1)
 	if !hasPlatform {
-		subjects = append(subjects, root)
+		candidates = append(candidates, root)
 	}
 	for _, child := range indexManifest.Manifests {
-		if isInlineAttestationDescriptorInternal(child) {
+		childPlatform := ocispec.Platform{
+			Architecture: kit.FromPtr(child.Platform).Architecture,
+			OS:           kit.FromPtr(child.Platform).OS,
+			OSVersion:    kit.FromPtr(child.Platform).OSVersion,
+			OSFeatures:   kit.FromPtr(child.Platform).OSFeatures,
+			Variant:      kit.FromPtr(child.Platform).Variant,
+		}
+		if child.Annotations[attestation.DockerAnnotationReferenceType] == attestation.DockerAnnotationReferenceTypeDefault ||
+			child.ArtifactType == dockerAttestationManifestArtifactType ||
+			(hasPlatform && (child.Platform == nil || !platforms.Only(platform).Match(childPlatform))) {
 			continue
 		}
-		if hasPlatform && !platformDescriptorMatchesInternal(child.Platform, platform) {
-			continue
-		}
-		childPlatform := platformStringInternal(child.Platform)
-		if hasPlatform && childPlatform == "" {
-			childPlatform = platforms.Format(platform)
-		}
-		subjects = append(subjects, subjectInternal{
+		candidates = append(candidates, subject{
 			Descriptor: child,
 			Digest:     child.Digest.String(),
-			Platform:   childPlatform,
+			Platform: cmp.Or(
+				kit.Ternary(childPlatform.OS != "" && childPlatform.Architecture != "", platforms.Format(childPlatform), ""),
+				kit.Ternary(hasPlatform, platforms.Format(platform), ""),
+			),
 		})
 	}
 
-	return index, dedupeSubjectsInternal(subjects), nil
-}
-
-func dedupeSubjectsInternal(subjects []subjectInternal) []subjectInternal {
-	seen := make(map[string]struct{}, len(subjects))
-	out := make([]subjectInternal, 0, len(subjects))
-	for _, subject := range subjects {
-		if subject.Digest == "" {
-			continue
-		}
-		key := subject.Digest + "|" + subject.Platform
-		if _, ok := seen[key]; ok {
-			continue
-		}
+	seen := make(map[string]struct{}, len(candidates))
+	return index, slices.DeleteFunc(candidates, func(candidate subject) bool {
+		key := candidate.Digest + "|" + candidate.Platform
+		_, duplicate := seen[key]
 		seen[key] = struct{}{}
-		out = append(out, subject)
-	}
-	return out
+		return candidate.Digest == "" || duplicate
+	}), nil
 }
 
-func (
-	s *Service,
-) readReferrerAttestationsInternal(
+func (s *Service) readReferrerAttestations(
 	ctx context.Context,
 	repository name.Repository,
-	subject subjectInternal,
+	target subject,
 	remoteOptions []remote.Option,
 	query Query,
-) (
-	[]image.Attestation,
-	error,
-) {
-	referrers, err := remote.Referrers(repository.Digest(subject.Digest), remoteOptions...)
+) ([]image.Attestation, error) {
+	referrers, err := remote.Referrers(repository.Digest(target.Digest), remoteOptions...)
 	if err != nil {
-		if shouldIgnoreReferrersErrorInternal(err) {
+		if transportErr, ok := errors.AsType[*transport.Error](err); ok &&
+			(transportErr.StatusCode == http.StatusNotFound || transportErr.StatusCode == http.StatusMethodNotAllowed) {
 			return nil, nil
 		}
-		return nil, fmt.Errorf("query image referrers for %s: %w", subject.Digest, err)
+		return nil, fmt.Errorf("query image referrers for %s: %w", target.Digest, err)
 	}
 
 	manifest, err := referrers.IndexManifest()
 	if err != nil {
-		return nil, fmt.Errorf("read image referrers for %s: %w", subject.Digest, err)
+		return nil, fmt.Errorf("read image referrers for %s: %w", target.Digest, err)
 	}
 
 	attestations := make([]image.Attestation, 0, len(manifest.Manifests))
@@ -304,14 +359,16 @@ func (
 			continue
 		}
 
-		if referrer.ArtifactType == "" {
-			referrer.ArtifactType = referrerDescriptor.ArtifactType
-		}
-		if referrer.MediaType == "" {
-			referrer.MediaType = referrerDescriptor.MediaType
-		}
-
-		items, getErr := readAttestationImageInternal(ctx, referrerImage, referrer, subject.Platform, query)
+		items, getErr := readAttestationImage(ctx, referrerImage, v1.Descriptor{ //exhaustruct:enforce
+			MediaType:    cmp.Or(referrer.MediaType, referrerDescriptor.MediaType),
+			Size:         referrer.Size,
+			Digest:       referrer.Digest,
+			Data:         referrer.Data,
+			URLs:         referrer.URLs,
+			Annotations:  referrer.Annotations,
+			Platform:     referrer.Platform,
+			ArtifactType: cmp.Or(referrer.ArtifactType, referrerDescriptor.ArtifactType),
+		}, target.Platform, query)
 		if getErr != nil {
 			return nil, getErr
 		}
@@ -320,203 +377,68 @@ func (
 	return attestations, nil
 }
 
-func readInlineAttestationsInternal(ctx context.Context, index v1.ImageIndex, subjects []subjectInternal, query Query) ([]image.Attestation, error) {
-	if len(subjects) == 0 {
-		return nil, nil
-	}
-
-	indexManifest, err := index.IndexManifest()
-	if err != nil {
-		return nil, fmt.Errorf("read image index manifest for inline attestations: %w", err)
-	}
-
-	subjectByDigest := make(map[string]subjectInternal, len(subjects))
-	for _, subject := range subjects {
-		subjectByDigest[subject.Digest] = subject
-	}
-
-	attestations := make([]image.Attestation, 0)
-	for _, descriptor := range indexManifest.Manifests {
-		if !isInlineAttestationDescriptorInternal(descriptor) {
-			continue
-		}
-
-		referenceDigest := strings.TrimSpace(descriptor.Annotations[attestation.DockerAnnotationReferenceDigest])
-		subject, ok := subjectByDigest[referenceDigest]
-		if referenceDigest != "" && !ok {
-			continue
-		}
-		if referenceDigest == "" {
-			subject = firstSubjectInternal(subjects)
-		}
-
-		attestationImage, imageErr := index.Image(descriptor.Digest)
-		if imageErr != nil {
-			return nil, fmt.Errorf("read inline attestation image %s: %w", descriptor.Digest.String(), imageErr)
-		}
-
-		items, imageErr := readAttestationImageInternal(ctx, attestationImage, descriptor, subject.Platform, query)
-		if imageErr != nil {
-			return nil, imageErr
-		}
-		attestations = append(attestations, items...)
-	}
-	return attestations, nil
-}
-
-func firstSubjectInternal(subjects []subjectInternal) subjectInternal {
-	if len(subjects) == 0 {
-		return subjectInternal{}
-	}
-	return subjects[0]
-}
-
-func readAttestationImageInternal(ctx context.Context, attestationImage v1.Image, artifactDescriptor v1.Descriptor, platform string, query Query) ([]image.Attestation, error) {
+func readAttestationImage(ctx context.Context, attestationImage v1.Image, artifactDescriptor v1.Descriptor, platform string, query Query) ([]image.Attestation, error) {
 	manifest, err := attestationImage.Manifest()
 	if err != nil {
 		return nil, fmt.Errorf("read attestation manifest %s: %w", artifactDescriptor.Digest.String(), err)
 	}
 
-	artifactType := artifactDescriptor.ArtifactType
-	if artifactType == "" {
-		artifactType = manifest.ArtifactType
-	}
-
 	attestations := make([]image.Attestation, 0, len(manifest.Layers))
 	for _, layerDescriptor := range manifest.Layers {
-		item, ok, readAttestationLayerErr := readAttestationLayerInternal(ctx, attestationImage, layerDescriptor, artifactType, platform, query)
-		if readAttestationLayerErr != nil {
-			return nil, readAttestationLayerErr
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
 		}
-		if ok {
-			attestations = append(attestations, item)
+		annotationPredicate := strings.TrimSpace(layerDescriptor.Annotations[inTotoPredicateTypeAnnotation])
+		if layerDescriptor.MediaType != inTotoLayerMediaType ||
+			(query.PredicateType != "" && annotationPredicate != "" && annotationPredicate != query.PredicateType) {
+			continue
 		}
+
+		layer, layerErr := attestationImage.LayerByDigest(layerDescriptor.Digest)
+		if layerErr != nil {
+			return nil, fmt.Errorf("read attestation layer %s: %w", layerDescriptor.Digest.String(), layerErr)
+		}
+
+		rawStatement, layerErr := readAttestationLayerBytes(layer, layerDescriptor.Digest.String())
+		if layerErr != nil {
+			return nil, layerErr
+		}
+
+		var statement attestationStatementEnvelope
+		if unmarshalErr := json.Unmarshal(rawStatement, &statement); unmarshalErr != nil {
+			return nil, fmt.Errorf("parse attestation statement %s: %w", layerDescriptor.Digest.String(), unmarshalErr)
+		}
+		if query.PredicateType != "" && cmp.Or(statement.PredicateType, annotationPredicate) != query.PredicateType {
+			continue
+		}
+
+		attestations = append(attestations, image.Attestation{
+			Digest:        layerDescriptor.Digest.String(),
+			MediaType:     string(layerDescriptor.MediaType),
+			ArtifactType:  cmp.Or(artifactDescriptor.ArtifactType, manifest.ArtifactType),
+			PredicateType: cmp.Or(statement.PredicateType, annotationPredicate),
+			StatementType: statement.Type,
+			Subject:       kit.Ternary(statement.Subject == nil, []image.AttestationSubject{}, statement.Subject),
+			Platform:      platform,
+			Size:          cmp.Or(layerDescriptor.Size, int64(len(rawStatement))),
+			Statement: func() []byte {
+				if !query.IncludeStatement {
+					return nil
+				}
+				return append([]byte(nil), rawStatement...)
+			}(),
+		})
 	}
 	return attestations, nil
 }
 
-func readAttestationLayerInternal(
-	ctx context.Context,
-	attestationImage v1.Image,
-	layerDescriptor v1.Descriptor,
-	artifactType, platform string,
-	query Query,
-) (
-	image.Attestation,
-	bool,
-	error,
-) {
-	if err := ctx.Err(); err != nil {
-		return image.Attestation{}, false, err
-	}
-	if layerDescriptor.MediaType != inTotoLayerMediaType {
-		return image.Attestation{}, false, nil
-	}
-
-	annotationPredicate := strings.TrimSpace(layerDescriptor.Annotations[inTotoPredicateTypeAnnotation])
-	if query.PredicateType != "" && annotationPredicate != "" && annotationPredicate != query.PredicateType {
-		return image.Attestation{}, false, nil
-	}
-
-	layer, err := attestationImage.LayerByDigest(layerDescriptor.Digest)
-	if err != nil {
-		return image.Attestation{}, false, fmt.Errorf("read attestation layer %s: %w", layerDescriptor.Digest.String(), err)
-	}
-
-	rawStatement, err := readAttestationLayerBytesInternal(layer, layerDescriptor.Digest.String())
-	if err != nil {
-		return image.Attestation{}, false, err
-	}
-
-	statement, err := parseAttestationStatementInternal(rawStatement)
-	if err != nil {
-		return image.Attestation{}, false, fmt.Errorf("parse attestation statement %s: %w", layerDescriptor.Digest.String(), err)
-	}
-	statement.PredicateType = cmp.Or(statement.PredicateType, annotationPredicate)
-	if query.PredicateType != "" && statement.PredicateType != query.PredicateType {
-		return image.Attestation{}, false, nil
-	}
-
-	size := cmp.Or(layerDescriptor.Size, int64(len(rawStatement)))
-
-	item := image.Attestation{
-		Digest:        layerDescriptor.Digest.String(),
-		MediaType:     string(layerDescriptor.MediaType),
-		ArtifactType:  artifactType,
-		PredicateType: statement.PredicateType,
-		StatementType: statement.Type,
-		Subject:       statement.Subject,
-		Platform:      platform,
-		Size:          size,
-	}
-	if item.Subject == nil {
-		item.Subject = []image.AttestationSubject{}
-	}
-	if query.IncludeStatement {
-		item.Statement = append([]byte(nil), rawStatement...)
-	}
-	return item, true, nil
-}
-
-func dedupeAttestationsInternal(attestations []image.Attestation) []image.Attestation {
-	seen := make(map[string]struct{}, len(attestations))
-	out := make([]image.Attestation, 0, len(attestations))
-	for _, item := range attestations {
-		key := strings.Join([]string{
-			item.Digest,
-			item.PredicateType,
-			item.Platform,
-		}, "|")
-		if _, ok := seen[key]; ok {
-			continue
-		}
-		seen[key] = struct{}{}
-		out = append(out, item)
-	}
-	return out
-}
-
-func parseAttestationStatementInternal(rawStatement []byte) (attestationStatementEnvelopeInternal, error) {
-	var statement attestationStatementEnvelopeInternal
-	if err := json.Unmarshal(rawStatement, &statement); err != nil {
-		return attestationStatementEnvelopeInternal{}, err
-	}
-	return statement, nil
-}
-
-type attestationStatementEnvelopeInternal struct {
-	Type          string                     `json:"_type"`
-	PredicateType string                     `json:"predicateType"`
-	Subject       []image.AttestationSubject `json:"subject"`
-}
-
-// decompressAttestationStatementInternal returns the raw in-toto statement
+// readAttestationLayerBytes returns the raw in-toto statement
 // bytes, transparently decompressing OCI blobs that are stored compressed. The
 // in-toto media type does not encode the compression algorithm, so the
 // container is detected from the magic header. gzip and zstd are the algorithms
 // supported by the OCI image spec; anything else (including already
 // uncompressed JSON) is returned unchanged.
-func decompressAttestationStatementInternal(data []byte) ([]byte, error) {
-	switch {
-	case len(data) >= 2 && data[0] == 0x1f && data[1] == 0x8b:
-		reader, err := gzip.NewReader(bytes.NewReader(data))
-		if err != nil {
-			return nil, err
-		}
-		defer func() { _ = reader.Close() }()
-		return io.ReadAll(reader)
-	case len(data) >= 4 && data[0] == 0x28 && data[1] == 0xb5 && data[2] == 0x2f && data[3] == 0xfd:
-		decoder, err := zstdDecoder()
-		if err != nil {
-			return nil, err
-		}
-		return decoder.DecodeAll(data, nil)
-	default:
-		return data, nil
-	}
-}
-
-func readAttestationLayerBytesInternal(layer v1.Layer, digest string) ([]byte, error) {
+func readAttestationLayerBytes(layer v1.Layer, digest string) ([]byte, error) {
 	reader, err := layer.Compressed()
 	if err != nil {
 		return nil, fmt.Errorf("open attestation layer %s: %w", digest, err)
@@ -530,109 +452,27 @@ func readAttestationLayerBytesInternal(layer v1.Layer, digest string) ([]byte, e
 		return nil, fmt.Errorf("close attestation layer %s: %w", digest, closeErr)
 	}
 
-	statement, err := decompressAttestationStatementInternal(rawStatement)
+	statement, err := func() ([]byte, error) {
+		switch {
+		case len(rawStatement) >= 2 && rawStatement[0] == 0x1f && rawStatement[1] == 0x8b:
+			gzipReader, gzipErr := gzip.NewReader(bytes.NewReader(rawStatement))
+			if gzipErr != nil {
+				return nil, gzipErr
+			}
+			defer func() { _ = gzipReader.Close() }()
+			return io.ReadAll(gzipReader)
+		case len(rawStatement) >= 4 && rawStatement[0] == 0x28 && rawStatement[1] == 0xb5 && rawStatement[2] == 0x2f && rawStatement[3] == 0xfd:
+			decoder, decoderErr := zstdDecoder()
+			if decoderErr != nil {
+				return nil, decoderErr
+			}
+			return decoder.DecodeAll(rawStatement, nil)
+		default:
+			return rawStatement, nil
+		}
+	}()
 	if err != nil {
 		return nil, fmt.Errorf("decompress attestation layer %s: %w", digest, err)
 	}
 	return statement, nil
-}
-
-func isInlineAttestationDescriptorInternal(descriptor v1.Descriptor) bool {
-	return descriptor.Annotations[attestation.DockerAnnotationReferenceType] == attestation.DockerAnnotationReferenceTypeDefault ||
-		descriptor.ArtifactType == dockerAttestationManifestArtifactType
-}
-
-const (
-	dockerAttestationManifestArtifactType = "application/vnd.docker.attestation.manifest.v1+json"
-	inTotoLayerMediaType                  = "application/vnd.in-toto+json"
-	inTotoPredicateTypeAnnotation         = "in-toto.io/predicate-type"
-)
-
-func shouldIgnoreReferrersErrorInternal(err error) bool {
-	if transportErr, ok := errors.AsType[*transport.Error](err); ok {
-		return transportErr.StatusCode == http.StatusNotFound || transportErr.StatusCode == http.StatusMethodNotAllowed
-	}
-	return false
-}
-
-func platformStringInternal(platform *v1.Platform) string {
-	if platform == nil || platform.OS == "" || platform.Architecture == "" {
-		return ""
-	}
-	return platforms.Format(ocispec.Platform{
-		Architecture: platform.Architecture,
-		OS:           platform.OS,
-		OSVersion:    platform.OSVersion,
-		OSFeatures:   platform.OSFeatures,
-		Variant:      platform.Variant,
-	})
-}
-
-func platformDescriptorMatchesInternal(platform *v1.Platform, wanted ocispec.Platform) bool {
-	if platform == nil {
-		return false
-	}
-	candidate := ocispec.Platform{
-		Architecture: platform.Architecture,
-		OS:           platform.OS,
-		OSVersion:    platform.OSVersion,
-		OSFeatures:   platform.OSFeatures,
-		Variant:      platform.Variant,
-	}
-	return platforms.Only(wanted).Match(candidate)
-}
-
-func parseAttestationPlatformInternal(value string) (ocispec.Platform, bool, error) {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return ocispec.Platform{}, false, nil
-	}
-
-	platform, err := platforms.Parse(value)
-	if err != nil {
-		return ocispec.Platform{}, false, fmt.Errorf("invalid platform %q: %w", value, err)
-	}
-	return platform, true, nil
-}
-
-func digestFromReferenceInternal(imageRef string) string {
-	if _, digest, found := strings.Cut(strings.TrimSpace(imageRef), "@"); found {
-		return digest
-	}
-	return ""
-}
-
-func isLikelyLocalImageIDInternal(value string) bool {
-	value = strings.TrimSpace(value)
-	if strings.HasPrefix(value, "sha256:") {
-		return true
-	}
-	if len(value) != 64 {
-		return false
-	}
-	for _, r := range value {
-		if (r < '0' || r > '9') && (r < 'a' || r > 'f') && (r < 'A' || r > 'F') {
-			return false
-		}
-	}
-	return true
-}
-
-func isUsableImageReferenceInternal(value string) bool {
-	value = strings.TrimSpace(value)
-	return value != "" && !strings.Contains(value, "<none>")
-}
-
-func firstUsableImageReferenceInternal(repoDigests, repoTags []string) string {
-	for _, repoDigest := range repoDigests {
-		if isUsableImageReferenceInternal(repoDigest) && strings.Contains(repoDigest, "@sha256:") {
-			return strings.TrimSpace(repoDigest)
-		}
-	}
-	for _, repoTag := range repoTags {
-		if isUsableImageReferenceInternal(repoTag) {
-			return strings.TrimSpace(repoTag)
-		}
-	}
-	return ""
 }

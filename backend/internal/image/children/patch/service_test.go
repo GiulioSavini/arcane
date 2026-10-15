@@ -79,16 +79,30 @@ func TestListPatchTargets_ExcludesUntaggedImages(t *testing.T) {
 	require.NoError(t, gdb.AutoMigrate(&vulnerability.VulnerabilityScanRecord{}, &vulnerability.VulnerabilityReportRecord{}, &ImagePatchRecord{}))
 	db := &database.DB{DB: gdb}
 
-	svc := &Service{
-		db:            db,
-		dockerService: docker.NewDockerClientService(ctx, nil, &config.Config{DockerHost: "unix:///nonexistent-arcane-test.sock"}, nil),
-	}
+	svc := NewService(db, docker.NewDockerClientService(ctx, nil, &config.Config{DockerHost: "unix:///nonexistent-arcane-test.sock"}, nil), nil, nil, nil, nil)
 
-	fixable := 3
 	records := []vulnerability.VulnerabilityScanRecord{
-		{ID: "sha256:aaa", ImageName: "nginx:latest", Status: vulnerability.ScanStatusCompleted, ScanTime: time.Now(), FixableCount: &fixable},
-		{ID: "sha256:bbb", ImageName: "sha256:bbb", Status: vulnerability.ScanStatusCompleted, ScanTime: time.Now(), FixableCount: &fixable},
-		{ID: "sha256:ccc", ImageName: "<none>:<none>", Status: vulnerability.ScanStatusCompleted, ScanTime: time.Now(), FixableCount: &fixable},
+		{
+			ID:           "sha256:aaa",
+			ImageName:    "nginx:latest",
+			Status:       vulnerability.ScanStatusCompleted,
+			ScanTime:     time.Now(),
+			FixableCount: new(3),
+		},
+		{
+			ID:           "sha256:bbb",
+			ImageName:    "sha256:bbb",
+			Status:       vulnerability.ScanStatusCompleted,
+			ScanTime:     time.Now(),
+			FixableCount: new(3),
+		},
+		{
+			ID:           "sha256:ccc",
+			ImageName:    "<none>:<none>",
+			Status:       vulnerability.ScanStatusCompleted,
+			ScanTime:     time.Now(),
+			FixableCount: new(3),
+		},
 	}
 	for i := range records {
 		require.NoError(t, db.Create(&records[i]).Error)
@@ -118,11 +132,14 @@ func patchFeatureSettings(t *testing.T) (*settings.SettingsService, *database.DB
 func TestVulnerabilityFeatureBlocksReportPatchesOnly(t *testing.T) {
 	settingsSvc, db := patchFeatureSettings(t)
 	require.NoError(t, settingsSvc.SetBoolSetting(t.Context(), features.VulnerabilityManagementSettingKey, false))
-	svc := &Service{
-		settingsService: settingsSvc,
-		db:              db,
-		dockerService:   docker.NewDockerClientService(t.Context(), nil, &config.Config{DockerHost: "unix:///nonexistent-arcane-feature-test.sock"}, nil),
-	}
+	svc := NewService(
+		db,
+		docker.NewDockerClientService(t.Context(), nil, &config.Config{DockerHost: "unix:///nonexistent-arcane-feature-test.sock"}, nil),
+		settingsSvc,
+		nil,
+		nil,
+		nil,
+	)
 	_, err := svc.PatchImage(t.Context(), "0", "test-image", imagepatch.PatchOptions{ScanID: "test-image"}, user.Actor{})
 	require.ErrorIs(t, err, common.ErrFeatureDisabled)
 	_, _, err = svc.ListPatchTargets(t.Context(), "0", pagination.QueryParams{})
@@ -138,8 +155,13 @@ func TestVulnerabilityFeatureBlocksReportPatchesOnly(t *testing.T) {
 
 func TestQueuedReportPatchStopsWhenFeatureDisabled(t *testing.T) {
 	settingsSvc, db := patchFeatureSettings(t)
-	svc := &Service{settingsService: settingsSvc, db: db, patchSlot: make(chan struct{}, 1)}
-	record := &ImagePatchRecord{EnvironmentID: "0", OriginalImageID: "test-image", Mode: string(imagepatch.PatchModeReport), Status: string(imagepatch.PatchStatusPatching)}
+	svc := NewService(db, nil, settingsSvc, nil, nil, nil)
+	record := &ImagePatchRecord{
+		EnvironmentID:   "0",
+		OriginalImageID: "test-image",
+		Mode:            string(imagepatch.PatchModeReport),
+		Status:          string(imagepatch.PatchStatusPatching),
+	}
 	require.NoError(t, db.Create(record).Error)
 	svc.patchSlot <- struct{}{}
 	done := make(chan struct{})
@@ -177,12 +199,15 @@ func TestDisabledFeatureSkipsPatchVerificationScan(t *testing.T) {
 	dockerClient, err := client.New(client.WithHost(server.URL), client.WithAPIVersion("1.41"))
 	require.NoError(t, err)
 	defer func() { assert.NoError(t, dockerClient.Close()) }()
-	svc := &Service{
-		settingsService: settingsSvc,
-		dockerService:   &docker.DockerClientService{Client: dockerClient},
+	svc := NewService(
+		nil,
+		&docker.DockerClientService{Client: dockerClient},
+		settingsSvc,
+		nil,
+		nil,
 		// Any attempt to scan would access unconfigured dependencies and fail.
-		vulnerabilityService: &vulnerability.VulnerabilityService{},
-	}
+		&vulnerability.VulnerabilityService{},
+	)
 	require.NotPanics(t, func() {
 		svc.verifyPatchedImage(t.Context(), &ImagePatchRecord{EnvironmentID: "0", PatchedRef: "test:patched"}, "")
 	})
@@ -192,13 +217,36 @@ func TestDisabledFeatureSkipsPatchVerificationScan(t *testing.T) {
 func TestAggregatePatchTargetsMergesEnvironments(t *testing.T) {
 	scanned := time.Date(2026, time.January, 1, 0, 0, 0, 0, time.UTC)
 	bodies := map[string]base.Paginated[imagepatch.PatchTarget]{
-		"a": {Success: true, Data: []imagepatch.PatchTarget{
-			{ImageID: "sha256:a1", ImageRef: "nginx:1", FixableCount: 3, ScanTime: scanned.Add(2 * time.Hour)},
-			{ImageID: "sha256:a2", ImageRef: "redis:7", FixableCount: 1, ScanTime: scanned},
-		}, Pagination: base.PaginationResponse{TotalItems: 2, GrandTotalItems: 4}},
-		"b": {Success: true, Data: []imagepatch.PatchTarget{
-			{ImageID: "sha256:b1", ImageRef: "alpine:3", FixableCount: 5, ScanTime: scanned.Add(time.Hour)},
-		}, Pagination: base.PaginationResponse{TotalItems: 1}},
+		"a": {
+			Success: true,
+			Data: []imagepatch.PatchTarget{
+				{
+					ImageID:      "sha256:a1",
+					ImageRef:     "nginx:1",
+					FixableCount: 3,
+					ScanTime:     scanned.Add(2 * time.Hour),
+				},
+				{
+					ImageID:      "sha256:a2",
+					ImageRef:     "redis:7",
+					FixableCount: 1,
+					ScanTime:     scanned,
+				},
+			},
+			Pagination: base.PaginationResponse{TotalItems: 2, GrandTotalItems: 4},
+		},
+		"b": {
+			Success: true,
+			Data: []imagepatch.PatchTarget{
+				{
+					ImageID:      "sha256:b1",
+					ImageRef:     "alpine:3",
+					FixableCount: 5,
+					ScanTime:     scanned.Add(time.Hour),
+				},
+			},
+			Pagination: base.PaginationResponse{TotalItems: 1},
+		},
 	}
 	var queries sync.Map
 	ctx := httpx.WithEnvironmentScope(t.Context(), &httpx.EnvironmentScope{
@@ -231,9 +279,12 @@ func TestAggregatePatchTargetsMergesEnvironments(t *testing.T) {
 		}
 		return out
 	}
-	svc := &Service{}
+	svc := NewService(nil, nil, nil, nil, nil, nil)
 	merge := func(sort string, order pagination.SortOrder, start, limit int) base.Paginated[imagepatch.PatchTarget] {
-		body, err := svc.AggregatePatchTargets(ctx, pagination.QueryParams{SortParams: pagination.SortParams{Sort: sort, Order: order}, Params: pagination.Params{Start: start, Limit: limit}})
+		body, err := svc.AggregatePatchTargets(ctx, pagination.QueryParams{
+			SortParams: pagination.SortParams{Sort: sort, Order: order},
+			Params:     pagination.Params{Start: start, Limit: limit},
+		})
 		require.NoError(t, err)
 		return body
 	}

@@ -15,8 +15,9 @@ import (
 	"github.com/getarcaneapp/arcane/types/v2/image"
 	"github.com/getarcaneapp/arcane/types/v2/system"
 	uploadtypes "github.com/getarcaneapp/arcane/types/v2/upload"
+	"github.com/samber/mo"
 	"go.getarcane.app/builds/types"
-	kit "go.getarcane.app/kit/pkg"
+	"go.getarcane.app/kit/pkg"
 	"gorm.io/gorm"
 
 	"github.com/getarcaneapp/arcane/backend/v2/internal/activity"
@@ -140,15 +141,13 @@ type UploadImageInput struct {
 
 // ListImages returns a paginated list of images.
 func (h *ImageHandler) ListImages(ctx context.Context, input *ListImagesInput) (*ListImagesOutput, error) {
-	params := handlerutil.PaginationParams(input.Start, input.Limit, input.Sort, input.Order, input.Search)
+	params := handlerutil.PaginationParams(input.Start, cmp.Or(input.Limit, 20), input.Sort, input.Order, input.Search)
 	if input.InUse != "" {
 		params.Filters["inUse"] = input.InUse
 	}
 	if input.Updates != "" {
 		params.Filters["updates"] = input.Updates
 	}
-
-	params.Limit = cmp.Or(params.Limit, 20)
 
 	if _, ok := httpx.EnvironmentScopeFromContext(ctx); ok {
 		body, err := h.imageService.AggregateImages(ctx, params)
@@ -194,7 +193,7 @@ func (h *ImageHandler) GetImage(ctx context.Context, input *GetImageInput) (*han
 
 // TagImage adds a repository tag to an image.
 func (h *ImageHandler) TagImage(ctx context.Context, input *TagImageInput) (*handlerutil.Out[base.MessageResponse], error) {
-	imageName, err := validateImageNameInternal(input.ImageName)
+	imageName, err := validateImageName(input.ImageName)
 	if err != nil {
 		return nil, err
 	}
@@ -216,7 +215,7 @@ func (h *ImageHandler) TagImage(ctx context.Context, input *TagImageInput) (*han
 
 // GetImageHistory returns Docker image layer history.
 func (h *ImageHandler) GetImageHistory(ctx context.Context, input *GetImageHistoryInput) (*handlerutil.Out[[]image.HistoryItem], error) {
-	imageName, err := validateImageNameInternal(input.ImageName)
+	imageName, err := validateImageName(input.ImageName)
 	if err != nil {
 		return nil, err
 	}
@@ -260,7 +259,7 @@ func (h *ImageHandler) SearchImages(ctx context.Context, input *SearchImagesInpu
 
 // ExportImage streams a Docker image tar archive.
 func (h *ImageHandler) ExportImage(ctx context.Context, input *ExportImageInput) (*huma.StreamResponse, error) {
-	imageName, err := validateImageNameInternal(input.ImageName)
+	imageName, err := validateImageName(input.ImageName)
 	if err != nil {
 		return nil, err
 	}
@@ -275,25 +274,22 @@ func (h *ImageHandler) ExportImage(ctx context.Context, input *ExportImageInput)
 			defer func() { _ = reader.Close() }()
 
 			humaCtx.SetHeader("Content-Type", "application/x-tar")
-			humaCtx.SetHeader("Content-Disposition", fmt.Sprintf("attachment; filename=%q", imageExportFileNameInternal(imageName)))
+			humaCtx.SetHeader("Content-Disposition", fmt.Sprintf(
+				"attachment; filename=%q",
+				cmp.Or(strings.Trim(strings.NewReplacer("/", "_", ":", "_", "@", "_").Replace(imageName), "._-"), "image")+".tar",
+			))
 
 			_, _ = io.Copy(humaCtx.BodyWriter(), reader)
 		},
 	}, nil
 }
 
-func validateImageNameInternal(raw string) (string, error) {
+func validateImageName(raw string) (string, error) {
 	imageName := strings.TrimSpace(raw)
 	if imageName == "" {
 		return "", huma.Error400BadRequest("image name is required")
 	}
 	return imageName, nil
-}
-
-func imageExportFileNameInternal(imageName string) string {
-	name := strings.NewReplacer("/", "_", ":", "_", "@", "_").Replace(imageName)
-	name = cmp.Or(strings.Trim(name, "._-"), "image")
-	return name + ".tar"
 }
 
 // RemoveImage removes a Docker image.
@@ -385,10 +381,6 @@ func (h *ImageHandler) BuildImage(ctx context.Context, input *BuildImageInput) (
 
 			runtimeCtx := utils.ActivityRuntimeContext(humaCtx.Context(), h.appCtx)
 			rawWriter := humaCtx.BodyWriter()
-			resourceName := strings.Join(input.Body.Tags, ", ")
-			if strings.TrimSpace(resourceName) == "" {
-				resourceName = input.Body.ContextDir
-			}
 			activityID, runtimeCtx := activitylib.StartHandlerActivity(
 				runtimeCtx,
 				h.activityService,
@@ -396,7 +388,7 @@ func (h *ImageHandler) BuildImage(ctx context.Context, input *BuildImageInput) (
 				activitytypes.TypeImageBuild,
 				"image",
 				"",
-				resourceName,
+				kit.Ternary(strings.TrimSpace(strings.Join(input.Body.Tags, ", ")) == "", input.Body.ContextDir, strings.Join(input.Body.Tags, ", ")),
 				user,
 				"Building image",
 				"Image build started",
@@ -494,66 +486,41 @@ func (h *ImageHandler) GetImageBuild(ctx context.Context, input *GetImageBuildIn
 
 // PruneImages removes unused Docker images.
 func (h *ImageHandler) PruneImages(ctx context.Context, input *PruneImagesInput) (*handlerutil.Out[image.PruneReport], error) {
-	mode := resolvePruneImageModeInternal(input)
-	until := resolvePruneImageUntilInternal(input)
-
 	report, err := h.imageService.PruneImages(ctx, system.PruneImagesOptions{
-		Mode:  system.PruneImageMode(mode),
-		Until: until,
+		Mode: system.PruneImageMode(func() string {
+			if mode := strings.TrimSpace(kit.FromPtr(kit.FromPtr(input.Body).Mode)); mode != "" {
+				return mode
+			}
+			if dangling, ok := mo.PointerToOption(kit.FromPtr(input.Body).Dangling).Get(); ok {
+				return kit.Ternary(dangling, "dangling", "all")
+			}
+			for _, value := range kit.FromPtr(input.Body).Filters["dangling"] {
+				if dangling, valid := kit.ParseBool(value); valid {
+					return kit.Ternary(dangling, "dangling", "all")
+				}
+			}
+			return kit.Ternary(input.Dangling, "dangling", "all")
+		}()),
+		Until: func() string {
+			if until, ok := mo.PointerToOption(kit.FromPtr(input.Body).Until).Get(); ok {
+				return strings.TrimSpace(until)
+			}
+			if vals := kit.FromPtr(input.Body).Filters["until"]; len(vals) > 0 {
+				return strings.TrimSpace(vals[0])
+			}
+			return ""
+		}(),
 	})
 	if err != nil {
 		return nil, huma.Error500InternalServerError("Failed to prune images: " + err.Error())
 	}
 
-	out := image.NewPruneReport(*report)
-
 	return &handlerutil.Out[image.PruneReport]{
 		Body: base.ApiResponse[image.PruneReport]{
 			Success: true,
-			Data:    out,
+			Data:    image.NewPruneReport(*report),
 		},
 	}, nil
-}
-
-func resolvePruneImageModeInternal(input *PruneImagesInput) string {
-	mode := kit.Ternary(input.Dangling, "dangling", "all")
-	if input.Body == nil {
-		return mode
-	}
-
-	if input.Body.Mode != nil && strings.TrimSpace(*input.Body.Mode) != "" {
-		return strings.TrimSpace(*input.Body.Mode)
-	}
-
-	if input.Body.Dangling != nil {
-		return kit.Ternary(*input.Body.Dangling, "dangling", "all")
-	}
-
-	if vals, ok := input.Body.Filters["dangling"]; ok {
-		for _, value := range vals {
-			if dangling, valid := kit.ParseBool(value); valid {
-				return kit.Ternary(dangling, "dangling", "all")
-			}
-		}
-	}
-
-	return mode
-}
-
-func resolvePruneImageUntilInternal(input *PruneImagesInput) string {
-	if input.Body == nil {
-		return ""
-	}
-
-	if input.Body.Until != nil {
-		return strings.TrimSpace(*input.Body.Until)
-	}
-
-	if vals, ok := input.Body.Filters["until"]; ok && len(vals) > 0 {
-		return strings.TrimSpace(vals[0])
-	}
-
-	return ""
 }
 
 // GetImageUsageCounts returns counts of images by usage status.
@@ -595,10 +562,7 @@ func (h *ImageHandler) UploadImage(ctx context.Context, input *UploadImageInput)
 	}
 	defer cleanup()
 
-	maxSizeMB := h.settingsService.GetIntSetting(ctx, "maxImageUploadSize", 500)
-	maxSizeBytes := int64(maxSizeMB) * 1024 * 1024
-
-	result, err := h.imageService.LoadImageFromReader(ctx, file, session.Filename, *user, maxSizeBytes)
+	result, err := h.imageService.LoadImageFromReader(ctx, file, session.Filename, *user, int64(h.settingsService.GetIntSetting(ctx, "maxImageUploadSize", 500))*1024*1024)
 	if err != nil {
 		return nil, huma.Error500InternalServerError("Failed to load image: " + err.Error())
 	}

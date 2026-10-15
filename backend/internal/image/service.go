@@ -29,7 +29,6 @@ import (
 	"github.com/moby/moby/api/types/image"
 	"github.com/moby/moby/client"
 	"github.com/samber/hot"
-	"github.com/samber/mo"
 	"go.getarcane.app/docker"
 	"go.getarcane.app/kit/pkg"
 	"go.getarcane.app/updater"
@@ -41,7 +40,6 @@ import (
 	"github.com/getarcaneapp/arcane/backend/v2/internal/database"
 	dockerInternal "github.com/getarcaneapp/arcane/backend/v2/internal/docker"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/event"
-	"github.com/getarcaneapp/arcane/backend/v2/internal/image/children/attestations"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/image/children/patch"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/imageupdate"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/registry"
@@ -56,6 +54,10 @@ import (
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/utils/httpx"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/utils/imageref"
 )
+
+// projectIDCacheTTL bounds how long a snapshot of all (name → id) project rows is reused.
+// Dashboard polls frequently; the projects table changes rarely, so a short TTL is safe.
+const projectIDCacheTTL = 5 * time.Second
 
 // patchSlot is one patch task's output; failures travel as task errors.
 type patchSlot struct {
@@ -74,6 +76,17 @@ type ImageService struct {
 	patch           *patch.Service
 	patchWorkflow   *flow.Workflow
 	projectIDCache  *hot.HotCache[struct{}, map[string]string]
+}
+
+type imageRefUpdateLookup struct {
+	originalRef          string
+	tag                  string
+	repositoryCandidates map[string]struct{}
+}
+
+type imageUpdateRecordKey struct {
+	repository string
+	tag        string
 }
 
 func NewImageService(
@@ -162,53 +175,51 @@ func (s *ImageService) RegisterWorkflows(engine *flow.Engine) error {
 				if err != nil {
 					return nil, err
 				}
-				outcome := scheduler.Outcome{Status: scheduler.Succeeded}
+				var failed []scheduler.TargetOutcome
 				patched, skipped := 0, 0
 				for index, slot := range slots {
 					switch {
 					case slot.Err != "":
-						outcome.Targets = append(outcome.Targets, scheduler.TargetOutcome{ResourceType: "image", ID: targets[index].ImageName, Status: scheduler.Failed, Message: slot.Err})
+						failed = append(failed, scheduler.TargetOutcome{
+							ResourceType: "image",
+							ID:           targets[index].ImageName,
+							Status:       scheduler.Failed,
+							Message:      slot.Err,
+						})
 					case slot.Value.Skipped:
 						skipped++
 					default:
 						patched++
 					}
 				}
-				outcome.Message = fmt.Sprintf("Image patch completed: %d patched, %d failed", patched, len(outcome.Targets))
-				switch {
-				case skipped > 0 || (len(targets) == 0 && !s.settingsService.IsFeatureEnabled(ctx, features.VulnerabilityManagement)):
-					outcome.Status = kit.Ternary(patched > 0, scheduler.Partial, scheduler.Skipped)
-					outcome.Message = fmt.Sprintf("Remaining patches stopped because feature %s was disabled", features.VulnerabilityManagement)
-				case len(outcome.Targets) > 0:
-					outcome.Status = scheduler.Partial
-				}
-				return outcome, nil
+				status, message := func() (scheduler.RunStatus, string) {
+					switch {
+					case skipped > 0 || (len(targets) == 0 && !s.settingsService.IsFeatureEnabled(ctx, features.VulnerabilityManagement)):
+						return kit.Ternary(patched > 0, scheduler.Partial, scheduler.Skipped),
+							fmt.Sprintf("Remaining patches stopped because feature %s was disabled", features.VulnerabilityManagement)
+					case len(failed) > 0:
+						return scheduler.Partial, fmt.Sprintf("Image patch completed: %d patched, %d failed", patched, len(failed))
+					default:
+						return scheduler.Succeeded, fmt.Sprintf("Image patch completed: %d patched, %d failed", patched, len(failed))
+					}
+				}()
+				return scheduler.Outcome{
+					Status:  status,
+					Message: message,
+					Targets: failed,
+				}, nil
 			}), workflow.WithInputFrom("discover")),
 		},
 	})
 	if err != nil {
 		return err
 	}
-	s.patchWorkflow = patchWorkflow
+	s.patchWorkflow = patchWorkflow // keep: the workflow is defined after construction, once the flow engine exists
 	return nil
 }
 
 // PatchWorkflow is the scheduled auto-patch workflow.
 func (s *ImageService) PatchWorkflow() *flow.Workflow { return s.patchWorkflow }
-
-// newAttestationsServiceInternal builds the attestation reader from the image
-// service's Docker client and registry credentials.
-func (s *ImageService) newAttestationsServiceInternal() *attestations.Service {
-	var dockerClient func(context.Context) (*client.Client, error)
-	if s.dockerService != nil {
-		dockerClient = s.dockerService.GetClient
-	}
-	var registryAuth func(context.Context, string) (string, error)
-	if s.registryService != nil {
-		registryAuth = s.registryService.GetRegistryAuthForHost
-	}
-	return attestations.NewService(dockerClient, registryAuth)
-}
 
 // GetImageDetail returns a DetailSummary for the given image ID. It fetches ImageInspect
 // and ImageList concurrently so the size field reflects the same metric shown in the
@@ -273,12 +284,11 @@ func (s *ImageService) GetImageDetail(ctx context.Context, id string) (*imagetyp
 
 	out := imagetypes.NewDetailSummary(&inspect)
 	if listSize > 0 {
-		out.Size = listSize
-		out.Descriptor.Size = listSize
+		out.Size = listSize            // keep: DetailSummary is mapped from the inspect response by imagetypes.NewDetailSummary
+		out.Descriptor.Size = listSize // keep: DetailSummary is mapped from the inspect response by imagetypes.NewDetailSummary
 	}
 	if len(containers) > 0 {
-		pinnedRefsMap := collectPinnedReferencesByImageIDInternal(containers)
-		out.PinnedReferences = pinnedRefsMap[inspect.ID]
+		out.PinnedReferences = collectPinnedReferencesByImageID(containers)[inspect.ID] // keep: DetailSummary is mapped from the inspect response by imagetypes.NewDetailSummary
 	}
 	return &out, nil
 }
@@ -291,17 +301,12 @@ func (s *ImageService) RemoveImage(ctx context.Context, id string, force bool, u
 	}
 
 	imageDetails, inspectErr := dockerClient.ImageInspect(ctx, id)
-	var imageName string
-	if inspectErr == nil && len(imageDetails.RepoTags) > 0 {
-		imageName = imageDetails.RepoTags[0]
-	} else {
-		imageName = id
-	}
-
-	options := client.ImageRemoveOptions{
-		Force:         force,
-		PruneChildren: true,
-	}
+	imageName := func() string {
+		if inspectErr == nil && len(imageDetails.RepoTags) > 0 {
+			return imageDetails.RepoTags[0]
+		}
+		return id
+	}()
 
 	defer s.eventService.BeginDockerResourceSuppressionWindow("image", id, imageName)()
 	if inspectErr == nil {
@@ -316,28 +321,27 @@ func (s *ImageService) RemoveImage(ctx context.Context, id string, force bool, u
 			tagReleases = append(tagReleases, s.eventService.BeginDockerResourceSuppressionWindow("image", "", tag))
 		}
 	}
-	removed, err := dockerClient.ImageRemove(ctx, id, options)
+	removed, err := dockerClient.ImageRemove(ctx, id, client.ImageRemoveOptions{
+		Force:         force,
+		PruneChildren: true,
+	})
 	if err != nil {
 		s.eventService.LogErrorEvent(ctx, event.EventTypeImageError, "image", id, imageName, user.ID, user.Username, "0", err, database.JSON{"action": "delete", "force": force})
 		return fmt.Errorf("failed to remove image: %w", err)
 	}
 
-	idsToDelete := append(getDeletedImageIDsInternal(removed.Items), id)
-	s.cleanupImageUpdateRecordsInternal(ctx, idsToDelete)
+	s.cleanupImageUpdateRecords(ctx, append(getDeletedImageIDs(removed.Items), id))
 
 	// Clean up vulnerability scan records for the deleted image
-	if s.vulnerabilityService != nil {
-		if deleteScanResultErr := s.vulnerabilityService.DeleteScanResult(ctx, id); deleteScanResultErr != nil {
-			slog.WarnContext(ctx, "failed to delete vulnerability scan record", "id", id, "error", deleteScanResultErr)
-		}
+	if deleteScanResultErr := s.vulnerabilityService.DeleteScanResult(ctx, id); deleteScanResultErr != nil {
+		slog.WarnContext(ctx, "failed to delete vulnerability scan record", "id", id, "error", deleteScanResultErr)
 	}
 
-	metadata := database.JSON{
+	if logErr := s.eventService.LogImageEvent(ctx, event.EventTypeImageDelete, id, imageName, user.ID, user.Username, "0", database.JSON{
 		"action":  "delete",
 		"imageId": id,
 		"force":   force,
-	}
-	if logErr := s.eventService.LogImageEvent(ctx, event.EventTypeImageDelete, id, imageName, user.ID, user.Username, "0", metadata); logErr != nil {
+	}); logErr != nil {
 		slog.WarnContext(ctx, "could not log image deletion action", "err", logErr, "image", imageName, "imageId", id)
 	}
 
@@ -405,11 +409,10 @@ func (s *ImageService) PullImage(ctx context.Context, imageName string, progress
 
 	slog.DebugContext(ctx, "image pull stream completed", "image", imageName)
 
-	metadata := database.JSON{
+	if logErr := s.eventService.LogImageEvent(ctx, event.EventTypeImagePull, "", imageName, user.ID, user.Username, "0", database.JSON{
 		"action":    "pull",
 		"imageName": imageName,
-	}
-	if logErr := s.eventService.LogImageEvent(ctx, event.EventTypeImagePull, "", imageName, user.ID, user.Username, "0", metadata); logErr != nil {
+	}); logErr != nil {
 		slog.WarnContext(ctx, "could not log image pull action", "err", logErr, "image", imageName)
 	}
 	if s.registryService != nil {
@@ -472,14 +475,13 @@ func (s *ImageService) TagImage(ctx context.Context, source string, req imagetyp
 		return fmt.Errorf("failed to tag image: %w", err)
 	}
 
-	metadata := database.JSON{
+	if logErr := s.eventService.LogImageEvent(ctx, event.EventTypeImageTag, "", source, user.ID, user.Username, "0", database.JSON{
 		"action":     "tag",
 		"imageName":  source,
 		"repository": repository,
 		"tag":        tag,
 		"target":     target,
-	}
-	if logErr := s.eventService.LogImageEvent(ctx, event.EventTypeImageTag, "", source, user.ID, user.Username, "0", metadata); logErr != nil {
+	}); logErr != nil {
 		slog.WarnContext(ctx, "could not log image tag action", "err", logErr, "image", source, "target", target)
 	}
 
@@ -587,7 +589,6 @@ func (s *ImageService) LoadImageFromReader(ctx context.Context, reader io.Reader
 	}
 	defer func() { _ = loadResp.Close() }()
 
-	var result imagetypes.LoadResult
 	var responseBuilder strings.Builder
 	streamErr := docker.RenderJSONMessageStream(loadResp, &responseBuilder)
 	if streamErr != nil {
@@ -610,17 +611,14 @@ func (s *ImageService) LoadImageFromReader(ctx context.Context, reader io.Reader
 		return nil, fmt.Errorf("failed to read load response: %w", streamErr)
 	}
 
-	result.Stream = responseBuilder.String()
-
-	metadata := database.JSON{
+	if logErr := s.eventService.LogImageEvent(ctx, event.EventTypeImageLoad, "", fileName, user.ID, user.Username, "0", database.JSON{
 		"action":   "load",
 		"fileName": fileName,
-	}
-	if logErr := s.eventService.LogImageEvent(ctx, event.EventTypeImageLoad, "", fileName, user.ID, user.Username, "0", metadata); logErr != nil {
+	}); logErr != nil {
 		slog.WarnContext(ctx, "could not log image load action", "err", logErr, "file", fileName)
 	}
 
-	return &result, nil
+	return &imagetypes.LoadResult{Stream: responseBuilder.String()}, nil
 }
 
 func (s *ImageService) ImageExistsLocally(ctx context.Context, imageName string) (bool, error) {
@@ -642,8 +640,6 @@ func (s *ImageService) ImageExistsLocally(ctx context.Context, imageName string)
 }
 
 func (s *ImageService) PullOptionsWithAuth(ctx context.Context, imageRef string, externalCreds []containerregistry.Credential) (client.ImagePullOptions, error) {
-	pullOptions := client.ImagePullOptions{}
-
 	registryHost := registryauth.ExtractRegistryHost(imageRef)
 
 	// Check external credentials first
@@ -655,58 +651,36 @@ func (s *ImageService) PullOptionsWithAuth(ctx context.Context, imageRef string,
 		if registryauth.IsRegistryMatch(cred.URL, registryHost) {
 			authStr, err := registryauth.EncodeAuthHeader(cred.Username, cred.Token, registryauth.NormalizeRegistryURL(cred.URL))
 			if err != nil {
-				return pullOptions, fmt.Errorf("failed to create auth header: %w", err)
+				return client.ImagePullOptions{}, fmt.Errorf("failed to create auth header: %w", err)
 			}
-			pullOptions.RegistryAuth = authStr
 
 			slog.DebugContext(ctx, "Using external credentials for image pull", "registry", registryHost, "username", cred.Username)
-			return pullOptions, nil
+			return client.ImagePullOptions{RegistryAuth: authStr}, nil
 		}
-	}
-
-	if s.registryService == nil {
-		return pullOptions, nil
 	}
 
 	authStr, err := s.registryService.GetRegistryAuthForHost(ctx, registryHost)
 	if err != nil {
-		return pullOptions, fmt.Errorf("failed to get registry credentials: %w", err)
+		return client.ImagePullOptions{}, fmt.Errorf("failed to get registry credentials: %w", err)
 	}
 	if authStr != "" {
-		pullOptions.RegistryAuth = authStr
 		slog.DebugContext(ctx, "Using database credentials for image pull", "registry", registryHost)
 	}
 
-	return pullOptions, nil
+	return client.ImagePullOptions{RegistryAuth: authStr}, nil
 }
 
 func ShouldRetryAnonymousPull(pullOptions client.ImagePullOptions, pullErr error) bool {
 	if pullOptions.RegistryAuth == "" || pullErr == nil {
 		return false
 	}
-	return isUnauthorizedPullErrorInternal(pullErr)
-}
-
-func isUnauthorizedPullErrorInternal(err error) bool {
-	if err == nil {
-		return false
-	}
-
-	errLower := strings.ToLower(err.Error())
-	unauthorizedIndicators := []string{
+	return slices.ContainsFunc([]string{
 		"unauthorized",
 		"authentication required",
 		"incorrect username or password",
 		"no basic auth credentials",
 		"access denied",
-	}
-
-	for _, indicator := range unauthorizedIndicators {
-		if strings.Contains(errLower, indicator) {
-			return true
-		}
-	}
-	return false
+	}, func(indicator string) bool { return strings.Contains(strings.ToLower(pullErr.Error()), indicator) })
 }
 
 func (s *ImageService) PruneImages(ctx context.Context, options system.PruneImagesOptions) (*image.PruneReport, error) {
@@ -715,48 +689,54 @@ func (s *ImageService) PruneImages(ctx context.Context, options system.PruneImag
 		return nil, fmt.Errorf("failed to connect to Docker: %w", err)
 	}
 
-	filterArgs := make(client.Filters)
-	switch options.Mode {
-	case system.PruneImageModeNone:
-		return nil, errors.New("image prune mode none is not allowed")
-	case system.PruneImageModeDangling:
-		filterArgs = filterArgs.Add("dangling", "true")
-	case system.PruneImageModeAll:
-		filterArgs = filterArgs.Add("dangling", "false")
-	case system.PruneImageModeOlderThan:
-		if strings.TrimSpace(options.Until) == "" {
-			return nil, errors.New("image prune mode olderThan requires until")
+	filterArgs, err := func() (client.Filters, error) {
+		switch options.Mode {
+		case system.PruneImageModeNone:
+			return nil, errors.New("image prune mode none is not allowed")
+		case system.PruneImageModeDangling:
+			return make(client.Filters).Add("dangling", "true"), nil
+		case system.PruneImageModeAll:
+			return make(client.Filters).Add("dangling", "false"), nil
+		case system.PruneImageModeOlderThan:
+			if strings.TrimSpace(options.Until) == "" {
+				return nil, errors.New("image prune mode olderThan requires until")
+			}
+			return make(client.Filters).Add("until", options.Until), nil
+		default:
+			return nil, fmt.Errorf("unsupported image prune mode: %s", options.Mode)
 		}
-		filterArgs = filterArgs.Add("until", options.Until)
-	default:
-		return nil, fmt.Errorf("unsupported image prune mode: %s", options.Mode)
+	}()
+	if err != nil {
+		return nil, err
 	}
 
 	report, err := dockerClient.ImagePrune(ctx, client.ImagePruneOptions{Filters: filterArgs})
 	if err != nil {
 		return nil, fmt.Errorf("failed to prune images: %w", err)
 	}
-	pruneReport := report.Report
 
-	idsToDelete := getDeletedImageIDsInternal(pruneReport.ImagesDeleted)
-	s.cleanupImageUpdateRecordsInternal(ctx, idsToDelete)
-	s.cleanupVulnerabilityRecordsAfterPruneInternal(ctx, idsToDelete)
+	idsToDelete := getDeletedImageIDs(report.Report.ImagesDeleted)
+	s.cleanupImageUpdateRecords(ctx, idsToDelete)
+	if len(idsToDelete) > 0 {
+		if deleteErr := s.vulnerabilityService.DeleteScanResultsByImageIDs(ctx, idsToDelete); deleteErr != nil {
+			slog.WarnContext(ctx, "failed to delete vulnerability scan records after prune", "count", len(idsToDelete), "error", deleteErr)
+		}
+	}
 
-	metadata := database.JSON{
+	if logErr := s.eventService.LogImageEvent(ctx, event.EventTypeImageDelete, "", "bulk_prune", usertypes.SystemUser.ID, usertypes.SystemUser.Username, "0", database.JSON{
 		"action":         "prune",
 		"mode":           options.Mode,
 		"until":          options.Until,
-		"imagesDeleted":  len(pruneReport.ImagesDeleted),
-		"spaceReclaimed": pruneReport.SpaceReclaimed,
-	}
-	if logErr := s.eventService.LogImageEvent(ctx, event.EventTypeImageDelete, "", "bulk_prune", usertypes.SystemUser.ID, usertypes.SystemUser.Username, "0", metadata); logErr != nil {
+		"imagesDeleted":  len(report.Report.ImagesDeleted),
+		"spaceReclaimed": report.Report.SpaceReclaimed,
+	}); logErr != nil {
 		slog.WarnContext(ctx, "could not log image prune action", "err", logErr)
 	}
 
-	return &pruneReport, nil
+	return &report.Report, nil
 }
 
-func getDeletedImageIDsInternal(deletedImages []image.DeleteResponse) []string {
+func getDeletedImageIDs(deletedImages []image.DeleteResponse) []string {
 	if len(deletedImages) == 0 {
 		return nil
 	}
@@ -774,21 +754,7 @@ func getDeletedImageIDsInternal(deletedImages []image.DeleteResponse) []string {
 	return idsToDelete
 }
 
-func (s *ImageService) cleanupVulnerabilityRecordsAfterPruneInternal(ctx context.Context, idsToDelete []string) {
-	if s.vulnerabilityService == nil || len(idsToDelete) == 0 {
-		return
-	}
-
-	if err := s.vulnerabilityService.DeleteScanResultsByImageIDs(ctx, idsToDelete); err != nil {
-		slog.WarnContext(ctx, "failed to delete vulnerability scan records after prune", "count", len(idsToDelete), "error", err)
-	}
-}
-
-func (s *ImageService) cleanupImageUpdateRecordsInternal(ctx context.Context, idsToDelete []string) {
-	if s.imageUpdateService == nil {
-		return
-	}
-
+func (s *ImageService) cleanupImageUpdateRecords(ctx context.Context, idsToDelete []string) {
 	if err := s.imageUpdateService.DeleteRecordsForImages(ctx, idsToDelete); err != nil {
 		slog.WarnContext(ctx, "failed to clean up image update records", "error", err)
 	}
@@ -800,7 +766,7 @@ func (s *ImageService) cleanupImageUpdateRecordsInternal(ctx context.Context, id
 // GetUpdateInfoByImageIDs returns a map of image ID to UpdateInfo for the given image IDs.
 // This is used by the container service to populate update info for containers.
 func (s *ImageService) GetUpdateInfoByImageIDs(ctx context.Context, imageIDs []string) (map[string]*imagetypes.UpdateInfo, error) {
-	if s.db == nil || len(imageIDs) == 0 {
+	if len(imageIDs) == 0 {
 		return make(map[string]*imagetypes.UpdateInfo), nil
 	}
 
@@ -825,7 +791,7 @@ func (s *ImageService) GetUpdateInfoByImageIDs(ctx context.Context, imageIDs []s
 // checks are omitted; disabling automatic installation does not hide results.
 func (s *ImageService) GetUpdateInfoByContainers(ctx context.Context, containers []container.Summary) (map[string]*imagetypes.UpdateInfo, error) {
 	result := make(map[string]*imagetypes.UpdateInfo)
-	if s.db == nil || len(containers) == 0 {
+	if len(containers) == 0 {
 		return result, nil
 	}
 	digestImageIDs := make(map[string]string, len(containers))
@@ -863,8 +829,7 @@ func (s *ImageService) GetUpdateInfoByContainers(ctx context.Context, containers
 		for containerID, imageID := range digestImageIDs {
 			if info := byImageID[imageID]; info != nil {
 				// Each container gets its own copy so aggregation never mutates a shared record.
-				scoped := *info
-				result[containerID] = &scoped
+				result[containerID] = new(*info)
 			}
 		}
 	}
@@ -884,21 +849,31 @@ func (s *ImageService) GetUpdateInfoByContainers(ctx context.Context, containers
 	return result, nil
 }
 
-type imageRefUpdateLookup struct {
-	originalRef          string
-	tag                  string
-	repositoryCandidates map[string]struct{}
-}
-
 // GetUpdateInfoByImageRefs returns persisted update information keyed by the
 // original image reference string.
 func (s *ImageService) GetUpdateInfoByImageRefs(ctx context.Context, imageRefs []string) (map[string]*imagetypes.UpdateInfo, error) {
 	result := make(map[string]*imagetypes.UpdateInfo)
-	if s.db == nil || len(imageRefs) == 0 {
+	if len(imageRefs) == 0 {
 		return result, nil
 	}
 
-	lookups := buildImageRefUpdateLookupsInternal(imageRefs)
+	lookups := make([]imageRefUpdateLookup, 0, len(imageRefs))
+	seenRefs := make(map[string]struct{}, len(imageRefs))
+	for _, rawRef := range imageRefs {
+		originalRef, tag, repositoryCandidates, ok := imageref.ParseUpdateLookup(rawRef)
+		if !ok {
+			continue
+		}
+		if _, exists := seenRefs[originalRef]; exists {
+			continue
+		}
+		seenRefs[originalRef] = struct{}{}
+		lookups = append(lookups, imageRefUpdateLookup{
+			originalRef:          originalRef,
+			tag:                  tag,
+			repositoryCandidates: repositoryCandidates,
+		})
+	}
 	if len(lookups) == 0 {
 		return result, nil
 	}
@@ -934,10 +909,32 @@ func (s *ImageService) GetUpdateInfoByImageRefs(ctx context.Context, imageRefs [
 		return nil, fmt.Errorf("failed to fetch update records by image refs: %w", err)
 	}
 
-	index := indexLatestImageUpdateRecordsInternal(updateRecords)
+	// index maps each repository and tag to the position of its latest record. Ties keep the
+	// earliest position, matching the order the records were fetched in.
+	index := make(map[imageUpdateRecordKey]int, len(updateRecords))
+	for i := range updateRecords {
+		key := newImageUpdateRecordKey(updateRecords[i].Repository, updateRecords[i].Tag)
+		if existing, ok := index[key]; !ok || updateRecords[i].CheckTime.After(updateRecords[existing].CheckTime) {
+			index[key] = i
+		}
+	}
 	for _, lookup := range lookups {
-		if record := selectLatestMatchingImageUpdateRecordInternal(lookup, updateRecords, index); record != nil {
-			result[lookup.originalRef] = record.UpdateInfo()
+		// Pick the latest record across the lookup's repository aliases; equal check times fall back to fetch order.
+		latest := -1
+		for repository := range lookup.repositoryCandidates {
+			i, ok := index[newImageUpdateRecordKey(repository, lookup.tag)]
+			if !ok {
+				continue
+			}
+			switch {
+			case latest == -1,
+				updateRecords[i].CheckTime.After(updateRecords[latest].CheckTime),
+				updateRecords[i].CheckTime.Equal(updateRecords[latest].CheckTime) && i < latest:
+				latest = i
+			}
+		}
+		if latest != -1 {
+			result[lookup.originalRef] = updateRecords[latest].UpdateInfo()
 		}
 	}
 
@@ -957,7 +954,6 @@ func (s *ImageService) ListImagesPaginated(ctx context.Context, params paginatio
 	g.Go(func() (workerErr error) {
 		defer utils.RecoverToError(&workerErr, "image worker")
 
-		var err error
 		imageList, err := s.dockerService.ListImages(groupCtx)
 		if err != nil {
 			return fmt.Errorf("failed to list Docker images: %w", err)
@@ -970,7 +966,6 @@ func (s *ImageService) ListImagesPaginated(ctx context.Context, params paginatio
 	g.Go(func() (workerErr error) {
 		defer utils.RecoverToError(&workerErr, "image worker")
 
-		var err error
 		containerList, err := s.dockerService.ListContainers(groupCtx)
 		if err != nil {
 			return fmt.Errorf("failed to list containers: %w", err)
@@ -988,34 +983,31 @@ func (s *ImageService) ListImagesPaginated(ctx context.Context, params paginatio
 		imageIDs = append(imageIDs, img.ID)
 	}
 
-	if s.db != nil && len(imageIDs) > 0 {
+	if len(imageIDs) > 0 {
 		if err := s.db.WithContext(ctx).Where("id IN ? OR image_id IN ?", imageIDs, imageIDs).Find(&updateRecords).Error; err != nil {
 			return nil, pagination.Response{}, fmt.Errorf("failed to fetch image update records: %w", err)
 		}
 	}
 
-	var vulnerabilityMap map[string]*vulnerabilitytypes.ScanSummary
-	if s.vulnerabilityService != nil && len(imageIDs) > 0 {
-		var err error
-		vulnerabilityMap, err = s.vulnerabilityService.GetScanSummariesByImageIDs(ctx, imageIDs)
-		if err != nil {
-			return nil, pagination.Response{}, err
+	vulnerabilityMap, err := func() (map[string]*vulnerabilitytypes.ScanSummary, error) {
+		if len(imageIDs) == 0 {
+			return nil, nil
 		}
+		return s.vulnerabilityService.GetScanSummariesByImageIDs(ctx, imageIDs)
+	}()
+	if err != nil {
+		return nil, pagination.Response{}, err
 	}
 
-	projectIDByName := s.BuildProjectIDMap(ctx, containers)
-	usageMap := BuildVolumeUsageMap(containers, projectIDByName)
-	updateMap := buildUpdateMapInternal(updateRecords)
+	result := s.getImagePaginationConfig().SearchOrderAndPaginate(MapDockerImagesToDTOs(
+		dockerImages,
+		containers,
+		BuildVolumeUsageMap(containers, s.BuildProjectIDMap(ctx, containers)),
+		buildUpdateMap(updateRecords),
+		vulnerabilityMap,
+	), params)
 
-	items := MapDockerImagesToDTOs(dockerImages, containers, usageMap, updateMap, vulnerabilityMap)
-
-	config := s.getImagePaginationConfig()
-
-	result := config.SearchOrderAndPaginate(items, params)
-
-	paginationResp := pagination.BuildResponse(result.TotalCount, result.TotalAvailable, params)
-
-	return result.Items, paginationResp, nil
+	return result.Items, pagination.BuildResponse(result.TotalCount, result.TotalAvailable, params), nil
 }
 
 func (s *ImageService) AggregateImages(ctx context.Context, params pagination.QueryParams) (imagetypes.ListResponse, error) {
@@ -1054,106 +1046,47 @@ func (s *ImageService) AggregateImageCounts(ctx context.Context) (base.ApiRespon
 		return base.ApiResponse[imagetypes.UsageCounts]{}, err
 	}
 
-	counts := imagetypes.UsageCounts{}
+	inuse, unused, total, totalSize := 0, 0, 0, int64(0)
 	for _, result := range collection.Results {
-		counts.Inuse += result.Value.Data.Inuse
-		counts.Unused += result.Value.Data.Unused
-		counts.Total += result.Value.Data.Total
-		counts.TotalSize += result.Value.Data.TotalSize
+		inuse += result.Value.Data.Inuse
+		unused += result.Value.Data.Unused
+		total += result.Value.Data.Total
+		totalSize += result.Value.Data.TotalSize
 	}
 
-	return base.ApiResponse[imagetypes.UsageCounts]{Success: true, Data: counts, FailedEnvironments: collection.Failures}, nil
+	return base.ApiResponse[imagetypes.UsageCounts]{
+		Success: true,
+		Data: imagetypes.UsageCounts{
+			Inuse:     inuse,
+			Unused:    unused,
+			Total:     total,
+			TotalSize: totalSize,
+		},
+		FailedEnvironments: collection.Failures,
+	}, nil
 }
 
-func buildImageRefUpdateLookupsInternal(imageRefs []string) []imageRefUpdateLookup {
-	lookups := make([]imageRefUpdateLookup, 0, len(imageRefs))
-	seen := make(map[string]struct{}, len(imageRefs))
-
-	for _, rawRef := range imageRefs {
-		originalRef, tag, repositoryCandidates, ok := imageref.ParseUpdateLookup(rawRef)
-		if !ok {
-			continue
-		}
-		lookup := imageRefUpdateLookup{originalRef: originalRef, tag: tag, repositoryCandidates: repositoryCandidates}
-		if _, exists := seen[lookup.originalRef]; exists {
-			continue
-		}
-		seen[lookup.originalRef] = struct{}{}
-		lookups = append(lookups, lookup)
-	}
-
-	return lookups
+func newImageUpdateRecordKey(repository, tag string) imageUpdateRecordKey {
+	return imageUpdateRecordKey{repository: strings.TrimSpace(repository), tag: strings.ToLower(strings.TrimSpace(tag))}
 }
 
-type imageUpdateRecordKeyInternal struct {
-	repository string
-	tag        string
-}
-
-func newImageUpdateRecordKeyInternal(repository, tag string) imageUpdateRecordKeyInternal {
-	return imageUpdateRecordKeyInternal{repository: strings.TrimSpace(repository), tag: strings.ToLower(strings.TrimSpace(tag))}
-}
-
-// indexLatestImageUpdateRecordsInternal maps each repository and tag to the
-// position of its latest record. Ties keep the earliest position, matching
-// the order the records were fetched in.
-func indexLatestImageUpdateRecordsInternal(updateRecords []imageupdate.ImageUpdateRecord) map[imageUpdateRecordKeyInternal]int {
-	index := make(map[imageUpdateRecordKeyInternal]int, len(updateRecords))
-	for i := range updateRecords {
-		key := newImageUpdateRecordKeyInternal(updateRecords[i].Repository, updateRecords[i].Tag)
-		if existing, ok := index[key]; !ok || updateRecords[i].CheckTime.After(updateRecords[existing].CheckTime) {
-			index[key] = i
+// BuildProjectIDMap returns a map of compose project name → project ID for any
+// containers that carry the com.docker.compose.project label. The lookup uses a
+// short-TTL cache shared across all callers of this ImageService instance.
+func (s *ImageService) BuildProjectIDMap(ctx context.Context, containers []container.Summary) map[string]string {
+	projectIDs := make(map[string]string)
+	projectNameSet := make(map[string]struct{})
+	for _, c := range containers {
+		if projectName := docker.ComposeProjectLabel(c.Labels); projectName != "" {
+			projectNameSet[projectName] = struct{}{}
 		}
 	}
-	return index
-}
-
-// selectLatestMatchingImageUpdateRecordInternal picks the latest record across
-// the lookup's repository aliases; equal check times fall back to fetch order.
-func selectLatestMatchingImageUpdateRecordInternal(
-	lookup imageRefUpdateLookup,
-	updateRecords []imageupdate.ImageUpdateRecord,
-	index map[imageUpdateRecordKeyInternal]int,
-) *imageupdate.ImageUpdateRecord {
-	latest := -1
-	for repository := range lookup.repositoryCandidates {
-		i, ok := index[newImageUpdateRecordKeyInternal(repository, lookup.tag)]
-		if !ok {
-			continue
-		}
-		switch {
-		case latest == -1,
-			updateRecords[i].CheckTime.After(updateRecords[latest].CheckTime),
-			updateRecords[i].CheckTime.Equal(updateRecords[latest].CheckTime) && i < latest:
-			latest = i
-		}
+	if len(projectNameSet) == 0 {
+		return projectIDs
 	}
-	if latest == -1 {
-		return nil
-	}
-	return &updateRecords[latest]
-}
 
-func convertLabels(labels map[string]string) map[string]any {
-	if labels == nil {
-		return nil
-	}
-	result, _ := kit.AsStringMap(labels)
-	return result
-}
-
-// projectIDCacheTTL bounds how long a snapshot of all (name → id) project rows is reused.
-// Dashboard polls frequently; the projects table changes rarely, so a short TTL is safe.
-const projectIDCacheTTL = 5 * time.Second
-
-func (s *ImageService) loadProjectIDByNameCachedInternal(ctx context.Context) map[string]string {
-	if s.projectIDCache == nil {
-		s.projectIDCache = hot.NewHotCache[struct{}, map[string]string](hot.LRU, 1).
-			WithTTL(projectIDCacheTTL).
-			Build()
-	}
-	stale, staleFound := s.projectIDCache.Peek(struct{}{})
-	byName, found, err := s.projectIDCache.GetWithLoaders(struct{}{}, func(_ []struct{}) (map[struct{}]map[string]string, error) {
+	stale, _ := s.projectIDCache.Peek(struct{}{})
+	byName, _, err := s.projectIDCache.GetWithLoaders(struct{}{}, func(_ []struct{}) (map[struct{}]map[string]string, error) {
 		var projects []struct {
 			ID   string
 			Name string
@@ -1170,34 +1103,8 @@ func (s *ImageService) loadProjectIDByNameCachedInternal(ctx context.Context) ma
 	})
 	if err != nil {
 		slog.WarnContext(ctx, "failed to load project ID map", "error", err)
-		return kit.Ternary(staleFound, stale, map[string]string{})
 	}
-	return kit.Ternary(!found, map[string]string{}, byName)
-}
-
-// BuildProjectIDMap returns a map of compose project name → project ID for any
-// containers that carry the com.docker.compose.project label. The lookup uses a
-// short-TTL cache shared across all callers of this ImageService instance.
-func (s *ImageService) BuildProjectIDMap(ctx context.Context, containers []container.Summary) map[string]string {
-	projectIDs := make(map[string]string)
-	if s.db == nil {
-		return projectIDs
-	}
-
-	projectNameSet := make(map[string]struct{})
-	for _, c := range containers {
-		if c.Labels == nil {
-			continue
-		}
-		if projectName := docker.ComposeProjectLabel(c.Labels); projectName != "" {
-			projectNameSet[projectName] = struct{}{}
-		}
-	}
-	if len(projectNameSet) == 0 {
-		return projectIDs
-	}
-
-	all := s.loadProjectIDByNameCachedInternal(ctx)
+	all := kit.Ternary(err != nil, stale, byName)
 	for name := range projectNameSet {
 		if id, ok := all[name]; ok {
 			projectIDs[name] = id
@@ -1219,23 +1126,19 @@ func BuildVolumeUsageMap(containers []container.Summary, projectIDByName map[str
 		projectName := docker.ComposeProjectLabel(c.Labels)
 
 		if projectName != "" {
-			projectID := projectIDByName[projectName]
 			if projectSeen[c.ImageID] == nil {
 				projectSeen[c.ImageID] = make(map[string]bool)
 			}
 			if !projectSeen[c.ImageID][projectName] {
-				usedBy := imagetypes.UsedBy{
+				usageMap[c.ImageID] = append(usageMap[c.ImageID], imagetypes.UsedBy{
 					Type: "project",
 					Name: projectName,
-				}
-				usedBy.ID = cmp.Or(projectID, usedBy.ID)
-				usageMap[c.ImageID] = append(usageMap[c.ImageID], usedBy)
+					ID:   projectIDByName[projectName],
+				})
 				projectSeen[c.ImageID][projectName] = true
 			}
 			continue
 		}
-
-		containerName := cmp.Or(docker.ContainerNameFromNames(c.Names), c.ID)
 
 		if containerSeen[c.ImageID] == nil {
 			containerSeen[c.ImageID] = make(map[string]bool)
@@ -1243,7 +1146,7 @@ func BuildVolumeUsageMap(containers []container.Summary, projectIDByName map[str
 		if !containerSeen[c.ImageID][c.ID] {
 			usageMap[c.ImageID] = append(usageMap[c.ImageID], imagetypes.UsedBy{
 				Type: "container",
-				Name: containerName,
+				Name: cmp.Or(docker.ContainerNameFromNames(c.Names), c.ID),
 				ID:   c.ID,
 			})
 			containerSeen[c.ImageID][c.ID] = true
@@ -1253,7 +1156,7 @@ func BuildVolumeUsageMap(containers []container.Summary, projectIDByName map[str
 	return usageMap
 }
 
-func buildUpdateMapInternal(records []imageupdate.ImageUpdateRecord) map[string]*imageupdate.ImageUpdateRecord {
+func buildUpdateMap(records []imageupdate.ImageUpdateRecord) map[string]*imageupdate.ImageUpdateRecord {
 	updateMap := make(map[string]*imageupdate.ImageUpdateRecord, len(records))
 	for i := range records {
 		if records[i].ContainerID == "" {
@@ -1266,59 +1169,21 @@ func buildUpdateMapInternal(records []imageupdate.ImageUpdateRecord) map[string]
 			continue
 		}
 		// A shared image can have several container policies and target tags.
-		aggregate := &imageupdate.ImageUpdateRecord{ID: record.ImageID, HasUpdate: true, CheckTime: record.CheckTime}
-		if existing := updateMap[record.ImageID]; existing != nil && existing.CheckTime.After(aggregate.CheckTime) {
-			aggregate.CheckTime = existing.CheckTime
+		updateMap[record.ImageID] = &imageupdate.ImageUpdateRecord{
+			ID:        record.ImageID,
+			HasUpdate: true,
+			CheckTime: func() time.Time {
+				if existing := updateMap[record.ImageID]; existing != nil && existing.CheckTime.After(record.CheckTime) {
+					return existing.CheckTime
+				}
+				return record.CheckTime
+			}(),
 		}
-		updateMap[record.ImageID] = aggregate
 	}
 	return updateMap
 }
 
-func parseRepoAndTagFromRepoTag(repoTag string) (repo, tag string) {
-	if named, err := reference.ParseNormalizedNamed(repoTag); err == nil {
-		repo = reference.FamiliarName(named)
-		if tagged, ok := named.(reference.NamedTagged); ok {
-			tag = tagged.Tag()
-		} else {
-			tag = "latest"
-		}
-		return repo, tag
-	}
-
-	if before, after, found := strings.CutLast(repoTag, ":"); found {
-		return before, after
-	}
-	return repoTag, "latest"
-}
-
-func parseRepoFromDigests(repoDigests []string) mo.Option[string] {
-	for _, rd := range repoDigests {
-		if rd == "<none>@<none>" {
-			continue
-		}
-		if candidateRepo, _, found := strings.CutLast(rd, "@"); found && candidateRepo != "" {
-			return mo.Some(candidateRepo)
-		}
-	}
-	return mo.None[string]()
-}
-
-func determineRepoAndTag(di image.Summary) (repo, tag string) {
-	if len(di.RepoTags) > 0 {
-		return parseRepoAndTagFromRepoTag(di.RepoTags[0])
-	}
-
-	if len(di.RepoDigests) > 0 {
-		if localRepo, found := parseRepoFromDigests(di.RepoDigests).Get(); found {
-			return localRepo, "<none>"
-		}
-	}
-
-	return "<none>", "<none>"
-}
-
-func collectPinnedReferencesByImageIDInternal(containers []container.Summary) map[string][]string {
+func collectPinnedReferencesByImageID(containers []container.Summary) map[string][]string {
 	if len(containers) == 0 {
 		return nil
 	}
@@ -1367,13 +1232,32 @@ func MapDockerImagesToDTOs(
 	updateMap map[string]*imageupdate.ImageUpdateRecord,
 	vulnerabilityMap map[string]*vulnerabilitytypes.ScanSummary,
 ) []imagetypes.Summary {
-	pinnedRefsByImageID := collectPinnedReferencesByImageIDInternal(containers)
+	pinnedRefsByImageID := collectPinnedReferencesByImageID(containers)
 	items := make([]imagetypes.Summary, 0, len(dockerImages))
 	for _, di := range dockerImages {
-		repo, tag := determineRepoAndTag(di)
+		repo, tag := func() (string, string) {
+			if len(di.RepoTags) > 0 {
+				if named, err := reference.ParseNormalizedNamed(di.RepoTags[0]); err == nil {
+					if tagged, ok := named.(reference.NamedTagged); ok {
+						return reference.FamiliarName(named), tagged.Tag()
+					}
+					return reference.FamiliarName(named), "latest"
+				}
+				if before, after, found := strings.CutLast(di.RepoTags[0], ":"); found {
+					return before, after
+				}
+				return di.RepoTags[0], "latest"
+			}
+			for _, rd := range di.RepoDigests {
+				if candidateRepo, _, found := strings.CutLast(rd, "@"); rd != "<none>@<none>" && found && candidateRepo != "" {
+					return candidateRepo, "<none>"
+				}
+			}
+			return "<none>", "<none>"
+		}()
 
 		usedBy := usageMap[di.ID]
-		imageDto := imagetypes.Summary{
+		items = append(items, imagetypes.Summary{
 			ID:               di.ID,
 			Repo:             repo,
 			Tag:              tag,
@@ -1383,32 +1267,25 @@ func MapDockerImagesToDTOs(
 			Created:          di.Created,
 			Size:             di.Size,
 			VirtualSize:      di.SharedSize,
-			Labels:           convertLabels(di.Labels),
-			InUse:            len(usedBy) > 0,
-			UsedBy:           usedBy,
-		}
-
-		if updateRecord, exists := updateMap[di.ID]; exists {
-			imageDto.UpdateInfo = updateRecord.UpdateInfo()
-		}
-
-		if vulnerabilityMap != nil {
-			if summary, exists := vulnerabilityMap[di.ID]; exists {
-				imageDto.VulnerabilityScan = summary
-			}
-		}
-
-		items = append(items, imageDto)
+			Labels: func() map[string]any {
+				if di.Labels == nil {
+					return nil
+				}
+				labels, _ := kit.AsStringMap(di.Labels)
+				return labels
+			}(),
+			InUse:  len(usedBy) > 0,
+			UsedBy: usedBy,
+			UpdateInfo: func() *imagetypes.UpdateInfo {
+				if updateRecord, exists := updateMap[di.ID]; exists {
+					return updateRecord.UpdateInfo()
+				}
+				return nil
+			}(),
+			VulnerabilityScan: vulnerabilityMap[di.ID],
+		})
 	}
 	return items
-}
-
-func vulnerabilitySortCountsInternal(i imagetypes.Summary) vulnerabilitytypes.SeveritySummary {
-	scan := i.VulnerabilityScan
-	if scan == nil || scan.Status != vulnerabilitytypes.ScanStatusCompleted || scan.Summary == nil {
-		return vulnerabilitytypes.SeveritySummary{Total: -1}
-	}
-	return *scan.Summary
 }
 
 func (s *ImageService) getImagePaginationConfig() pagination.Config[imagetypes.Summary] {
@@ -1476,7 +1353,13 @@ func (s *ImageService) getImagePaginationConfig() pagination.Config[imagetypes.S
 			{
 				Key: "vulnerabilities",
 				Fn: func(a, b imagetypes.Summary) int {
-					ac, bc := vulnerabilitySortCountsInternal(a), vulnerabilitySortCountsInternal(b)
+					counts := func(i imagetypes.Summary) vulnerabilitytypes.SeveritySummary {
+						if kit.FromPtr(i.VulnerabilityScan).Status != vulnerabilitytypes.ScanStatusCompleted || kit.FromPtr(i.VulnerabilityScan).Summary == nil {
+							return vulnerabilitytypes.SeveritySummary{Total: -1}
+						}
+						return *i.VulnerabilityScan.Summary
+					}
+					ac, bc := counts(a), counts(b)
 					return cmp.Or(
 						cmp.Compare(ac.Total, bc.Total),
 						cmp.Compare(ac.Critical, bc.Critical),
@@ -1497,17 +1380,16 @@ func (s *ImageService) getImagePaginationConfig() pagination.Config[imagetypes.S
 				Fn: func(i imagetypes.Summary, filterValue string) bool {
 					switch filterValue {
 					case "has_update":
-						return i.UpdateInfo != nil && i.UpdateInfo.HasUpdate
+						return kit.FromPtr(i.UpdateInfo).HasUpdate
 					case "up_to_date":
 						return i.UpdateInfo != nil && !i.UpdateInfo.HasUpdate && i.UpdateInfo.Error == ""
 					case "error":
-						return i.UpdateInfo != nil && i.UpdateInfo.Error != ""
+						return kit.FromPtr(i.UpdateInfo).Error != ""
 					case "unknown":
 						return i.UpdateInfo == nil
 					default:
 						value, valid := kit.ParseBool(filterValue)
-						hasUpdate := i.UpdateInfo != nil && i.UpdateInfo.HasUpdate
-						return !valid || hasUpdate == value
+						return !valid || kit.FromPtr(i.UpdateInfo).HasUpdate == value
 					}
 				},
 			},

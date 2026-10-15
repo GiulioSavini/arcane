@@ -42,14 +42,15 @@ func New(
 	uploadService *upload.UploadService,
 ) *Module {
 	return &Module{
-		service:             service,
-		docker:              dockerService,
-		imageUpdate:         imageUpdate,
-		settings:            settingsService,
-		build:               buildService,
-		activity:            activityService,
-		upload:              uploadService,
-		attestationsHandler: attestations.NewHandler(service.newAttestationsServiceInternal()),
+		service:     service,
+		docker:      dockerService,
+		imageUpdate: imageUpdate,
+		settings:    settingsService,
+		build:       buildService,
+		activity:    activityService,
+		upload:      uploadService,
+		// The attestation reader uses the image service's Docker client and registry credentials.
+		attestationsHandler: attestations.NewHandler(attestations.NewService(service.dockerService.GetClient, service.registryService.GetRegistryAuthForHost)),
 	}
 }
 
@@ -69,11 +70,7 @@ func (m *Module) RegisterRoutes(api huma.API, appCtx handlerutil.ActivityAppCont
 	}
 	RegisterImages(api, m.docker, m.service, m.imageUpdate, m.settings, m.build, m.activity, m.upload, appCtx)
 	attestations.RegisterRoutes(api, m.attestationsHandler)
-	var patchService *patch.Service
-	if m.service != nil {
-		patchService = m.service.patch
-	}
-	patch.RegisterRoutes(api, patchService, appCtx)
+	patch.RegisterRoutes(api, m.service.patch, appCtx)
 }
 
 // RegisterImages registers image management routes using Huma.

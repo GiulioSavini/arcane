@@ -10,7 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestReadAttestationLayerBytesInternalDecompressesGzip(t *testing.T) {
+func TestReadAttestationLayerBytesDecompressesGzip(t *testing.T) {
 	statement := []byte(`{"predicateType":"https://slsa.dev/provenance/v0.2"}`)
 
 	var buf bytes.Buffer
@@ -28,7 +28,7 @@ func TestReadAttestationLayerBytesInternalDecompressesGzip(t *testing.T) {
 	}
 
 	layer := static.NewLayer(buf.Bytes(), inTotoLayerMediaType)
-	got, err := readAttestationLayerBytesInternal(layer, "sha256:test")
+	got, err := readAttestationLayerBytes(layer, "sha256:test")
 
 	require.NoError(t, err,
 		"unexpected error: %v", err)
@@ -37,11 +37,11 @@ func TestReadAttestationLayerBytesInternalDecompressesGzip(t *testing.T) {
 		"expected decompressed statement %q, got %q", statement, got)
 }
 
-func TestReadAttestationLayerBytesInternalPassesThroughRawJSON(t *testing.T) {
+func TestReadAttestationLayerBytesPassesThroughRawJSON(t *testing.T) {
 	statement := []byte(`{"predicateType":"https://spdx.dev/Document"}`)
 
 	layer := static.NewLayer(statement, inTotoLayerMediaType)
-	got, err := readAttestationLayerBytesInternal(layer, "sha256:test")
+	got, err := readAttestationLayerBytes(layer, "sha256:test")
 
 	require.NoError(t, err,
 		"unexpected error: %v", err)
@@ -50,7 +50,7 @@ func TestReadAttestationLayerBytesInternalPassesThroughRawJSON(t *testing.T) {
 		"expected raw statement unchanged %q, got %q", statement, got)
 }
 
-func TestReadAttestationLayerBytesInternalDecompressesZstd(t *testing.T) {
+func TestReadAttestationLayerBytesDecompressesZstd(t *testing.T) {
 	statement := []byte(`{"predicateType":"https://slsa.dev/provenance/v1"}`)
 
 	encoder, err := zstd.NewWriter(nil)
@@ -66,7 +66,7 @@ func TestReadAttestationLayerBytesInternalDecompressesZstd(t *testing.T) {
 	}
 
 	layer := static.NewLayer(compressed, inTotoLayerMediaType)
-	got, err := readAttestationLayerBytesInternal(layer, "sha256:test")
+	got, err := readAttestationLayerBytes(layer, "sha256:test")
 
 	require.NoError(t, err,
 		"unexpected error: %v", err)

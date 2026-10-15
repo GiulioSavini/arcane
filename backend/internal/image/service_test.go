@@ -43,13 +43,22 @@ import (
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/utils/imageref"
 )
 
-var imageDockerAPIVersionPrefixInternal = regexp.MustCompile(`^/v\d+\.\d+`)
+var imageDockerAPIVersionPrefix = regexp.MustCompile(`^/v\d+\.\d+`)
 
-func imageDockerTestPathInternal(path string) string {
-	return imageDockerAPIVersionPrefixInternal.ReplaceAllString(path, "")
+// testProjectRow is a minimal stand-in for project.Project: the project
+// package imports this one, so the in-package test cannot import it back.
+type testProjectRow struct {
+	database.BaseModel
+	Name               string
+	Path               string
+	BuildImageRefsJSON *string `gorm:"column:build_image_refs_json"`
 }
 
-func setupImageProjectTestDBInternal(t *testing.T) *database.DB {
+func imageDockerTestPath(path string) string {
+	return imageDockerAPIVersionPrefix.ReplaceAllString(path, "")
+}
+
+func setupImageProjectTestDB(t *testing.T) *database.DB {
 	t.Helper()
 	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
 	require.NoError(t, err)
@@ -62,7 +71,7 @@ func setupImageProjectTestDBInternal(t *testing.T) *database.DB {
 	return &database.DB{DB: db}
 }
 
-func TestCollectPinnedReferencesByImageIDInternal(t *testing.T) {
+func TestCollectPinnedReferencesByImageID(t *testing.T) {
 	containers := []container.Summary{
 		{
 			ID:      "c1",
@@ -108,7 +117,7 @@ func TestCollectPinnedReferencesByImageIDInternal(t *testing.T) {
 		},
 	}
 
-	result := collectPinnedReferencesByImageIDInternal(containers)
+	result := collectPinnedReferencesByImageID(containers)
 	require.NotNil(t, result)
 
 	pins1 := result["sha256:image-pinned-1"]
@@ -127,7 +136,7 @@ func TestCollectPinnedReferencesByImageIDInternal(t *testing.T) {
 	assert.NotContains(t, result, "sha256:image-invalid")
 }
 
-func TestMapDockerImagesToDTOs_PopulatesPinnedReferencesInternal(t *testing.T) {
+func TestMapDockerImagesToDTOs_PopulatesPinnedReferences(t *testing.T) {
 	pinnedRef := "ghcr.io/syncthing/syncthing:2.1.3@sha256:8c8ff37ab6aa8be23b700648a90fa9412e214852e9fd6ea8477c8334792daec0"
 	dockerImages := []image.Summary{
 		{
@@ -178,8 +187,8 @@ func TestMapDockerImagesToDTOs_PopulatesPinnedReferencesInternal(t *testing.T) {
 	assert.True(t, items[1].InUse)
 }
 
-func TestImageService_GetImageDetail_EnrichesPinnedReferencesInternal(t *testing.T) {
-	db := setupImageProjectTestDBInternal(t)
+func TestImageService_GetImageDetail_EnrichesPinnedReferences(t *testing.T) {
+	db := setupImageProjectTestDB(t)
 	const pinnedID = "sha256:test-pinned-detail"
 	pinnedRef := "ghcr.io/syncthing/syncthing:2.1.3@sha256:8c8ff37ab6aa8be23b700648a90fa9412e214852e9fd6ea8477c8334792daec0"
 
@@ -211,7 +220,7 @@ func TestImageService_GetImageDetail_EnrichesPinnedReferencesInternal(t *testing
 	}))
 	t.Cleanup(server.Close)
 
-	imageSvc := NewImageService(db, &docker.DockerClientService{Client: newTestDockerClientInternal(t, server)}, nil, nil, nil, event.NewEventService(db, nil, nil), nil, nil)
+	imageSvc := NewImageService(db, &docker.DockerClientService{Client: newTestDockerClient(t, server)}, nil, nil, nil, event.NewEventService(db, nil, nil), nil, nil)
 
 	detail, err := imageSvc.GetImageDetail(t.Context(), pinnedID)
 	require.NoError(t, err)
@@ -220,8 +229,8 @@ func TestImageService_GetImageDetail_EnrichesPinnedReferencesInternal(t *testing
 	assert.Equal(t, []string{pinnedRef}, detail.PinnedReferences)
 }
 
-func TestImageService_GetImageDetail_ContainerFailureDoesNotBreakInspectionInternal(t *testing.T) {
-	db := setupImageProjectTestDBInternal(t)
+func TestImageService_GetImageDetail_ContainerFailureDoesNotBreakInspection(t *testing.T) {
+	db := setupImageProjectTestDB(t)
 	const testID = "sha256:test-detail-resilient"
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -244,7 +253,7 @@ func TestImageService_GetImageDetail_ContainerFailureDoesNotBreakInspectionInter
 	}))
 	t.Cleanup(server.Close)
 
-	imageSvc := NewImageService(db, &docker.DockerClientService{Client: newTestDockerClientInternal(t, server)}, nil, nil, nil, event.NewEventService(db, nil, nil), nil, nil)
+	imageSvc := NewImageService(db, &docker.DockerClientService{Client: newTestDockerClient(t, server)}, nil, nil, nil, event.NewEventService(db, nil, nil), nil, nil)
 
 	detail, err := imageSvc.GetImageDetail(t.Context(), testID)
 	require.NoError(t, err)
@@ -253,9 +262,8 @@ func TestImageService_GetImageDetail_ContainerFailureDoesNotBreakInspectionInter
 	assert.Nil(t, detail.PinnedReferences)
 }
 
-func TestImagePaginationConfig_SearchesPinnedReferencesInternal(t *testing.T) {
-	svc := &ImageService{}
-	localConfig := svc.getImagePaginationConfig()
+func TestImagePaginationConfig_SearchesPinnedReferences(t *testing.T) {
+	localConfig := NewImageService(nil, nil, nil, nil, nil, nil, nil, nil).getImagePaginationConfig()
 
 	item := imagetypes.Summary{
 		ID:               "sha256:syncthing",
@@ -282,7 +290,7 @@ func TestImageService_GetUpdateInfoByImageRefs_MatchesCanonicalAndFamiliarRepos(
 	require.NoError(t, err)
 	require.NoError(t, db.AutoMigrate(&imageupdate.ImageUpdateRecord{}))
 
-	svc := &ImageService{db: &database.DB{DB: db}}
+	svc := NewImageService(&database.DB{DB: db}, nil, nil, nil, nil, nil, nil, nil)
 	now := time.Now().UTC()
 
 	records := []imageupdate.ImageUpdateRecord{
@@ -338,11 +346,7 @@ func setupImageServiceAuthTest(t *testing.T) (*ImageService, *database.DB) {
 	})
 
 	dbWrap := &database.DB{DB: db}
-	svc := &ImageService{
-		registryService: registry.NewContainerRegistryService(dbWrap, nil, kv.NewKVService(dbWrap), nil),
-	}
-
-	return svc, dbWrap
+	return NewImageService(nil, nil, registry.NewContainerRegistryService(dbWrap, nil, kv.NewKVService(dbWrap), nil), nil, nil, nil, nil, nil), dbWrap
 }
 
 func createTestPullRegistry(t *testing.T, db *database.DB, localUrl, username, token string) {
@@ -387,30 +391,35 @@ func TestGetPullOptionsWithAuth_DBRegistryUsesValidCredentials(t *testing.T) {
 	require.NoError(t, err)
 	require.NotEmpty(t, pullOptions.RegistryAuth)
 
-	authCfg := decodeRegistryAuthInternal(t, pullOptions.RegistryAuth)
+	authCfg := decodeRegistryAuth(t, pullOptions.RegistryAuth)
 	assert.Equal(t, "docker-user", authCfg.Username)
 	assert.Equal(t, "docker-token", authCfg.Password)
 	assert.Equal(t, "https://index.docker.io/v1/", authCfg.ServerAddress)
 }
 
-func TestGetPullOptionsWithAuth_ExternalCredentialsOverrideDBRegistryInternal(t *testing.T) {
+func TestGetPullOptionsWithAuth_ExternalCredentialsOverrideDBRegistry(t *testing.T) {
 	svc, db := setupImageServiceAuthTest(t)
 	createTestPullRegistry(t, db, "https://registry.example.com", "db-user", "db-token")
 
 	pullOptions, err := svc.PullOptionsWithAuth(t.Context(), "registry.example.com/team/app:latest", []containerregistry.Credential{
-		{URL: "https://registry.example.com", Username: "external-user", Token: "external-token", Enabled: true},
+		{
+			URL:      "https://registry.example.com",
+			Username: "external-user",
+			Token:    "external-token",
+			Enabled:  true,
+		},
 	})
 	require.NoError(t, err)
 	require.NotEmpty(t, pullOptions.RegistryAuth)
 
-	authCfg := decodeRegistryAuthInternal(t, pullOptions.RegistryAuth)
+	authCfg := decodeRegistryAuth(t, pullOptions.RegistryAuth)
 	assert.Equal(t, "external-user", authCfg.Username)
 	assert.Equal(t, "external-token", authCfg.Password)
 	assert.Equal(t, "registry.example.com", authCfg.ServerAddress)
 }
 
-func TestImageServicePullImageRetriesAnonymouslyAfterAuthRejectedInternal(t *testing.T) {
-	db := setupImageProjectTestDBInternal(t)
+func TestImageServicePullImageRetriesAnonymouslyAfterAuthRejected(t *testing.T) {
+	db := setupImageProjectTestDB(t)
 	eventService := event.NewEventService(db, nil, nil)
 	var authHeaders []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -429,11 +438,16 @@ func TestImageServicePullImageRetriesAnonymouslyAfterAuthRejectedInternal(t *tes
 	}))
 	t.Cleanup(server.Close)
 
-	dockerService := &docker.DockerClientService{Client: newTestDockerClientInternal(t, server)}
+	dockerService := &docker.DockerClientService{Client: newTestDockerClient(t, server)}
 	imageSvc := NewImageService(db, dockerService, nil, nil, nil, eventService, nil, nil)
 
 	err := imageSvc.PullImage(t.Context(), "registry.example.com/team/app:latest", io.Discard, user.SystemUser, []containerregistry.Credential{
-		{URL: "https://registry.example.com", Username: "external-user", Token: "external-token", Enabled: true},
+		{
+			URL:      "https://registry.example.com",
+			Username: "external-user",
+			Token:    "external-token",
+			Enabled:  true,
+		},
 	})
 	require.NoError(t, err)
 	require.Len(t, authHeaders, 2)
@@ -441,12 +455,12 @@ func TestImageServicePullImageRetriesAnonymouslyAfterAuthRejectedInternal(t *tes
 	assert.Empty(t, authHeaders[1])
 }
 
-func TestImageServiceTagImageCallsDockerAPIInternal(t *testing.T) {
-	db := setupImageProjectTestDBInternal(t)
+func TestImageServiceTagImageCallsDockerAPI(t *testing.T) {
+	db := setupImageProjectTestDB(t)
 	eventService := event.NewEventService(db, nil, nil)
 	var gotRepo, gotTag string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost || imageDockerTestPathInternal(r.URL.Path) != "/images/source:latest/tag" {
+		if r.Method != http.MethodPost || imageDockerTestPath(r.URL.Path) != "/images/source:latest/tag" {
 			http.NotFound(w, r)
 			return
 		}
@@ -457,7 +471,7 @@ func TestImageServiceTagImageCallsDockerAPIInternal(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	imageSvc := NewImageService(db, &docker.DockerClientService{Client: newTestDockerClientInternal(t, server)}, nil, nil, nil, eventService, nil, nil)
+	imageSvc := NewImageService(db, &docker.DockerClientService{Client: newTestDockerClient(t, server)}, nil, nil, nil, eventService, nil, nil)
 
 	err := imageSvc.TagImage(t.Context(), "source:latest", imagetypes.TagRequest{Repository: "registry.example.com/team/app", Tag: "v2"}, user.SystemUser)
 	require.NoError(t, err)
@@ -465,20 +479,25 @@ func TestImageServiceTagImageCallsDockerAPIInternal(t *testing.T) {
 	assert.Equal(t, "v2", gotTag)
 }
 
-func TestImageServiceGetImageHistoryCallsDockerAPIInternal(t *testing.T) {
-	db := setupImageProjectTestDBInternal(t)
+func TestImageServiceGetImageHistoryCallsDockerAPI(t *testing.T) {
+	db := setupImageProjectTestDB(t)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet || imageDockerTestPathInternal(r.URL.Path) != "/images/source:latest/history" {
+		if r.Method != http.MethodGet || imageDockerTestPath(r.URL.Path) != "/images/source:latest/history" {
 			http.NotFound(w, r)
 			return
 		}
 		_ = json.NewEncoder(w).Encode([]map[string]any{
-			{"Id": "layer-1", "Created": 1710000000, "CreatedBy": "/bin/sh", "Size": 123},
+			{
+				"Id":        "layer-1",
+				"Created":   1710000000,
+				"CreatedBy": "/bin/sh",
+				"Size":      123,
+			},
 		})
 	}))
 	t.Cleanup(server.Close)
 
-	imageSvc := NewImageService(db, &docker.DockerClientService{Client: newTestDockerClientInternal(t, server)}, nil, nil, nil, event.NewEventService(db, nil, nil), nil, nil)
+	imageSvc := NewImageService(db, &docker.DockerClientService{Client: newTestDockerClient(t, server)}, nil, nil, nil, event.NewEventService(db, nil, nil), nil, nil)
 
 	history, err := imageSvc.GetImageHistory(t.Context(), "source:latest")
 	require.NoError(t, err)
@@ -487,7 +506,7 @@ func TestImageServiceGetImageHistoryCallsDockerAPIInternal(t *testing.T) {
 	assert.Equal(t, int64(123), history[0].Size)
 }
 
-func TestImageServiceSearchImagesRequiresTermInternal(t *testing.T) {
+func TestImageServiceSearchImagesRequiresTerm(t *testing.T) {
 	imageSvc := NewImageService(nil, &docker.DockerClientService{}, nil, nil, nil, nil, nil, nil)
 
 	_, err := imageSvc.SearchImages(t.Context(), " ")
@@ -495,10 +514,10 @@ func TestImageServiceSearchImagesRequiresTermInternal(t *testing.T) {
 	assert.Contains(t, err.Error(), "search term is required")
 }
 
-func TestImageServiceExportImageReturnsTarStreamInternal(t *testing.T) {
-	db := setupImageProjectTestDBInternal(t)
+func TestImageServiceExportImageReturnsTarStream(t *testing.T) {
+	db := setupImageProjectTestDB(t)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet || imageDockerTestPathInternal(r.URL.Path) != "/images/get" {
+		if r.Method != http.MethodGet || imageDockerTestPath(r.URL.Path) != "/images/get" {
 			http.NotFound(w, r)
 			return
 		}
@@ -510,7 +529,7 @@ func TestImageServiceExportImageReturnsTarStreamInternal(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	imageSvc := NewImageService(db, &docker.DockerClientService{Client: newTestDockerClientInternal(t, server)}, nil, nil, nil, event.NewEventService(db, nil, nil), nil, nil)
+	imageSvc := NewImageService(db, &docker.DockerClientService{Client: newTestDockerClient(t, server)}, nil, nil, nil, event.NewEventService(db, nil, nil), nil, nil)
 
 	reader, err := imageSvc.ExportImage(t.Context(), "source:latest")
 	require.NoError(t, err)
@@ -520,22 +539,27 @@ func TestImageServiceExportImageReturnsTarStreamInternal(t *testing.T) {
 	assert.Equal(t, "tar-bytes", string(body))
 }
 
-func TestImageServiceSearchImagesCallsDockerAPIInternal(t *testing.T) {
-	db := setupImageProjectTestDBInternal(t)
+func TestImageServiceSearchImagesCallsDockerAPI(t *testing.T) {
+	db := setupImageProjectTestDB(t)
 	var gotTerm string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet || imageDockerTestPathInternal(r.URL.Path) != "/images/search" {
+		if r.Method != http.MethodGet || imageDockerTestPath(r.URL.Path) != "/images/search" {
 			http.NotFound(w, r)
 			return
 		}
 		gotTerm, _ = url.QueryUnescape(r.URL.Query().Get("term"))
 		_ = json.NewEncoder(w).Encode([]map[string]any{
-			{"name": "library/nginx", "description": "web server", "star_count": 1, "is_official": true},
+			{
+				"name":        "library/nginx",
+				"description": "web server",
+				"star_count":  1,
+				"is_official": true,
+			},
 		})
 	}))
 	t.Cleanup(server.Close)
 
-	imageSvc := NewImageService(db, &docker.DockerClientService{Client: newTestDockerClientInternal(t, server)}, nil, nil, nil, event.NewEventService(db, nil, nil), nil, nil)
+	imageSvc := NewImageService(db, &docker.DockerClientService{Client: newTestDockerClient(t, server)}, nil, nil, nil, event.NewEventService(db, nil, nil), nil, nil)
 
 	results, err := imageSvc.SearchImages(t.Context(), "nginx")
 	require.NoError(t, err)
@@ -545,13 +569,13 @@ func TestImageServiceSearchImagesCallsDockerAPIInternal(t *testing.T) {
 	assert.True(t, results[0].Official)
 }
 
-func TestShouldRetryAnonymousPullInternal_UnauthorizedWithAuth(t *testing.T) {
+func TestShouldRetryAnonymousPull_UnauthorizedWithAuth(t *testing.T) {
 	err := errors.New(`error response from daemon: Head "registry-1.docker.io/v2/library/nginx/manifests/latest": unauthorized: incorrect username or password`)
 
 	assert.True(t, ShouldRetryAnonymousPull(client.ImagePullOptions{RegistryAuth: "encoded-auth"}, err))
 }
 
-func TestShouldRetryAnonymousPullInternal_SkipsRetryWithoutUnauthorizedOrAuth(t *testing.T) {
+func TestShouldRetryAnonymousPull_SkipsRetryWithoutUnauthorizedOrAuth(t *testing.T) {
 	nonAuthErr := errors.New("error response from daemon: i/o timeout")
 	unauthorizedErr := errors.New("unauthorized: authentication required")
 
@@ -559,8 +583,8 @@ func TestShouldRetryAnonymousPullInternal_SkipsRetryWithoutUnauthorizedOrAuth(t 
 	assert.False(t, ShouldRetryAnonymousPull(client.ImagePullOptions{}, unauthorizedErr))
 }
 
-// decodeRegistryAuthInternal decodes a base64 X-Registry-Auth header.
-func decodeRegistryAuthInternal(t *testing.T, encoded string) dockerregistry.AuthConfig {
+// decodeRegistryAuth decodes a base64 X-Registry-Auth header.
+func decodeRegistryAuth(t *testing.T, encoded string) dockerregistry.AuthConfig {
 	t.Helper()
 
 	cfg, err := authconfig.Decode(encoded)
@@ -568,8 +592,8 @@ func decodeRegistryAuthInternal(t *testing.T, encoded string) dockerregistry.Aut
 	return *cfg
 }
 
-// newTestDockerClientInternal builds a Docker client pointed at a fake Docker HTTP server.
-func newTestDockerClientInternal(t *testing.T, server *httptest.Server) *client.Client {
+// newTestDockerClient builds a Docker client pointed at a fake Docker HTTP server.
+func newTestDockerClient(t *testing.T, server *httptest.Server) *client.Client {
 	t.Helper()
 
 	httpClient := server.Client()
@@ -587,28 +611,32 @@ func newTestDockerClientInternal(t *testing.T, server *httptest.Server) *client.
 	return cli
 }
 
-// testProjectRow is a minimal stand-in for project.Project: the project
-// package imports this one, so the in-package test cannot import it back.
-type testProjectRow struct {
-	database.BaseModel
-	Name               string
-	Path               string
-	BuildImageRefsJSON *string `gorm:"column:build_image_refs_json"`
-}
-
 func (testProjectRow) TableName() string { return "projects" }
 
 func TestImageServiceContainerTagUpdatesStayScoped(t *testing.T) {
 	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
 	require.NoError(t, err)
 	require.NoError(t, db.AutoMigrate(&imageupdate.ImageUpdateRecord{}))
-	svc := &ImageService{db: &database.DB{DB: db}}
+	svc := NewImageService(&database.DB{DB: db}, nil, nil, nil, nil, nil, nil, nil)
 	now := time.Now().UTC()
-	firstLabels := map[string]string{"com.getarcaneapp.arcane.updater.strategy": "tag", "com.getarcaneapp.arcane.updater.constraint": "3.x"}
-	secondLabels := map[string]string{"com.getarcaneapp.arcane.updater.strategy": "tag", "com.getarcaneapp.arcane.updater.constraint": "4.x"}
+	firstLabels := map[string]string{
+		"com.getarcaneapp.arcane.updater.strategy":   "tag",
+		"com.getarcaneapp.arcane.updater.constraint": "3.x",
+	}
+	secondLabels := map[string]string{
+		"com.getarcaneapp.arcane.updater.strategy":   "tag",
+		"com.getarcaneapp.arcane.updater.constraint": "4.x",
+	}
 	firstTarget, secondTarget := "3.2.0", "4.0.0"
 	records := []imageupdate.ImageUpdateRecord{
-		{ID: "shared-image", Repository: "docker.io/library/example", Tag: "3.1.0", CurrentVersion: "3.1.0", UpdateType: "digest", CheckTime: now},
+		{
+			ID:             "shared-image",
+			Repository:     "docker.io/library/example",
+			Tag:            "3.1.0",
+			CurrentVersion: "3.1.0",
+			UpdateType:     "digest",
+			CheckTime:      now,
+		},
 		{
 			ID: "container::first",
 			PolicyKey: imageref.UpdatePolicyKey(
@@ -672,7 +700,7 @@ func TestImageServiceContainerTagUpdatesStayScoped(t *testing.T) {
 	require.False(t, byRef["example:3.1.0"].HasUpdate)
 	require.Empty(t, byRef["example:3.1.0"].LatestVersion)
 	for _, ordered := range [][]imageupdate.ImageUpdateRecord{records, {records[2], records[1], records[0]}} {
-		aggregate := buildUpdateMapInternal(ordered)["shared-image"]
+		aggregate := buildUpdateMap(ordered)["shared-image"]
 		require.True(t, aggregate.HasUpdate)
 		require.Empty(t, aggregate.CurrentVersion)
 		require.Nil(t, aggregate.LatestVersion)
@@ -683,9 +711,20 @@ func TestImageServiceContainerTagUpdatesStayScoped(t *testing.T) {
 	for _, currentLabels := range []map[string]string{
 		{},
 		{"com.getarcaneapp.arcane.updater.strategy": "digest"},
-		{"com.getarcaneapp.arcane.updater.strategy": "tag", "com.getarcaneapp.arcane.updater.constraint": "3.1.x"},
-		{"com.getarcaneapp.arcane.updater.strategy": "tag", "com.getarcaneapp.arcane.updater.constraint": "3.x", "com.getarcaneapp.arcane.updater.tag-pattern": ".*"},
-		{"com.getarcaneapp.arcane.updater.strategy": "tag", "com.getarcaneapp.arcane.updater.constraint": "3.x", imageref.UpdateCheckLabel: "false"},
+		{
+			"com.getarcaneapp.arcane.updater.strategy":   "tag",
+			"com.getarcaneapp.arcane.updater.constraint": "3.1.x",
+		},
+		{
+			"com.getarcaneapp.arcane.updater.strategy":    "tag",
+			"com.getarcaneapp.arcane.updater.constraint":  "3.x",
+			"com.getarcaneapp.arcane.updater.tag-pattern": ".*",
+		},
+		{
+			"com.getarcaneapp.arcane.updater.strategy":   "tag",
+			"com.getarcaneapp.arcane.updater.constraint": "3.x",
+			imageref.UpdateCheckLabel:                    "false",
+		},
 	} {
 		checks, getUpdateInfoByContainersErr := svc.GetUpdateInfoByContainers(
 			t.Context(),
@@ -713,7 +752,13 @@ func TestImageServiceContainerTagUpdatesStayScoped(t *testing.T) {
 		"com.getarcaneapp.arcane.updater.constraint": "3.x",
 		"com.getarcaneapp.arcane.updater":            "false",
 	}
-	checks, err := svc.GetUpdateInfoByContainers(t.Context(), []container.Summary{{ID: "first", Image: "example:3.1.0", Labels: installExcluded}})
+	checks, err := svc.GetUpdateInfoByContainers(t.Context(), []container.Summary{
+		{
+			ID:     "first",
+			Image:  "example:3.1.0",
+			Labels: installExcluded,
+		},
+	})
 	require.NoError(t, err)
 	require.Equal(t, firstTarget, checks["first"].LatestVersion)
 
@@ -732,10 +777,29 @@ func TestImageServiceContainerTagUpdatesStayScoped(t *testing.T) {
 		}).Error,
 	)
 	digestContainers := []container.Summary{
-		{ID: "moving", Image: "app:latest", ImageID: "moving-image"},
-		{ID: "moving-twin", Image: "app:latest", ImageID: "moving-image", Labels: map[string]string{"com.getarcaneapp.arcane.updater": "false"}},
-		{ID: "moving-unmonitored", Image: "app:latest", ImageID: "moving-image", Labels: map[string]string{imageref.UpdateCheckLabel: "false"}},
-		{ID: "moving-tag", Image: "app:latest", ImageID: "moving-image", Labels: map[string]string{"com.getarcaneapp.arcane.updater.strategy": "tag"}},
+		{
+			ID:      "moving",
+			Image:   "app:latest",
+			ImageID: "moving-image",
+		},
+		{
+			ID:      "moving-twin",
+			Image:   "app:latest",
+			ImageID: "moving-image",
+			Labels:  map[string]string{"com.getarcaneapp.arcane.updater": "false"},
+		},
+		{
+			ID:      "moving-unmonitored",
+			Image:   "app:latest",
+			ImageID: "moving-image",
+			Labels:  map[string]string{imageref.UpdateCheckLabel: "false"},
+		},
+		{
+			ID:      "moving-tag",
+			Image:   "app:latest",
+			ImageID: "moving-image",
+			Labels:  map[string]string{"com.getarcaneapp.arcane.updater.strategy": "tag"},
+		},
 		{ID: "moving-no-id", Image: "app:latest"},
 	}
 	checks, err = svc.GetUpdateInfoByContainers(t.Context(), digestContainers)
@@ -750,7 +814,7 @@ func TestImageServiceContainerTagUpdatesStayScoped(t *testing.T) {
 
 func TestPatchWorkflowDefinitions(t *testing.T) {
 	harness := flowtest.New(t, nil)
-	require.NoError(t, (&ImageService{}).RegisterWorkflows(harness.Engine))
+	require.NoError(t, NewImageService(nil, nil, nil, nil, nil, nil, nil, nil).RegisterWorkflows(harness.Engine))
 	harness.Start(t)
 	flowtest.AssertDefinitions(t, harness)
 }
@@ -780,13 +844,35 @@ func imageScopeContext(t *testing.T, target string, bodies map[string]any) (cont
 
 func TestAggregateImagesMergesEnvironments(t *testing.T) {
 	bodies := map[string]any{
-		"a": imagetypes.ListResponse{Success: true, Data: []imagetypes.Summary{
-			{ID: "a1", Repo: "nginx", Tag: "latest"},
-			{ID: "a2", Repo: "redis", Tag: "7"},
-		}, Pagination: base.PaginationResponse{TotalItems: 2, GrandTotalItems: 4}, MaxImageUploadSize: 500},
-		"b": imagetypes.ListResponse{Success: true, Data: []imagetypes.Summary{
-			{ID: "b1", Repo: "postgres", Tag: "16"},
-		}, Pagination: base.PaginationResponse{TotalItems: 1}, MaxImageUploadSize: 100},
+		"a": imagetypes.ListResponse{
+			Success: true,
+			Data: []imagetypes.Summary{
+				{
+					ID:   "a1",
+					Repo: "nginx",
+					Tag:  "latest",
+				},
+				{
+					ID:   "a2",
+					Repo: "redis",
+					Tag:  "7",
+				},
+			},
+			Pagination:         base.PaginationResponse{TotalItems: 2, GrandTotalItems: 4},
+			MaxImageUploadSize: 500,
+		},
+		"b": imagetypes.ListResponse{
+			Success: true,
+			Data: []imagetypes.Summary{
+				{
+					ID:   "b1",
+					Repo: "postgres",
+					Tag:  "16",
+				},
+			},
+			Pagination:         base.PaginationResponse{TotalItems: 1},
+			MaxImageUploadSize: 100,
+		},
 	}
 	rowLabels := func(items []imagetypes.Summary) []string {
 		out := make([]string, 0, len(items))
@@ -795,7 +881,7 @@ func TestAggregateImagesMergesEnvironments(t *testing.T) {
 		}
 		return out
 	}
-	svc := &ImageService{}
+	svc := NewImageService(nil, nil, nil, nil, nil, nil, nil, nil)
 
 	t.Run("sorts by repo across environments and pages", func(t *testing.T) {
 		ctx, queries := imageScopeContext(t, "/api/environments/a,b,c/images?start=0&limit=2&sort=repo&order=asc", bodies)
@@ -846,15 +932,35 @@ func TestAggregateImagesMergesEnvironments(t *testing.T) {
 
 func TestAggregateImageCountsSumsEnvironments(t *testing.T) {
 	ctx, _ := imageScopeContext(t, "/api/environments/a,b,c/images/counts", map[string]any{
-		"a": base.ApiResponse[imagetypes.UsageCounts]{Success: true, Data: imagetypes.UsageCounts{Inuse: 1, Unused: 2, Total: 3, TotalSize: 100}},
-		"b": base.ApiResponse[imagetypes.UsageCounts]{Success: true, Data: imagetypes.UsageCounts{Inuse: 2, Total: 2, TotalSize: 50}},
+		"a": base.ApiResponse[imagetypes.UsageCounts]{
+			Success: true,
+			Data: imagetypes.UsageCounts{
+				Inuse:     1,
+				Unused:    2,
+				Total:     3,
+				TotalSize: 100,
+			},
+		},
+		"b": base.ApiResponse[imagetypes.UsageCounts]{
+			Success: true,
+			Data: imagetypes.UsageCounts{
+				Inuse:     2,
+				Total:     2,
+				TotalSize: 50,
+			},
+		},
 	})
 
-	body, err := (&ImageService{}).AggregateImageCounts(ctx)
+	body, err := NewImageService(nil, nil, nil, nil, nil, nil, nil, nil).AggregateImageCounts(ctx)
 	require.NoError(t, err)
 
 	assert.True(t, body.Success)
-	assert.Equal(t, imagetypes.UsageCounts{Inuse: 3, Unused: 2, Total: 5, TotalSize: 150}, body.Data)
+	assert.Equal(t, imagetypes.UsageCounts{
+		Inuse:     3,
+		Unused:    2,
+		Total:     5,
+		TotalSize: 150,
+	}, body.Data)
 	require.Len(t, body.FailedEnvironments, 1)
 	assert.Equal(t, "c", body.FailedEnvironments[0].Environment.ID)
 }

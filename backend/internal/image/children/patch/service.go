@@ -34,6 +34,7 @@ import (
 	"github.com/project-copacetic/copacetic/pkg/types"
 	"github.com/samber/mo"
 	"go.getarcane.app/acfs"
+	"go.getarcane.app/kit/pkg"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -101,7 +102,7 @@ func NewService(
 	// Copa resolves the daemon for BuildKit dialing, manifest discovery, and
 	// image loading from DOCKER_HOST; without it, its docker connhelper falls
 	// back to shelling out to the docker CLI, which Arcane deployments lack.
-	if os.Getenv("DOCKER_HOST") == "" && dockerService != nil {
+	if os.Getenv("DOCKER_HOST") == "" {
 		if host := strings.TrimSpace(dockerService.DockerHost()); host != "" {
 			if err := os.Setenv("DOCKER_HOST", host); err != nil {
 				slog.WarnContext(context.Background(), "failed to set DOCKER_HOST for image patching", "error", err) //nolint:forbidigo // Service construction has no request context.
@@ -133,8 +134,7 @@ func (s *Service) PatchImage(ctx context.Context, envID, imageID string, opts im
 		return nil, err
 	}
 	go func() { _ = run() }()
-	dto := record.ToDto()
-	return &dto, nil
+	return new(record.ToDto()), nil
 }
 
 // PatchTarget patches one scanned image and waits for the result. recordID keys
@@ -166,7 +166,7 @@ func (s *Service) startPatch(
 		}
 		// A record still patching was cut off mid-run, so whether Copacetic already replaced its tag is unknown.
 		// Its failure keeps that message, so no later delivery runs the patch again either.
-		if existing.Status == string(imagepatch.PatchStatusPatching) || mo.PointerToOption(existing.Error).OrEmpty() == errPatchInterrupted.Error() {
+		if existing.Status == string(imagepatch.PatchStatusPatching) || kit.FromPtr(existing.Error) == errPatchInterrupted.Error() {
 			s.finishPatchRecord(ctx, &existing, imagepatch.PatchStatusFailed, errPatchInterrupted.Error(), nil, 0)
 			return nil, nil, errPatchInterrupted
 		}
@@ -186,33 +186,27 @@ func (s *Service) startPatch(
 	if len(imageInspect.RepoTags) == 0 {
 		return nil, nil, common.ErrImageUntagged
 	}
-	imageRef := imageInspect.RepoTags[0]
-	if existing.ID != "" {
-		// A replay patches the source its record names, so the output matches the saved PatchedRef.
-		if !slices.Contains(imageInspect.RepoTags, existing.OriginalRef) {
-			return nil, nil, fmt.Errorf("image is no longer tagged %s; start a new patch", existing.OriginalRef)
-		}
-		imageRef = existing.OriginalRef
+	// A replay patches the source its record names, so the output matches the saved PatchedRef.
+	if existing.ID != "" && !slices.Contains(imageInspect.RepoTags, existing.OriginalRef) {
+		return nil, nil, fmt.Errorf("image is no longer tagged %s; start a new patch", existing.OriginalRef)
 	}
+	imageRef := cmp.Or(existing.OriginalRef, imageInspect.RepoTags[0])
 	// Never pulled or pushed: BuildKit cannot fetch the image to patch it.
 	if len(imageInspect.RepoDigests) == 0 {
 		return nil, nil, common.ErrImageLocalOnly
 	}
 
-	mode := imagepatch.PatchModeUpdateAll
-	var reportData []byte
+	// Scan records are keyed by image ID; refuse a scan of a different image than the route selected.
+	if opts.ScanID != "" && opts.ScanID != imageInspect.ID {
+		return nil, nil, common.ErrPatchScanImageMismatch
+	}
+	var report vulnerability.VulnerabilityReportRecord
 	if opts.ScanID != "" {
-		// Scan records are keyed by image ID; refuse a scan of a different image than the route selected.
-		if opts.ScanID != imageInspect.ID {
-			return nil, nil, common.ErrPatchScanImageMismatch
-		}
-		var report vulnerability.VulnerabilityReportRecord
 		if reportErr := s.db.WithContext(ctx).First(&report, "image_id = ?", opts.ScanID).Error; reportErr != nil || report.Data == "" {
 			return nil, nil, common.ErrPatchScanReportUnavailable
 		}
-		reportData = []byte(report.Data)
-		mode = imagepatch.PatchModeReport
 	}
+	mode := kit.Ternary(opts.ScanID != "", imagepatch.PatchModeReport, imagepatch.PatchModeUpdateAll)
 
 	suffix := cmp.Or(strings.TrimSpace(opts.Suffix), strings.TrimSpace(s.settingsService.GetSettingsConfig().ImagePatchSuffix.Value), "patched")
 	patchedRef, err := resolvePatchedRef(imageRef, opts.PatchedTag, suffix)
@@ -225,56 +219,66 @@ func (s *Service) startPatch(
 
 	// Unless the all-platforms setting is on, pin update-all patches to this image's platform manifest so copa
 	// patches one platform and keeps the plain patched tag. Report-mode patches are always single-platform.
-	copaImageRef := imageRef
-	if mode == imagepatch.PatchModeUpdateAll && !s.settingsService.GetSettingsConfig().ImagePatchAllPlatforms.IsTrue() {
-		copaImageRef = cmp.Or(platformPinnedRef(ctx, imageRef, v1.Platform{
-			OS:           imageInspect.Os,
-			Architecture: imageInspect.Architecture,
-			Variant:      imageInspect.Variant,
-		}), imageRef)
-	}
-
-	activityID := ""
-	if s.activityService != nil {
-		// Each attempt gets its own activity, since a finished activity never reopens.
-		started, startErr := s.activityService.StartActivity(ctx, activity.StartActivityRequest{
-			EnvironmentID: envID,
-			Type:          activitytypes.TypeImagePatch,
-			ResourceType:  new("image"),
-			ResourceID:    &imageID,
-			ResourceName:  &imageRef,
-			StartedBy:     &user,
-			Progress:      new(0),
-			LatestMessage: "Image patch queued",
-		})
-		if startErr != nil {
-			slog.WarnContext(ctx, "failed to create image patch activity", "error", startErr, "imageRef", imageRef)
-		} else {
-			activityID = started.ID
+	copaImageRef := func() string {
+		if mode == imagepatch.PatchModeUpdateAll && !s.settingsService.GetSettingsConfig().ImagePatchAllPlatforms.IsTrue() {
+			return cmp.Or(platformPinnedRef(ctx, imageRef, v1.Platform{
+				OS:           imageInspect.Os,
+				Architecture: imageInspect.Architecture,
+				Variant:      imageInspect.Variant,
+			}), imageRef)
 		}
+		return imageRef
+	}()
+
+	// Each attempt gets its own activity, since a finished activity never reopens.
+	started, startErr := s.activityService.StartActivity(ctx, activity.StartActivityRequest{
+		EnvironmentID: envID,
+		Type:          activitytypes.TypeImagePatch,
+		ResourceType:  new("image"),
+		ResourceID:    &imageID,
+		ResourceName:  &imageRef,
+		StartedBy:     &user,
+		Progress:      new(0),
+		LatestMessage: "Image patch queued",
+	})
+	if startErr != nil {
+		slog.WarnContext(ctx, "failed to create image patch activity", "error", startErr, "imageRef", imageRef)
 	}
+	activityID := kit.Ternary(startErr == nil, kit.FromPtr(started).ID, "")
 	runCtx := s.activityService.Track(ctx, activityID)
 
-	record := &existing
-	var saveErr error
-	if record.ID == "" {
-		record = &ImagePatchRecord{
-			EnvironmentID:   envID,
-			OriginalImageID: imageInspect.ID,
-			OriginalRef:     imageRef,
-			OriginalDigest:  imageInspect.RepoDigests[0],
-			PatchedRef:      patchedRef,
-			Mode:            string(mode),
-			Status:          string(imagepatch.PatchStatusPatching),
-			ActivityID:      mo.EmptyableToOption(activityID).ToPointer(),
+	record, saveErr := func() (*ImagePatchRecord, error) {
+		if existing.ID == "" {
+			created := &ImagePatchRecord{
+				ID:              recordID,
+				EnvironmentID:   envID,
+				OriginalImageID: imageInspect.ID,
+				OriginalRef:     imageRef,
+				OriginalDigest:  imageInspect.RepoDigests[0],
+				PatchedRef:      patchedRef,
+				Mode:            string(mode),
+				Status:          string(imagepatch.PatchStatusPatching),
+				ActivityID:      mo.EmptyableToOption(activityID).ToPointer(),
+			}
+			return created, s.db.WithContext(ctx).Create(created).Error
 		}
-		record.ID = recordID
-		saveErr = s.db.WithContext(ctx).Create(record).Error
-	} else {
 		// A retried record runs again under this attempt's activity, without the earlier attempt's error.
-		record.Status, record.Error, record.ActivityID = string(imagepatch.PatchStatusPatching), nil, mo.EmptyableToOption(activityID).ToPointer()
-		saveErr = s.db.WithContext(ctx).Model(record).Select("status", "error", "activity_id").Updates(record).Error
-	}
+		retried := &ImagePatchRecord{ //exhaustruct:enforce
+			BaseModel:       existing.BaseModel,
+			EnvironmentID:   existing.EnvironmentID,
+			OriginalImageID: existing.OriginalImageID,
+			OriginalRef:     existing.OriginalRef,
+			OriginalDigest:  existing.OriginalDigest,
+			PatchedRef:      existing.PatchedRef,
+			Mode:            existing.Mode,
+			Status:          string(imagepatch.PatchStatusPatching),
+			PackagesUpdated: existing.PackagesUpdated,
+			Error:           nil,
+			ActivityID:      mo.EmptyableToOption(activityID).ToPointer(),
+			DurationMs:      existing.DurationMs,
+		}
+		return retried, s.db.WithContext(ctx).Model(retried).Select("status", "error", "activity_id").Updates(retried).Error
+	}()
 	if saveErr != nil {
 		// No worker will run, so settle the activity and release its cancel registration here.
 		saveErr = fmt.Errorf("failed to save image patch record: %w", saveErr)
@@ -283,7 +287,7 @@ func (s *Service) startPatch(
 	}
 
 	slog.InfoContext(ctx, "image patch queued", "environmentId", envID, "imageRef", imageRef, "patchedRef", patchedRef, "mode", mode, "patchTarget", copaImageRef)
-	return record, func() error { return s.runPatch(runCtx, record, opts, reportData, copaImageRef, activityID) }, nil
+	return record, func() error { return s.runPatch(runCtx, record, opts, []byte(report.Data), copaImageRef, activityID) }, nil
 }
 
 // runPatch executes one recorded patch with Copacetic and settles its record and activity.
@@ -317,61 +321,50 @@ func (s *Service) runPatch(ctx context.Context, record *ImagePatchRecord, opts i
 
 	// Copa consumes the scan report as a file; materialize the stored report
 	// into a temp file for the duration of the run.
-	reportPath := ""
-	if len(reportData) > 0 {
-		reportDir, err := os.MkdirTemp("", "arcane-patch-report")
-		if err == nil {
-			reportPath = filepath.Join(reportDir, "report.json")
-			err = os.WriteFile(reportPath, reportData, 0o600)
-			defer func() {
-				if cleanupErr := os.RemoveAll(reportDir); cleanupErr != nil {
-					slog.WarnContext(ctx, "Failed to remove image patch temporary directory", "directory", reportDir, "error", cleanupErr)
-				}
-			}()
+	reportPath, err := func() (string, error) {
+		if len(reportData) == 0 {
+			return "", nil
 		}
-		if err != nil {
-			return fail(err, 0)
+		reportDir, mkdirErr := os.MkdirTemp("", "arcane-patch-report")
+		if mkdirErr != nil {
+			return "", mkdirErr
+		}
+		return filepath.Join(reportDir, "report.json"), nil
+	}()
+	if err != nil {
+		return fail(err, 0)
+	}
+	if reportPath != "" {
+		defer func() {
+			if cleanupErr := os.RemoveAll(filepath.Dir(reportPath)); cleanupErr != nil {
+				slog.WarnContext(ctx, "Failed to remove image patch temporary directory", "directory", filepath.Dir(reportPath), "error", cleanupErr)
+			}
+		}()
+		if writeErr := os.WriteFile(reportPath, reportData, 0o600); writeErr != nil {
+			return fail(writeErr, 0)
 		}
 	}
 
 	startTime := time.Now()
 
-	timeoutSeconds := opts.TimeoutSeconds
-	if timeoutSeconds <= 0 {
-		timeoutSeconds = s.settingsService.GetSettingsConfig().ImagePatchTimeoutSec.AsInt()
-	}
-	if timeoutSeconds <= 0 {
-		timeoutSeconds = 600
-	}
-
-	copaOpts := &types.Options{
-		Image:  copaImageRef,
-		Report: reportPath,
-		// The final tag was already resolved into the record; pass it verbatim
-		// so copa produces exactly the recorded reference.
-		PatchedTag:  record.PatchedRef[strings.LastIndex(record.PatchedRef, ":")+1:],
-		Timeout:     time.Duration(timeoutSeconds) * time.Second,
-		Progress:    progressui.QuietMode,
-		BkAddr:      "docker://",
-		IgnoreError: opts.IgnoreErrors,
-	}
-
-	var vexOutputPath string
-	if reportPath != "" {
-		copaOpts.Scanner = "trivy"
-		copaOpts.PkgTypes = "os"
-		// VEX output is only produced when patching from a report; use it to
-		// count how many packages were actually updated.
-		if vexDir, err := os.MkdirTemp("", "arcane-patch-vex"); err == nil {
-			vexOutputPath = filepath.Join(vexDir, "vex.json")
-			copaOpts.Format = "openvex"
-			copaOpts.Output = vexOutputPath
-			defer func() {
-				if cleanupErr := os.RemoveAll(vexDir); cleanupErr != nil {
-					slog.WarnContext(ctx, "Failed to remove image patch temporary directory", "directory", vexDir, "error", cleanupErr)
-				}
-			}()
+	// VEX output is only produced when patching from a report; use it to
+	// count how many packages were actually updated.
+	vexOutputPath := func() string {
+		if reportPath == "" {
+			return ""
 		}
+		vexDir, mkdirErr := os.MkdirTemp("", "arcane-patch-vex")
+		if mkdirErr != nil {
+			return ""
+		}
+		return filepath.Join(vexDir, "vex.json")
+	}()
+	if vexOutputPath != "" {
+		defer func() {
+			if cleanupErr := os.RemoveAll(filepath.Dir(vexOutputPath)); cleanupErr != nil {
+				slog.WarnContext(ctx, "Failed to remove image patch temporary directory", "directory", filepath.Dir(vexOutputPath), "error", cleanupErr)
+			}
+		}()
 	}
 
 	// Mirror copa's log output into the activity while the patch runs; BuildKit
@@ -379,7 +372,21 @@ func (s *Service) runPatch(ctx context.Context, record *ImagePatchRecord, opts i
 	s.appendPatchActivity(ctx, activityID, 30, "Patching image packages via BuildKit")
 	patchOut := activitylib.NewWriter(ctx, s.activityService, activityID, nil, "Patching image")
 	removeMirror := logging.AddLogrusMirror(patchOut)
-	patchErr := patch.Patch(ctx, copaOpts)
+	patchErr := patch.Patch(ctx, &types.Options{
+		Image:  copaImageRef,
+		Report: reportPath,
+		// The final tag was already resolved into the record; pass it verbatim
+		// so copa produces exactly the recorded reference.
+		PatchedTag:  record.PatchedRef[strings.LastIndex(record.PatchedRef, ":")+1:],
+		Timeout:     time.Duration(cmp.Or(max(opts.TimeoutSeconds, 0), max(s.settingsService.GetSettingsConfig().ImagePatchTimeoutSec.AsInt(), 0), 600)) * time.Second,
+		Scanner:     kit.Ternary(reportPath != "", "trivy", ""),
+		Format:      kit.Ternary(vexOutputPath != "", "openvex", ""),
+		Output:      vexOutputPath,
+		Progress:    progressui.QuietMode,
+		BkAddr:      "docker://",
+		IgnoreError: opts.IgnoreErrors,
+		PkgTypes:    kit.Ternary(reportPath != "", "os", ""),
+	})
 	removeMirror()
 	activitylib.FlushWriter(patchOut)
 	durationMs := time.Since(startTime).Milliseconds()
@@ -400,18 +407,22 @@ func (s *Service) runPatch(ctx context.Context, record *ImagePatchRecord, opts i
 	}
 
 	// Count VEX statements as the number of patched packages, when available.
-	var packagesUpdated *int
-	if vexOutputPath != "" {
-		if data, err := acfs.ReadFile(ctx, filepath.Dir(vexOutputPath), "/"+filepath.Base(vexOutputPath)); err == nil {
-			var doc struct {
-				Statements []jsontext.Value `json:"statements"`
-			}
-			if unmarshalErr := json.Unmarshal(data, &doc); unmarshalErr == nil {
-				count := len(doc.Statements)
-				packagesUpdated = &count
-			}
+	packagesUpdated := func() *int {
+		if vexOutputPath == "" {
+			return nil
 		}
-	}
+		data, readErr := acfs.ReadFile(ctx, filepath.Dir(vexOutputPath), "/"+filepath.Base(vexOutputPath))
+		if readErr != nil {
+			return nil
+		}
+		var doc struct {
+			Statements []jsontext.Value `json:"statements"`
+		}
+		if unmarshalErr := json.Unmarshal(data, &doc); unmarshalErr != nil {
+			return nil
+		}
+		return new(len(doc.Statements))
+	}()
 
 	s.verifyPatchedImage(ctx, record, activityID)
 
@@ -428,7 +439,7 @@ func (s *Service) verifyPatchedImage(ctx context.Context, record *ImagePatchReco
 		if patchedInspect, inspectErr := dockerClient.ImageInspect(ctx, record.PatchedRef); inspectErr != nil {
 			slog.WarnContext(ctx, "patched image tag not found after patching", "patchedRef", record.PatchedRef, "error", inspectErr)
 			s.appendPatchActivity(ctx, activityID, 95, "Patched image was created but the expected tag "+record.PatchedRef+" was not found; check the image list")
-		} else if s.vulnerabilityService != nil && s.settingsService.IsFeatureEnabled(ctx, features.VulnerabilityManagement) {
+		} else if s.settingsService.IsFeatureEnabled(ctx, features.VulnerabilityManagement) {
 			s.appendPatchActivity(ctx, activityID, 95, "Re-scanning patched image to verify the patch")
 			if _, scanErr := s.vulnerabilityService.ScanImage(context.WithoutCancel(ctx), record.EnvironmentID, patchedInspect.ID, scheduledPatchUser); scanErr != nil {
 				slog.WarnContext(ctx, "failed to start verification scan of patched image", "patchedRef", record.PatchedRef, "error", scanErr)
@@ -499,7 +510,7 @@ func resolvePatchedRef(imageRef, patchedTag, suffix string) (string, error) {
 // startup) owns that directory — a user's ~/.docker/config.json is never modified.
 func (s *Service) writeRegistryAuthConfig(ctx context.Context) {
 	configDir := strings.TrimSpace(os.Getenv("DOCKER_CONFIG"))
-	if configDir == "" || s.registryService == nil {
+	if configDir == "" {
 		return
 	}
 
@@ -585,9 +596,15 @@ func (s *Service) ListPatches(ctx context.Context, envID string, params paginati
 	}
 	q = pagination.ApplyFilter(q, "status", params.Filters["status"])
 
-	params.Sort = cmp.Or(params.Sort, "createdAt")
-
-	paginationResp, err := pagination.PaginateAndSortDB(params, q, &records)
+	paginationResp, err := pagination.PaginateAndSortDB(pagination.QueryParams{ //exhaustruct:enforce
+		SearchQuery: params.SearchQuery,
+		SortParams: pagination.SortParams{ //exhaustruct:enforce
+			Sort:  cmp.Or(params.Sort, "createdAt"),
+			Order: params.Order,
+		},
+		Params:  params.Params,
+		Filters: params.Filters,
+	}, q, &records)
 	if err != nil {
 		return nil, pagination.Response{}, fmt.Errorf("failed to paginate image patches: %w", err)
 	}
@@ -688,9 +705,16 @@ func (s *Service) ListPatchTargets(ctx context.Context, envID string, params pag
 	}
 	q = pagination.ApplyLikeSearch(q, params.Search, "image_name LIKE ?")
 
-	params.Sort = cmp.Or(params.Sort, "scanTime")
 	var scans []vulnerability.VulnerabilityScanRecord
-	paginationResp, err := pagination.PaginateAndSortDB(params, q, &scans)
+	paginationResp, err := pagination.PaginateAndSortDB(pagination.QueryParams{ //exhaustruct:enforce
+		SearchQuery: params.SearchQuery,
+		SortParams: pagination.SortParams{ //exhaustruct:enforce
+			Sort:  cmp.Or(params.Sort, "scanTime"),
+			Order: params.Order,
+		},
+		Params:  params.Params,
+		Filters: params.Filters,
+	}, q, &scans)
 	if err != nil {
 		return nil, pagination.Response{}, fmt.Errorf("failed to list patch targets: %w", err)
 	}
@@ -722,30 +746,25 @@ func (s *Service) ListPatchTargets(ctx context.Context, envID string, params pag
 	targets := make([]imagepatch.PatchTarget, 0, len(scans))
 	for i := range scans {
 		scan := &scans[i]
-		target := imagepatch.PatchTarget{
+		targets = append(targets, imagepatch.PatchTarget{
 			ImageID:      scan.ID,
 			ImageRef:     scan.ImageName,
-			FixableCount: mo.PointerToOption(scan.FixableCount).OrEmpty(),
+			FixableCount: kit.FromPtr(scan.FixableCount),
 			TotalCount:   scan.TotalCount,
 			ScanTime:     scan.ScanTime,
-		}
-		if digests, ok := repoDigestsByID[scan.ID]; ok {
-			target.LocalOnly = true
-			for _, digest := range digests {
-				if digest != "<none>@<none>" {
-					target.LocalOnly = false
-					break
+			LocalOnly: func() bool {
+				digests, ok := repoDigestsByID[scan.ID]
+				return ok && !slices.ContainsFunc(digests, func(digest string) bool { return digest != "<none>@<none>" })
+			}(),
+			LastPatch: func() *imagepatch.PatchRecord {
+				lastPatch, ok := lastPatchByImageID[scan.ID]
+				if !ok {
+					return nil
 				}
-			}
-		}
-
-		if lastPatch, ok := lastPatchByImageID[scan.ID]; ok {
-			dto := lastPatch.ToDto()
-			target.LastPatch = &dto
-			target.LastPatchScan = lastPatchScanByImageID[scan.ID]
-		}
-
-		targets = append(targets, target)
+				return new(lastPatch.ToDto())
+			}(),
+			LastPatchScan: lastPatchScanByImageID[scan.ID],
+		})
 	}
 
 	return targets, paginationResp, nil
@@ -810,7 +829,7 @@ func (s *Service) latestPatchesByImage(ctx context.Context, envID string, imageI
 		if latest != nil {
 			lastPatchScanByImageID[imageID] = &imagepatch.PatchScanSummary{
 				Status:       latest.Status,
-				FixableCount: mo.PointerToOption(latest.FixableCount).OrEmpty(),
+				FixableCount: kit.FromPtr(latest.FixableCount),
 				TotalCount:   latest.TotalCount,
 				ScanTime:     latest.ScanTime,
 			}
@@ -880,34 +899,33 @@ func requireContainerdImageStore(ctx context.Context, dockerClient *client.Clien
 }
 
 func (s *Service) appendPatchActivity(ctx context.Context, activityID string, progress int, message string) {
-	if s.activityService == nil || activityID == "" {
+	if activityID == "" {
 		return
 	}
 	if _, err := s.activityService.AppendMessage(ctx, activityID, activity.AppendActivityMessageRequest{
 		Level:    activitytypes.MessageLevelInfo,
 		Message:  message,
-		Progress: &progress,
+		Progress: new(progress),
 	}); err != nil {
 		slog.DebugContext(ctx, "failed to append image patch activity message", "activityId", activityID, "error", err)
 	}
 }
 
 func (s *Service) completePatchActivity(ctx context.Context, activityID string, success bool, errMessage string) {
-	if s.activityService == nil || activityID == "" {
+	if activityID == "" {
 		return
 	}
 
-	status := activitytypes.StatusSuccess
-	message := "Image patch completed"
-	var errorPtr *string
-	switch {
-	case success:
-	case activitylib.CancelledByContext(ctx):
-		status, message = activitytypes.StatusCancelled, "Image patch cancelled"
-	default:
-		status, message = activitytypes.StatusFailed, cmp.Or(errMessage, "Image patch failed")
-		errorPtr = mo.EmptyableToOption(errMessage).ToPointer()
-	}
+	status, message, errorPtr := func() (activitytypes.Status, string, *string) {
+		switch {
+		case success:
+			return activitytypes.StatusSuccess, "Image patch completed", nil
+		case activitylib.CancelledByContext(ctx):
+			return activitytypes.StatusCancelled, "Image patch cancelled", nil
+		default:
+			return activitytypes.StatusFailed, cmp.Or(errMessage, "Image patch failed"), mo.EmptyableToOption(errMessage).ToPointer()
+		}
+	}()
 
 	if _, err := s.activityService.CompleteActivity(utils.ActivityRuntimeContext(ctx, nil), activityID, status, message, errorPtr); err != nil {
 		slog.DebugContext(ctx, "failed to complete image patch activity", "activityId", activityID, "error", err)

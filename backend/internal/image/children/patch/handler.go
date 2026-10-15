@@ -56,16 +56,11 @@ func (h *ImagePatchHandler) PatchImage(ctx context.Context, input *PatchImageInp
 	runtimeCtx := utils.ActivityRuntimeContext(ctx, h.appCtx)
 	record, err := h.imagePatchService.PatchImage(runtimeCtx, input.EnvironmentID, input.ImageID, input.Body, *user)
 	if err != nil {
-		switch {
-		case errors.Is(err, common.ErrFeatureDisabled):
+		if errors.Is(err, common.ErrFeatureDisabled) {
 			return nil, handlerutil.FeatureDisabledError(features.VulnerabilityManagement)
-		case errors.Is(err, common.ErrBadRequest):
-			return nil, huma.Error400BadRequest(err.Error())
-		case errors.Is(err, common.ErrNotFound):
-			return nil, huma.Error404NotFound(err.Error())
-		default:
-			return nil, huma.Error500InternalServerError("Failed to patch image: " + err.Error())
 		}
+		apiErr := common.ToAPIError(err)
+		return nil, huma.NewError(apiErr.HTTPStatus(), apiErr.Message)
 	}
 
 	return &handlerutil.Out[imagepatch.PatchRecord]{
