@@ -73,7 +73,8 @@ for role in manager agent; do
     fi
 
     copied=false
-    for delay in 0 5 15 30; do
+    # GHCR briefly reports existing child manifests as not found, so only auth failures are final.
+    for delay in 0 10 30 60 90; do
         if [[ "$delay" != 0 ]]; then
             sleep "$delay"
         fi
@@ -83,8 +84,7 @@ for role in manager agent; do
             break
         fi
         cat "$copy_log" >&2
-        if grep -Eqi '401|403|unauthorized|denied' "$copy_log" \
-            || ! grep -Eqi '429|500|502|503|504|timeout|timed out|connection|temporary|temporarily|unexpected EOF' "$copy_log"; then
+        if grep -Eqi 'status code 40[13]|unauthorized|denied|forbidden' "$copy_log"; then
             break
         fi
     done
