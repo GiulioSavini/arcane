@@ -18,13 +18,13 @@ import (
 	"github.com/libtnb/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.getarcane.app/kit/pkg"
 	"gorm.io/gorm"
 
 	"github.com/getarcaneapp/arcane/backend/v2/internal/activity"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/config"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/database"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/environment"
-	"github.com/getarcaneapp/arcane/backend/v2/internal/job/children/remote"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/job/children/runtime"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/kv"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/middleware"
@@ -36,11 +36,11 @@ import (
 	francistest "github.com/getarcaneapp/arcane/backend/v2/pkg/utils/francis/testing"
 )
 
-func setupSettingsTestDBInternal(t *testing.T) *database.DB {
+func setupSettingsTestDB(t *testing.T) *database.DB {
 	t.Helper()
 	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
 	require.NoError(t, err)
-	require.NoError(t, db.AutoMigrate(&settings.SettingVariable{}, &kv.KVEntry{}))
+	require.NoError(t, db.AutoMigrate(&settings.SettingVariable{}, &kv.KVEntry{}, &activity.Activity{}, &activity.ActivityMessage{}))
 	sqlDB, err := db.DB()
 	require.NoError(t, err)
 	sqlDB.SetMaxOpenConns(1)
@@ -48,7 +48,7 @@ func setupSettingsTestDBInternal(t *testing.T) *database.DB {
 	return &database.DB{DB: db}
 }
 
-func newSettingsServiceForTestInternal(t testing.TB, ctx context.Context, db *database.DB) (*settings.SettingsService, error) {
+func newSettingsServiceForTest(t testing.TB, ctx context.Context, db *database.DB) (*settings.SettingsService, error) {
 	t.Helper()
 	service, err := settings.NewSettingsService(ctx, db)
 	if err == nil {
@@ -61,7 +61,7 @@ func newSettingsServiceForTestInternal(t testing.TB, ctx context.Context, db *da
 	return service, err
 }
 
-func newJobCoordinatorForTestInternal(t *testing.T, db *database.DB) *runs.Coordinator {
+func newJobCoordinatorForTest(t *testing.T, db *database.DB) *runs.Coordinator {
 	t.Helper()
 	francisRuntime := francistest.New(t)
 	coordinator := runs.New(kv.NewKVService(db), francisRuntime.Service(), time.UTC)
@@ -70,19 +70,29 @@ func newJobCoordinatorForTestInternal(t *testing.T, db *database.DB) *runs.Coord
 	return coordinator
 }
 
-func newJobServiceForTestInternal(t *testing.T, db *database.DB, settingsService *settings.SettingsService, cfg *config.Config) *JobService {
+func newJobServiceForTest(t *testing.T, db *database.DB, settingsService *settings.SettingsService, cfg *config.Config) *JobService {
 	t.Helper()
-	return NewJobService(db, settingsService, cfg, newJobCoordinatorForTestInternal(t, db), nil, nil, nil)
+	service := NewJobService(
+		db,
+		settingsService,
+		cfg,
+		newJobCoordinatorForTest(t, db),
+		role.NewRoleService(db),
+		environment.NewEnvironmentService(db, nil, nil, nil, nil, nil),
+		activity.NewActivityService(db, settingsService),
+	)
+	service.SetScheduler(t.Context(), newFakeJobScheduler())
+	return service
 }
 
 func TestJobService_GetJobSchedules_DefaultDockerClientRefreshInterval(t *testing.T) {
 	ctx := t.Context()
-	db := setupSettingsTestDBInternal(t)
+	db := setupSettingsTestDB(t)
 
-	settingsSvc, err := newSettingsServiceForTestInternal(t, ctx, db)
+	settingsSvc, err := newSettingsServiceForTest(t, ctx, db)
 	require.NoError(t, err)
 
-	jobSvc := newJobServiceForTestInternal(t, db, settingsSvc, &config.Config{})
+	jobSvc := newJobServiceForTest(t, db, settingsSvc, &config.Config{})
 	cfg := jobSvc.GetJobSchedules(ctx)
 
 	require.Equal(t, "0 */5 * * * *", cfg.DockerClientRefreshInterval)
@@ -91,16 +101,16 @@ func TestJobService_GetJobSchedules_DefaultDockerClientRefreshInterval(t *testin
 
 func TestJobService_ListJobs_AnalyticsHeartbeatIsManagedInternally(t *testing.T) {
 	ctx := t.Context()
-	db := setupSettingsTestDBInternal(t)
+	db := setupSettingsTestDB(t)
 
-	settingsSvc, err := newSettingsServiceForTestInternal(t, ctx, db)
+	settingsSvc, err := newSettingsServiceForTest(t, ctx, db)
 	require.NoError(t, err)
 
-	jobSvc := newJobServiceForTestInternal(t, db, settingsSvc, &config.Config{})
+	jobSvc := newJobServiceForTest(t, db, settingsSvc, &config.Config{})
 	jobs, err := jobSvc.ListJobs(ctx)
 	require.NoError(t, err)
 
-	analyticsJob := findJobStatusByIDInternal(t, jobs.Jobs, "analytics-heartbeat")
+	analyticsJob := findJobStatusByID(t, jobs.Jobs, "analytics-heartbeat")
 	require.Equal(t, "automatic (checked hourly; sent once per 24h)", analyticsJob.Schedule)
 	require.Empty(t, analyticsJob.SettingsKey)
 	require.Nil(t, analyticsJob.NextRun)
@@ -110,33 +120,33 @@ func TestJobService_ListJobs_AnalyticsHeartbeatIsManagedInternally(t *testing.T)
 
 func TestJobService_ListJobs_IncludesDisabledAutoHealJob(t *testing.T) {
 	ctx := t.Context()
-	db := setupSettingsTestDBInternal(t)
+	db := setupSettingsTestDB(t)
 
-	settingsSvc, err := newSettingsServiceForTestInternal(t, ctx, db)
+	settingsSvc, err := newSettingsServiceForTest(t, ctx, db)
 	require.NoError(t, err)
 	require.NoError(t, settingsSvc.SetBoolSetting(ctx, "autoHealEnabled", false))
 
-	jobSvc := newJobServiceForTestInternal(t, db, settingsSvc, &config.Config{})
+	jobSvc := newJobServiceForTest(t, db, settingsSvc, &config.Config{})
 	jobs, err := jobSvc.ListJobs(ctx)
 	require.NoError(t, err)
 
-	autoHealJob := findJobStatusByIDInternal(t, jobs.Jobs, "auto-heal")
+	autoHealJob := findJobStatusByID(t, jobs.Jobs, "auto-heal")
 	require.False(t, autoHealJob.Enabled)
 	require.Equal(t, "autoHealInterval", autoHealJob.SettingsKey)
 }
 
 func TestJobService_ListJobs_IncludesDockerClientRefreshJob(t *testing.T) {
 	ctx := t.Context()
-	db := setupSettingsTestDBInternal(t)
+	db := setupSettingsTestDB(t)
 
-	settingsSvc, err := newSettingsServiceForTestInternal(t, ctx, db)
+	settingsSvc, err := newSettingsServiceForTest(t, ctx, db)
 	require.NoError(t, err)
 
-	jobSvc := newJobServiceForTestInternal(t, db, settingsSvc, &config.Config{})
+	jobSvc := newJobServiceForTest(t, db, settingsSvc, &config.Config{})
 	jobs, err := jobSvc.ListJobs(ctx)
 	require.NoError(t, err)
 
-	refreshJob := findJobStatusByIDInternal(t, jobs.Jobs, "docker-client-refresh")
+	refreshJob := findJobStatusByID(t, jobs.Jobs, "docker-client-refresh")
 	require.True(t, refreshJob.Enabled)
 	require.True(t, refreshJob.CanRunManually)
 	require.Equal(t, "monitoring", refreshJob.Category)
@@ -146,32 +156,36 @@ func TestJobService_ListJobs_IncludesDockerClientRefreshJob(t *testing.T) {
 
 func TestJobService_ListJobs_UsesRuntimeScheduleAndNextRun(t *testing.T) {
 	ctx := t.Context()
-	db := setupSettingsTestDBInternal(t)
+	db := setupSettingsTestDB(t)
 
-	settingsSvc, err := newSettingsServiceForTestInternal(t, ctx, db)
+	settingsSvc, err := newSettingsServiceForTest(t, ctx, db)
 	require.NoError(t, err)
 
 	nextRun := time.Date(2026, time.July, 10, 8, 0, 0, 0, time.UTC)
-	fakeScheduler := newFakeJobSchedulerInternal("auto-update")
+	fakeScheduler := newFakeJobScheduler("auto-update")
 	fakeScheduler.runtimeStates["auto-update"] = scheduler.JobRuntimeState{
 		Schedule:  "0 0 8 * * *",
 		NextRun:   &nextRun,
 		Scheduled: true,
 	}
 
-	jobSvc := newJobServiceForTestInternal(t, db, settingsSvc, &config.Config{})
+	jobSvc := newJobServiceForTest(t, db, settingsSvc, &config.Config{})
 	jobSvc.SetScheduler(ctx, fakeScheduler)
 	jobs, err := jobSvc.ListJobs(ctx)
 	require.NoError(t, err)
 
-	autoUpdateJob := findJobStatusByIDInternal(t, jobs.Jobs, "auto-update")
+	autoUpdateJob := findJobStatusByID(t, jobs.Jobs, "auto-update")
 	require.Equal(t, "0 0 8 * * *", autoUpdateJob.Schedule)
 	require.Equal(t, nextRun, *autoUpdateJob.NextRun)
 
 	now := time.Now().UTC()
 	failed := scheduler.Run{
-		ID: "failed", EnvironmentID: "0", Status: scheduler.Failed, CreatedAt: now.Add(-time.Hour), UpdatedAt: now,
-		Outcome: scheduler.Outcome{Status: scheduler.Failed, Message: "clone failed"},
+		ID:            "failed",
+		EnvironmentID: "0",
+		Status:        scheduler.Failed,
+		CreatedAt:     now.Add(-time.Hour),
+		UpdatedAt:     now,
+		Outcome:       scheduler.Outcome{Status: scheduler.Failed, Message: "clone failed"},
 	}
 	succeeded := scheduler.Run{
 		ID:            "succeeded",
@@ -182,83 +196,138 @@ func TestJobService_ListJobs_UsesRuntimeScheduleAndNextRun(t *testing.T) {
 		FinishedAt:    new(now.Add(-time.Minute)),
 	}
 	for _, history := range [][]scheduler.Run{{failed, succeeded}, {succeeded, failed}} {
-		status := jobschedule.JobStatus{LastRun: new(failed), LastError: failed.Outcome.Message}
-		runtime.ApplyRunStatus(&status, history)
+		status := runtime.ApplyRunStatus(jobschedule.JobStatus{LastRun: new(failed), LastError: failed.Outcome.Message}, history)
 		require.Equal(t, succeeded.ID, status.LastRun.ID)
 		require.Empty(t, status.LastError)
 		require.Equal(t, "clone failed", history[0].Outcome.Message+history[1].Outcome.Message)
 	}
 	// An acknowledgement updates an old failure's revision, not its execution time.
-	failed.UpdatedAt = now.Add(time.Hour)
-	status := jobschedule.JobStatus{LastRun: new(succeeded)}
-	runtime.ApplyRunStatus(&status, []scheduler.Run{failed})
+	acknowledged := scheduler.Run{
+		ID:            failed.ID,
+		EnvironmentID: failed.EnvironmentID,
+		Status:        failed.Status,
+		CreatedAt:     failed.CreatedAt,
+		UpdatedAt:     now.Add(time.Hour),
+		Outcome:       failed.Outcome,
+	}
+	status := runtime.ApplyRunStatus(jobschedule.JobStatus{LastRun: new(succeeded)}, []scheduler.Run{acknowledged})
 	require.Equal(t, succeeded.ID, status.LastRun.ID)
 	require.Empty(t, status.LastError)
 	// A real retry of the older run becomes the latest execution.
-	failed.StartedAt = new(now.Add(time.Second))
-	failed.Attempts = []scheduler.Attempt{{Number: 2, StartedAt: *failed.StartedAt}}
-	runtime.ApplyRunStatus(&status, []scheduler.Run{failed})
-	require.Equal(t, failed.ID, status.LastRun.ID)
+	retried := scheduler.Run{
+		ID:            acknowledged.ID,
+		EnvironmentID: acknowledged.EnvironmentID,
+		Status:        acknowledged.Status,
+		CreatedAt:     acknowledged.CreatedAt,
+		UpdatedAt:     acknowledged.UpdatedAt,
+		StartedAt:     new(now.Add(time.Second)),
+		Outcome:       acknowledged.Outcome,
+		Attempts:      []scheduler.Attempt{{Number: 2, StartedAt: now.Add(time.Second)}},
+	}
+	status = runtime.ApplyRunStatus(status, []scheduler.Run{retried})
+	require.Equal(t, retried.ID, status.LastRun.ID)
 	require.Equal(t, "clone failed", status.LastError)
 	// Merge the same run's terminal revision before choosing an active run.
-	status.CurrentRun = new(succeeded)
-	status.CurrentRun.Status = scheduler.Running
-	succeeded.UpdatedAt = now.Add(2 * time.Second)
-	runtime.ApplyRunStatus(&status, []scheduler.Run{succeeded})
+	status = runtime.ApplyRunStatus(
+		jobschedule.JobStatus{
+			CurrentRun: &scheduler.Run{
+				ID:            succeeded.ID,
+				EnvironmentID: succeeded.EnvironmentID,
+				Status:        scheduler.Running,
+				CreatedAt:     succeeded.CreatedAt,
+				UpdatedAt:     succeeded.UpdatedAt,
+				FinishedAt:    succeeded.FinishedAt,
+			},
+			LastRun:     status.LastRun,
+			LastSuccess: status.LastSuccess,
+			LastError:   status.LastError,
+		},
+		[]scheduler.Run{{
+			ID:            succeeded.ID,
+			EnvironmentID: succeeded.EnvironmentID,
+			Status:        succeeded.Status,
+			CreatedAt:     succeeded.CreatedAt,
+			UpdatedAt:     now.Add(2 * time.Second),
+			FinishedAt:    succeeded.FinishedAt,
+		}},
+	)
 	require.Nil(t, status.CurrentRun)
-	failed.Status = scheduler.Running
-	failed.UpdatedAt = now.Add(2 * time.Hour)
-	runtime.ApplyRunStatus(&status, []scheduler.Run{failed})
-	require.Equal(t, failed.ID, status.CurrentRun.ID)
+	running := scheduler.Run{
+		ID:            retried.ID,
+		EnvironmentID: retried.EnvironmentID,
+		Status:        scheduler.Running,
+		CreatedAt:     retried.CreatedAt,
+		UpdatedAt:     now.Add(2 * time.Hour),
+		StartedAt:     retried.StartedAt,
+		Outcome:       retried.Outcome,
+		Attempts:      retried.Attempts,
+	}
+	status = runtime.ApplyRunStatus(status, []scheduler.Run{running})
+	require.Equal(t, running.ID, status.CurrentRun.ID)
 	require.Empty(t, status.LastError)
 
 	// A later manual failure stays visible while older work waits to retry.
-	retrying := failed
-	retrying.Status = scheduler.Retrying
-	retrying.NextAttempt = new(now.Add(time.Hour))
-	manualFailure := failed
-	manualFailure.ID = "manual-failure"
-	manualFailure.Status = scheduler.Failed
-	manualFailure.CreatedAt = now.Add(time.Minute)
-	manualFailure.StartedAt = nil
-	manualFailure.Attempts = nil
-	manualFailure.Outcome.Message = "latest manual failure"
-	succeeded.CreatedAt = now.Add(2 * time.Minute)
+	retrying := scheduler.Run{
+		ID:            running.ID,
+		EnvironmentID: running.EnvironmentID,
+		Status:        scheduler.Retrying,
+		CreatedAt:     running.CreatedAt,
+		UpdatedAt:     running.UpdatedAt,
+		StartedAt:     running.StartedAt,
+		NextAttempt:   new(now.Add(time.Hour)),
+		Outcome:       running.Outcome,
+		Attempts:      running.Attempts,
+	}
+	manualFailure := scheduler.Run{
+		ID:            "manual-failure",
+		EnvironmentID: running.EnvironmentID,
+		Status:        scheduler.Failed,
+		CreatedAt:     now.Add(time.Minute),
+		UpdatedAt:     running.UpdatedAt,
+		Outcome:       scheduler.Outcome{Status: running.Outcome.Status, Message: "latest manual failure"},
+	}
+	laterSuccess := scheduler.Run{
+		ID:            succeeded.ID,
+		EnvironmentID: succeeded.EnvironmentID,
+		Status:        succeeded.Status,
+		CreatedAt:     now.Add(2 * time.Minute),
+		UpdatedAt:     now.Add(2 * time.Second),
+		FinishedAt:    succeeded.FinishedAt,
+	}
 	for _, history := range [][]scheduler.Run{{retrying, manualFailure}, {manualFailure, retrying}} {
-		status = jobschedule.JobStatus{}
-		runtime.ApplyRunStatus(&status, history)
+		status = runtime.ApplyRunStatus(jobschedule.JobStatus{}, history)
 		require.Equal(t, retrying.ID, status.CurrentRun.ID)
 		require.Equal(t, manualFailure.ID, status.LastRun.ID)
 		require.Equal(t, manualFailure.Outcome.Message, status.LastError)
-		runtime.ApplyRunStatus(&status, []scheduler.Run{succeeded})
+		status = runtime.ApplyRunStatus(status, []scheduler.Run{laterSuccess})
 		require.Empty(t, status.LastError)
 	}
 
 	cloneErr := errors.New("failed to clone repository: network is unreachable")
-	outcome, runErr := classifyOutcomeInternal("gitops-sync:project", scheduler.Outcome{}, cloneErr)
+	outcome, runErr := classifyOutcome("gitops-sync:project", scheduler.Outcome{}, cloneErr)
 	require.ErrorIs(t, runErr, cloneErr)
 	require.Equal(t, scheduler.Failed, outcome.Status)
-	outcome, runErr = classifyOutcomeInternal("environment-health:0", scheduler.Outcome{}, context.DeadlineExceeded)
+	outcome, runErr = classifyOutcome("environment-health:0", scheduler.Outcome{}, context.DeadlineExceeded)
 	require.ErrorIs(t, runErr, context.DeadlineExceeded)
 	require.Equal(t, scheduler.Retrying, outcome.Status)
-	outcome, runErr = classifyOutcomeInternal("auto-update", scheduler.Outcome{Status: scheduler.Partial}, cloneErr)
+	outcome, runErr = classifyOutcome("auto-update", scheduler.Outcome{Status: scheduler.Partial}, cloneErr)
 	require.ErrorIs(t, runErr, cloneErr)
 	require.Equal(t, scheduler.Partial, outcome.Status)
 }
 
 func TestJobService_ListJobs_ImageUpdateWatcherIsContinuousAndRespectsEnabled(t *testing.T) {
 	ctx := t.Context()
-	db := setupSettingsTestDBInternal(t)
+	db := setupSettingsTestDB(t)
 
-	settingsSvc, err := newSettingsServiceForTestInternal(t, ctx, db)
+	settingsSvc, err := newSettingsServiceForTest(t, ctx, db)
 	require.NoError(t, err)
 	require.NoError(t, settingsSvc.SetBoolSetting(ctx, "pollingEnabled", false))
 
-	jobSvc := newJobServiceForTestInternal(t, db, settingsSvc, &config.Config{})
+	jobSvc := newJobServiceForTest(t, db, settingsSvc, &config.Config{})
 	jobs, err := jobSvc.ListJobs(ctx)
 	require.NoError(t, err)
 
-	watcher := findJobStatusByIDInternal(t, jobs.Jobs, "image-polling")
+	watcher := findJobStatusByID(t, jobs.Jobs, "image-polling")
 	require.Equal(t, "Image Update Watcher", watcher.Name)
 	require.Equal(t, "0 0 * * * *", watcher.Schedule)
 	require.Equal(t, "pollingInterval", watcher.SettingsKey)
@@ -270,13 +339,13 @@ func TestJobService_ListJobs_ImageUpdateWatcherIsContinuousAndRespectsEnabled(t 
 
 func TestJobService_UpdateJobSchedules_ReschedulesChangedJob(t *testing.T) {
 	ctx := t.Context()
-	db := setupSettingsTestDBInternal(t)
+	db := setupSettingsTestDB(t)
 
-	settingsSvc, err := newSettingsServiceForTestInternal(t, ctx, db)
+	settingsSvc, err := newSettingsServiceForTest(t, ctx, db)
 	require.NoError(t, err)
 
-	jobSvc := newJobServiceForTestInternal(t, db, settingsSvc, &config.Config{})
-	fakeScheduler := newFakeJobSchedulerInternal("auto-update")
+	jobSvc := newJobServiceForTest(t, db, settingsSvc, &config.Config{})
+	fakeScheduler := newFakeJobScheduler("auto-update")
 	jobSvc.SetScheduler(ctx, fakeScheduler)
 
 	_, err = jobSvc.UpdateJobSchedules(ctx, jobschedule.Update{
@@ -289,13 +358,13 @@ func TestJobService_UpdateJobSchedules_ReschedulesChangedJob(t *testing.T) {
 
 func TestJobService_UpdateJobSchedules_DeprecatedPollingIntervalDoesNotReschedule(t *testing.T) {
 	ctx := t.Context()
-	db := setupSettingsTestDBInternal(t)
+	db := setupSettingsTestDB(t)
 
-	settingsSvc, err := newSettingsServiceForTestInternal(t, ctx, db)
+	settingsSvc, err := newSettingsServiceForTest(t, ctx, db)
 	require.NoError(t, err)
 
-	jobSvc := newJobServiceForTestInternal(t, db, settingsSvc, &config.Config{})
-	fakeScheduler := newFakeJobSchedulerInternal("auto-update")
+	jobSvc := newJobServiceForTest(t, db, settingsSvc, &config.Config{})
+	fakeScheduler := newFakeJobScheduler("auto-update")
 	jobSvc.SetScheduler(ctx, fakeScheduler)
 
 	updated, err := jobSvc.UpdateJobSchedules(ctx, jobschedule.Update{
@@ -308,17 +377,17 @@ func TestJobService_UpdateJobSchedules_DeprecatedPollingIntervalDoesNotReschedul
 
 func TestJobService_UpdateJobSchedules_UsesLifecycleContextForReschedule(t *testing.T) {
 	ctx := t.Context()
-	db := setupSettingsTestDBInternal(t)
+	db := setupSettingsTestDB(t)
 
-	settingsSvc, err := newSettingsServiceForTestInternal(t, ctx, db)
+	settingsSvc, err := newSettingsServiceForTest(t, ctx, db)
 	require.NoError(t, err)
 
 	type lifecycleContextKey struct{}
 	lifecycleCtx := context.WithValue(t.Context(), lifecycleContextKey{}, true)
 	requestCtx, cancelRequest := context.WithCancel(t.Context())
 
-	jobSvc := newJobServiceForTestInternal(t, db, settingsSvc, &config.Config{})
-	fakeScheduler := newFakeJobSchedulerInternal("auto-update")
+	jobSvc := newJobServiceForTest(t, db, settingsSvc, &config.Config{})
+	fakeScheduler := newFakeJobScheduler("auto-update")
 	jobSvc.SetScheduler(lifecycleCtx, fakeScheduler)
 
 	_, err = jobSvc.UpdateJobSchedules(requestCtx, jobschedule.Update{
@@ -335,15 +404,15 @@ func TestJobService_UpdateJobSchedules_UsesLifecycleContextForReschedule(t *test
 
 func TestJobService_UpdateJobSchedules_RejectsInvalidCronWithoutChangingSetting(t *testing.T) {
 	ctx := t.Context()
-	db := setupSettingsTestDBInternal(t)
+	db := setupSettingsTestDB(t)
 
-	settingsSvc, err := newSettingsServiceForTestInternal(t, ctx, db)
+	settingsSvc, err := newSettingsServiceForTest(t, ctx, db)
 	require.NoError(t, err)
 	require.NoError(t, settingsSvc.EnsureDefaultSettings(ctx))
 	require.NoError(t, settingsSvc.LoadDatabaseSettings(ctx))
 
-	jobSvc := newJobServiceForTestInternal(t, db, settingsSvc, &config.Config{})
-	fakeScheduler := newFakeJobSchedulerInternal()
+	jobSvc := newJobServiceForTest(t, db, settingsSvc, &config.Config{})
+	fakeScheduler := newFakeJobScheduler()
 	jobSvc.SetScheduler(ctx, fakeScheduler)
 
 	_, err = jobSvc.UpdateJobSchedules(ctx, jobschedule.Update{
@@ -356,12 +425,12 @@ func TestJobService_UpdateJobSchedules_RejectsInvalidCronWithoutChangingSetting(
 
 func TestJobService_UpdateJobSchedules_UnchangedScheduleDoesNotReschedule(t *testing.T) {
 	ctx := t.Context()
-	db := setupSettingsTestDBInternal(t)
+	db := setupSettingsTestDB(t)
 
-	settingsSvc, err := newSettingsServiceForTestInternal(t, ctx, db)
+	settingsSvc, err := newSettingsServiceForTest(t, ctx, db)
 	require.NoError(t, err)
 
-	jobSvc := newJobServiceForTestInternal(t, db, settingsSvc, &config.Config{})
+	jobSvc := newJobServiceForTest(t, db, settingsSvc, &config.Config{})
 	updated, err := jobSvc.UpdateJobSchedules(ctx, jobschedule.Update{
 		PollingInterval: new("0 0 * * * *"),
 	})
@@ -371,16 +440,19 @@ func TestJobService_UpdateJobSchedules_UnchangedScheduleDoesNotReschedule(t *tes
 
 func TestJobService_UpdateJobSchedules_RestoresPreviousScheduleWhenRescheduleFails(t *testing.T) {
 	ctx := t.Context()
-	db := setupSettingsTestDBInternal(t)
+	db := setupSettingsTestDB(t)
 
-	settingsSvc, err := newSettingsServiceForTestInternal(t, ctx, db)
+	settingsSvc, err := newSettingsServiceForTest(t, ctx, db)
 	require.NoError(t, err)
 	require.NoError(t, settingsSvc.EnsureDefaultSettings(ctx))
 	require.NoError(t, settingsSvc.LoadDatabaseSettings(ctx))
 
-	jobSvc := newJobServiceForTestInternal(t, db, settingsSvc, &config.Config{})
-	fakeScheduler := newFakeJobSchedulerInternal("auto-update")
-	fakeScheduler.rescheduleErr = errors.New("scheduler unavailable")
+	jobSvc := newJobServiceForTest(t, db, settingsSvc, &config.Config{})
+	fakeScheduler := &fakeJobScheduler{
+		jobs:          map[string]scheduler.Job{"auto-update": fakeJob{name: "auto-update"}},
+		runtimeStates: map[string]scheduler.JobRuntimeState{},
+		rescheduleErr: errors.New("scheduler unavailable"),
+	}
 	jobSvc.SetScheduler(ctx, fakeScheduler)
 
 	_, err = jobSvc.UpdateJobSchedules(ctx, jobschedule.Update{
@@ -396,13 +468,13 @@ func TestJobService_UpdateJobSchedules_RestoresPreviousScheduleWhenRescheduleFai
 
 func TestJobService_UpdateJobSchedules_SkipsManagerOnlyJobsInAgentMode(t *testing.T) {
 	ctx := t.Context()
-	db := setupSettingsTestDBInternal(t)
+	db := setupSettingsTestDB(t)
 
-	settingsSvc, err := newSettingsServiceForTestInternal(t, ctx, db)
+	settingsSvc, err := newSettingsServiceForTest(t, ctx, db)
 	require.NoError(t, err)
 
-	jobSvc := newJobServiceForTestInternal(t, db, settingsSvc, &config.Config{AgentMode: true})
-	fakeScheduler := newFakeJobSchedulerInternal("environment-health")
+	jobSvc := newJobServiceForTest(t, db, settingsSvc, &config.Config{AgentMode: true})
+	fakeScheduler := newFakeJobScheduler("environment-health")
 	jobSvc.SetScheduler(ctx, fakeScheduler)
 
 	_, err = jobSvc.UpdateJobSchedules(ctx, jobschedule.Update{
@@ -415,17 +487,17 @@ func TestJobService_UpdateJobSchedules_SkipsManagerOnlyJobsInAgentMode(t *testin
 
 func TestJobService_UpdateJobSchedules_DelegatesEnvironmentHealthReschedule(t *testing.T) {
 	ctx := t.Context()
-	db := setupSettingsTestDBInternal(t)
+	db := setupSettingsTestDB(t)
 
-	settingsSvc, err := newSettingsServiceForTestInternal(t, ctx, db)
+	settingsSvc, err := newSettingsServiceForTest(t, ctx, db)
 	require.NoError(t, err)
 
-	jobSvc := newJobServiceForTestInternal(t, db, settingsSvc, &config.Config{})
-	fakeScheduler := newFakeJobSchedulerInternal()
+	jobSvc := newJobServiceForTest(t, db, settingsSvc, &config.Config{})
+	fakeScheduler := newFakeJobScheduler()
 	jobSvc.SetScheduler(ctx, fakeScheduler)
 
 	rescheduled := 0
-	jobSvc.OnEnvironmentHealthReschedule = func(context.Context) {
+	jobSvc.OnEnvironmentHealthReschedule = func(context.Context) { // keep: bootstrap wires this callback after construction
 		rescheduled++
 	}
 
@@ -439,18 +511,26 @@ func TestJobService_UpdateJobSchedules_DelegatesEnvironmentHealthReschedule(t *t
 
 func TestJobService_Submit_PersistsImageUpdateWatcherRun(t *testing.T) {
 	ctx := t.Context()
-	db := setupSettingsTestDBInternal(t)
-	settingsSvc, err := newSettingsServiceForTestInternal(t, ctx, db)
+	db := setupSettingsTestDB(t)
+	settingsSvc, err := newSettingsServiceForTest(t, ctx, db)
 	require.NoError(t, err)
-	fakeScheduler := newFakeJobSchedulerInternal()
-	jobSvc := newJobServiceForTestInternal(t, db, settingsSvc, &config.Config{})
+	fakeScheduler := newFakeJobScheduler()
+	jobSvc := newJobServiceForTest(t, db, settingsSvc, &config.Config{})
 	jobSvc.SetScheduler(ctx, fakeScheduler)
 	require.NoError(t, db.AutoMigrate(&userdomain.User{}, &role.Role{}, &role.UserRoleAssignment{}))
 	require.NoError(t, db.Create(&userdomain.User{Username: "operator", BaseModel: database.BaseModel{ID: "operator"}}).Error)
-	require.NoError(t, db.Create(&role.Role{ID: "jobs-manager", Name: "Jobs manager", Permissions: database.StringSlice{authz.PermJobsManage}}).Error)
+	require.NoError(t, db.Create(&role.Role{
+		ID:          "jobs-manager",
+		Name:        "Jobs manager",
+		Permissions: database.StringSlice{authz.PermJobsManage},
+	}).Error)
 	require.NoError(t, db.Create(&role.UserRoleAssignment{UserID: "operator", RoleID: "jobs-manager"}).Error)
-	jobSvc.roles = role.NewRoleService(db)
-	run, err := jobSvc.Submit(ctx, scheduler.Request{JobID: "image-polling", EnvironmentID: "0", Trigger: "manual", RequestedBy: "operator"})
+	run, err := jobSvc.Submit(ctx, scheduler.Request{
+		JobID:         "image-polling",
+		EnvironmentID: "0",
+		Trigger:       "manual",
+		RequestedBy:   "operator",
+	})
 	require.NoError(t, err)
 	require.Equal(t, scheduler.Queued, run.Status)
 	persisted, err := jobSvc.runs.Get(ctx, "0", "image-polling", run.ID)
@@ -459,7 +539,7 @@ func TestJobService_Submit_PersistsImageUpdateWatcherRun(t *testing.T) {
 	require.Empty(t, fakeScheduler.busWatcherRuns)
 }
 
-func findJobStatusByIDInternal(t *testing.T, jobs []jobschedule.JobStatus, id string) jobschedule.JobStatus {
+func findJobStatusByID(t *testing.T, jobs []jobschedule.JobStatus, id string) jobschedule.JobStatus {
 	t.Helper()
 
 	for _, job := range jobs {
@@ -471,7 +551,7 @@ func findJobStatusByIDInternal(t *testing.T, jobs []jobschedule.JobStatus, id st
 	return jobschedule.JobStatus{}
 }
 
-type fakeJobSchedulerInternal struct {
+type fakeJobScheduler struct {
 	jobs               map[string]scheduler.Job
 	runtimeStates      map[string]scheduler.JobRuntimeState
 	rescheduled        []string
@@ -481,29 +561,29 @@ type fakeJobSchedulerInternal struct {
 	busWatcherContexts []context.Context
 }
 
-func newFakeJobSchedulerInternal(jobIDs ...string) *fakeJobSchedulerInternal {
+func newFakeJobScheduler(jobIDs ...string) *fakeJobScheduler {
 	jobs := make(map[string]scheduler.Job, len(jobIDs))
 	for _, jobID := range jobIDs {
-		jobs[jobID] = fakeJobInternal{name: jobID}
+		jobs[jobID] = fakeJob{name: jobID}
 	}
 
-	return &fakeJobSchedulerInternal{
+	return &fakeJobScheduler{
 		jobs:          jobs,
 		runtimeStates: make(map[string]scheduler.JobRuntimeState),
 	}
 }
 
-func (s *fakeJobSchedulerInternal) GetJob(jobID string) (scheduler.Job, bool) {
+func (s *fakeJobScheduler) GetJob(jobID string) (scheduler.Job, bool) {
 	job, ok := s.jobs[jobID]
 	return job, ok
 }
 
-func (s *fakeJobSchedulerInternal) GetJobRuntimeState(jobID string) (scheduler.JobRuntimeState, bool) {
+func (s *fakeJobScheduler) GetJobRuntimeState(jobID string) (scheduler.JobRuntimeState, bool) {
 	state, ok := s.runtimeStates[jobID]
 	return state, ok
 }
 
-func (s *fakeJobSchedulerInternal) RescheduleJob(ctx context.Context, job scheduler.Job) error {
+func (s *fakeJobScheduler) RescheduleJob(ctx context.Context, job scheduler.Job) error {
 	s.rescheduled = append(s.rescheduled, job.Name())
 	s.rescheduleContexts = append(s.rescheduleContexts, ctx)
 	if s.rescheduleErr != nil {
@@ -517,44 +597,58 @@ func (s *fakeJobSchedulerInternal) RescheduleJob(ctx context.Context, job schedu
 	return nil
 }
 
-func (s *fakeJobSchedulerInternal) RunBusWatcherNow(ctx context.Context, watcherID string) error {
+func (s *fakeJobScheduler) RunBusWatcherNow(ctx context.Context, watcherID string) error {
 	s.busWatcherRuns = append(s.busWatcherRuns, watcherID)
 	s.busWatcherContexts = append(s.busWatcherContexts, ctx)
 	return nil
 }
 
-type fakeJobInternal struct {
+type fakeJob struct {
 	name string
 }
 
-func (j fakeJobInternal) Name() string {
+func (j fakeJob) Name() string {
 	return j.name
 }
 
-func (j fakeJobInternal) Schedule(context.Context) string {
+func (j fakeJob) Schedule(context.Context) string {
 	return "0 0 0 * * *"
 }
 
-func (j fakeJobInternal) Run(context.Context) (scheduler.Outcome, error) {
+func (j fakeJob) Run(context.Context) (scheduler.Outcome, error) {
 	return scheduler.Outcome{Status: scheduler.Succeeded}, nil
 }
 
-func newJobActivityTestServiceInternal(t *testing.T) (*JobService, *activity.ActivityService, *database.DB) {
+func newJobActivityTestService(t *testing.T) (*JobService, *activity.ActivityService, *database.DB) {
 	t.Helper()
-	db := setupSettingsTestDBInternal(t)
+	db := setupSettingsTestDB(t)
 	sqlDB, err := db.DB.DB()
 	require.NoError(t, err)
 	sqlDB.SetMaxOpenConns(1)
-	require.NoError(t, db.AutoMigrate(&activity.Activity{}, &activity.ActivityMessage{}))
+	settingsService, err := newSettingsServiceForTest(t, t.Context(), db)
+	require.NoError(t, err)
 	activities := activity.NewActivityService(db, nil)
-	svc := NewJobService(db, nil, &config.Config{}, newJobCoordinatorForTestInternal(t, db), nil, nil, activities)
+	svc := NewJobService(
+		db,
+		settingsService,
+		&config.Config{},
+		newJobCoordinatorForTest(t, db),
+		role.NewRoleService(db),
+		environment.NewEnvironmentService(db, nil, nil, nil, nil, nil),
+		activities,
+	)
+	svc.SetScheduler(t.Context(), newFakeJobScheduler())
 	return svc, activities, db
 }
 
 func TestJobActivityLifecycle(t *testing.T) {
-	svc, activities, db := newJobActivityTestServiceInternal(t)
+	svc, activities, db := newJobActivityTestService(t)
 	ctx := t.Context()
-	run, err := svc.runs.Submit(ctx, scheduler.Request{JobID: "auto-update", RunID: "b6d679c2-bdf5-4af1-985f-49c468983ba0", Trigger: "scheduled"})
+	run, err := svc.runs.Submit(ctx, scheduler.Request{
+		JobID:   "auto-update",
+		RunID:   "b6d679c2-bdf5-4af1-985f-49c468983ba0",
+		Trigger: "scheduled",
+	})
 	require.NoError(t, err)
 	activityID, err := uuid.Parse(run.ActivityID)
 	require.NoError(t, err)
@@ -569,14 +663,50 @@ func TestJobActivityLifecycle(t *testing.T) {
 		require.Equal(t, run.ID, *detail.Activity.BatchID)
 	}
 	check(activitytypes.StatusQueued, scheduler.Queued)
-	duplicate, err := svc.runs.Submit(ctx, scheduler.Request{JobID: run.JobID, RunID: run.ID, Trigger: "scheduled"})
+	duplicate, err := svc.runs.Submit(ctx, scheduler.Request{
+		JobID:   run.JobID,
+		RunID:   run.ID,
+		Trigger: "scheduled",
+	})
 	require.NoError(t, err)
 	require.Equal(t, run.ActivityID, duplicate.ActivityID)
 	for _, status := range []scheduler.RunStatus{scheduler.Running, scheduler.Waiting, scheduler.Failed} {
 		require.NoError(t, svc.runs.UpdateRun(ctx, run, func(current *scheduler.Run) error {
-			current.Status = status
-			current.UpdatedAt = time.Now().UTC()
-			current.Outcome = scheduler.Outcome{Status: status, Message: "operation detail"}
+			*current = scheduler.Run{ //exhaustruct:enforce
+				ActivityEnvironmentID: current.ActivityEnvironmentID,
+				ActivityID:            current.ActivityID,
+				Resolution:            current.Resolution,
+				RequestedWithKey:      current.RequestedWithKey,
+				ID:                    current.ID,
+				JobID:                 current.JobID,
+				EnvironmentID:         current.EnvironmentID,
+				Trigger:               current.Trigger,
+				RequestedBy:           current.RequestedBy,
+				Status:                status,
+				CreatedAt:             current.CreatedAt,
+				UpdatedAt:             time.Now().UTC(),
+				StartedAt:             current.StartedAt,
+				FinishedAt:            current.FinishedAt,
+				NextAttempt:           current.NextAttempt,
+				AttemptCount:          current.AttemptCount,
+				Owner:                 current.Owner,
+				Outcome: scheduler.Outcome{ //exhaustruct:enforce
+					Status:     status,
+					Message:    "operation detail",
+					ActivityID: "",
+					Targets:    nil,
+					Steps:      nil,
+				},
+				Attempts:                current.Attempts,
+				RemoteDeliveryAttempted: current.RemoteDeliveryAttempted,
+				RemoteOutcome:           current.RemoteOutcome,
+				RemoteRetryRequested:    current.RemoteRetryRequested,
+				RemoteRetryAttempted:    current.RemoteRetryAttempted,
+				RemoteAttemptCount:      current.RemoteAttemptCount,
+				RemoteAccepted:          current.RemoteAccepted,
+				RemoteSettled:           current.RemoteSettled,
+				LastConfirmedAt:         current.LastConfirmedAt,
+			}
 			return nil
 		}))
 	}
@@ -588,8 +718,35 @@ func TestJobActivityLifecycle(t *testing.T) {
 	later, err := svc.runs.Submit(ctx, scheduler.Request{JobID: run.JobID, Trigger: "scheduled"})
 	require.NoError(t, err)
 	require.NoError(t, svc.runs.UpdateRun(ctx, later, func(current *scheduler.Run) error {
-		current.Status = scheduler.Succeeded
-		current.UpdatedAt = time.Now().UTC()
+		*current = scheduler.Run{ //exhaustruct:enforce
+			ActivityEnvironmentID:   current.ActivityEnvironmentID,
+			ActivityID:              current.ActivityID,
+			Resolution:              current.Resolution,
+			RequestedWithKey:        current.RequestedWithKey,
+			ID:                      current.ID,
+			JobID:                   current.JobID,
+			EnvironmentID:           current.EnvironmentID,
+			Trigger:                 current.Trigger,
+			RequestedBy:             current.RequestedBy,
+			Status:                  scheduler.Succeeded,
+			CreatedAt:               current.CreatedAt,
+			UpdatedAt:               time.Now().UTC(),
+			StartedAt:               current.StartedAt,
+			FinishedAt:              current.FinishedAt,
+			NextAttempt:             current.NextAttempt,
+			AttemptCount:            current.AttemptCount,
+			Owner:                   current.Owner,
+			Outcome:                 current.Outcome,
+			Attempts:                current.Attempts,
+			RemoteDeliveryAttempted: current.RemoteDeliveryAttempted,
+			RemoteOutcome:           current.RemoteOutcome,
+			RemoteRetryRequested:    current.RemoteRetryRequested,
+			RemoteRetryAttempted:    current.RemoteRetryAttempted,
+			RemoteAttemptCount:      current.RemoteAttemptCount,
+			RemoteAccepted:          current.RemoteAccepted,
+			RemoteSettled:           current.RemoteSettled,
+			LastConfirmedAt:         current.LastConfirmedAt,
+		}
 		return nil
 	}))
 	failedDetail, err = activities.GetActivityDetail(ctx, "0", run.ActivityID, 10)
@@ -603,8 +760,35 @@ func TestJobActivityLifecycle(t *testing.T) {
 	require.ErrorIs(t, err, activity.ErrActivityNotCancelable)
 	check(activitytypes.StatusQueued, scheduler.Queued)
 	require.NoError(t, svc.runs.UpdateRun(ctx, run, func(current *scheduler.Run) error {
-		current.Status = scheduler.NeedsAttention
-		current.UpdatedAt = time.Now().UTC()
+		*current = scheduler.Run{ //exhaustruct:enforce
+			ActivityEnvironmentID:   current.ActivityEnvironmentID,
+			ActivityID:              current.ActivityID,
+			Resolution:              current.Resolution,
+			RequestedWithKey:        current.RequestedWithKey,
+			ID:                      current.ID,
+			JobID:                   current.JobID,
+			EnvironmentID:           current.EnvironmentID,
+			Trigger:                 current.Trigger,
+			RequestedBy:             current.RequestedBy,
+			Status:                  scheduler.NeedsAttention,
+			CreatedAt:               current.CreatedAt,
+			UpdatedAt:               time.Now().UTC(),
+			StartedAt:               current.StartedAt,
+			FinishedAt:              current.FinishedAt,
+			NextAttempt:             current.NextAttempt,
+			AttemptCount:            current.AttemptCount,
+			Owner:                   current.Owner,
+			Outcome:                 current.Outcome,
+			Attempts:                current.Attempts,
+			RemoteDeliveryAttempted: current.RemoteDeliveryAttempted,
+			RemoteOutcome:           current.RemoteOutcome,
+			RemoteRetryRequested:    current.RemoteRetryRequested,
+			RemoteRetryAttempted:    current.RemoteRetryAttempted,
+			RemoteAttemptCount:      current.RemoteAttemptCount,
+			RemoteAccepted:          current.RemoteAccepted,
+			RemoteSettled:           current.RemoteSettled,
+			LastConfirmedAt:         current.LastConfirmedAt,
+		}
 		return nil
 	}))
 	_, err = svc.runs.Resolve(ctx, "0", run.JobID, run.ID, "operator")
@@ -616,24 +800,78 @@ func TestJobActivityLifecycle(t *testing.T) {
 }
 
 func TestJobActivityVisibilityAndGrouping(t *testing.T) {
-	svc, activities, _ := newJobActivityTestServiceInternal(t)
+	svc, activities, _ := newJobActivityTestService(t)
 	for _, test := range []struct {
 		job, trigger, environment string
 		visible                   bool
 	}{
-		{"auto-update", "scheduled", "0", true},
-		{"gitops-sync:project", "scheduled", "0", true},
-		{"volume-backup:volume", "recovery", "0", true},
-		{"system-backup:system", "scheduled", "0", true},
-		{"image-polling", "manual", "0", true},
-		{"auto-update", "manual", "remote", true},
-		{"auto-update", "remote", "0", false},
-		{"image-polling", "scheduled", "0", false},
-		{"environment-health:0", "scheduled", "0", false},
-		{"activity-sweep", "scheduled", "0", false},
+		{
+			job:         "auto-update",
+			trigger:     "scheduled",
+			environment: "0",
+			visible:     true,
+		},
+		{
+			job:         "gitops-sync:project",
+			trigger:     "scheduled",
+			environment: "0",
+			visible:     true,
+		},
+		{
+			job:         "volume-backup:volume",
+			trigger:     "recovery",
+			environment: "0",
+			visible:     true,
+		},
+		{
+			job:         "system-backup:system",
+			trigger:     "scheduled",
+			environment: "0",
+			visible:     true,
+		},
+		{
+			job:         "image-polling",
+			trigger:     "manual",
+			environment: "0",
+			visible:     true,
+		},
+		{
+			job:         "auto-update",
+			trigger:     "manual",
+			environment: "remote",
+			visible:     true,
+		},
+		{
+			job:         "auto-update",
+			trigger:     "remote",
+			environment: "0",
+			visible:     false,
+		},
+		{
+			job:         "image-polling",
+			trigger:     "scheduled",
+			environment: "0",
+			visible:     false,
+		},
+		{
+			job:         "environment-health:0",
+			trigger:     "scheduled",
+			environment: "0",
+			visible:     false,
+		},
+		{
+			job:         "activity-sweep",
+			trigger:     "scheduled",
+			environment: "0",
+			visible:     false,
+		},
 	} {
 		t.Run(test.job+"/"+test.trigger+"/"+test.environment, func(t *testing.T) {
-			run, err := svc.runs.Submit(t.Context(), scheduler.Request{JobID: test.job, Trigger: test.trigger, EnvironmentID: test.environment})
+			run, err := svc.runs.Submit(t.Context(), scheduler.Request{
+				JobID:         test.job,
+				Trigger:       test.trigger,
+				EnvironmentID: test.environment,
+			})
 			require.NoError(t, err)
 			require.Equal(t, test.visible, run.ActivityID != "")
 			if test.visible {
@@ -650,20 +888,61 @@ func TestJobActivityVisibilityAndGrouping(t *testing.T) {
 }
 
 func TestJobActivityRestartRepairsFailedProjection(t *testing.T) {
-	svc, activities, db := newJobActivityTestServiceInternal(t)
+	svc, activities, db := newJobActivityTestService(t)
 	ctx := t.Context()
 	require.NoError(t, db.Migrator().DropTable(&activity.ActivityMessage{}, &activity.Activity{}))
 	run, err := svc.runs.Submit(ctx, scheduler.Request{JobID: "auto-update", Trigger: "scheduled"})
 	require.NoError(t, err, "activity failure must not reject accepted work")
 	require.NotEmpty(t, run.ActivityID)
 	require.NoError(t, svc.runs.UpdateRun(ctx, run, func(current *scheduler.Run) error {
-		current.Status = scheduler.NeedsAttention
-		current.Outcome = scheduler.Outcome{Message: "interrupted before applying updates"}
-		current.UpdatedAt = time.Now().UTC()
+		*current = scheduler.Run{ //exhaustruct:enforce
+			ActivityEnvironmentID: current.ActivityEnvironmentID,
+			ActivityID:            current.ActivityID,
+			Resolution:            current.Resolution,
+			RequestedWithKey:      current.RequestedWithKey,
+			ID:                    current.ID,
+			JobID:                 current.JobID,
+			EnvironmentID:         current.EnvironmentID,
+			Trigger:               current.Trigger,
+			RequestedBy:           current.RequestedBy,
+			Status:                scheduler.NeedsAttention,
+			CreatedAt:             current.CreatedAt,
+			UpdatedAt:             time.Now().UTC(),
+			StartedAt:             current.StartedAt,
+			FinishedAt:            current.FinishedAt,
+			NextAttempt:           current.NextAttempt,
+			AttemptCount:          current.AttemptCount,
+			Owner:                 current.Owner,
+			Outcome: scheduler.Outcome{ //exhaustruct:enforce
+				Status:     "",
+				Message:    "interrupted before applying updates",
+				ActivityID: "",
+				Targets:    nil,
+				Steps:      nil,
+			},
+			Attempts:                current.Attempts,
+			RemoteDeliveryAttempted: current.RemoteDeliveryAttempted,
+			RemoteOutcome:           current.RemoteOutcome,
+			RemoteRetryRequested:    current.RemoteRetryRequested,
+			RemoteRetryAttempted:    current.RemoteRetryAttempted,
+			RemoteAttemptCount:      current.RemoteAttemptCount,
+			RemoteAccepted:          current.RemoteAccepted,
+			RemoteSettled:           current.RemoteSettled,
+			LastConfirmedAt:         current.LastConfirmedAt,
+		}
 		return nil
 	}))
 	require.NoError(t, db.AutoMigrate(&activity.Activity{}, &activity.ActivityMessage{}))
-	restarted := NewJobService(db, nil, &config.Config{}, svc.runs, nil, nil, activities)
+	restarted := NewJobService(
+		db,
+		svc.settings,
+		&config.Config{},
+		svc.runs,
+		role.NewRoleService(db),
+		environment.NewEnvironmentService(db, nil, nil, nil, nil, nil),
+		activities,
+	)
+	restarted.SetScheduler(ctx, newFakeJobScheduler())
 	require.NoError(t, restarted.runs.Start(ctx, ctx))
 	t.Cleanup(func() {
 		stopCtx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), time.Second)
@@ -689,24 +968,52 @@ func TestJobActivityRestartRepairsFailedProjection(t *testing.T) {
 
 func TestResolveRemoteRunConfirmsOwnerAfterLostResponse(t *testing.T) {
 	for _, automatic := range []bool{false, true} {
-		name := "legacy operator"
-		if automatic {
-			name = "automatic settlement"
-		}
-		t.Run(name, func(t *testing.T) {
-			db := setupSettingsTestDBInternal(t)
+		t.Run(kit.Ternary(automatic, "automatic settlement", "legacy operator"), func(t *testing.T) {
+			db := setupSettingsTestDB(t)
 			require.NoError(t, db.AutoMigrate(&environment.Environment{}))
-			q := newJobCoordinatorForTestInternal(t, db)
-			local, err := q.Submit(t.Context(), scheduler.Request{JobID: "auto-update", EnvironmentID: "remote", Trigger: "scheduled"})
+			q := newJobCoordinatorForTest(t, db)
+			local, err := q.Submit(t.Context(), scheduler.Request{
+				JobID:         "auto-update",
+				EnvironmentID: "remote",
+				Trigger:       "scheduled",
+			})
 			require.NoError(t, err)
 			require.NoError(t, q.UpdateRun(t.Context(), local, func(run *scheduler.Run) error {
-				run.Status = scheduler.NeedsAttention
-				if automatic {
-					run.Status = scheduler.Running
+				*run = scheduler.Run{ //exhaustruct:enforce
+					ActivityEnvironmentID: run.ActivityEnvironmentID,
+					ActivityID:            run.ActivityID,
+					Resolution:            run.Resolution,
+					RequestedWithKey:      run.RequestedWithKey,
+					ID:                    run.ID,
+					JobID:                 run.JobID,
+					EnvironmentID:         run.EnvironmentID,
+					Trigger:               run.Trigger,
+					RequestedBy:           run.RequestedBy,
+					Status:                kit.Ternary(automatic, scheduler.Running, scheduler.NeedsAttention),
+					CreatedAt:             run.CreatedAt,
+					UpdatedAt:             run.UpdatedAt,
+					StartedAt:             run.StartedAt,
+					FinishedAt:            run.FinishedAt,
+					NextAttempt:           run.NextAttempt,
+					AttemptCount:          run.AttemptCount,
+					Owner:                 run.Owner,
+					Outcome: scheduler.Outcome{ //exhaustruct:enforce
+						Status:     scheduler.NeedsAttention,
+						Message:    "original failure",
+						ActivityID: "",
+						Targets:    nil,
+						Steps:      nil,
+					},
+					Attempts:                run.Attempts,
+					RemoteDeliveryAttempted: true,
+					RemoteOutcome:           run.RemoteOutcome,
+					RemoteRetryRequested:    run.RemoteRetryRequested,
+					RemoteRetryAttempted:    run.RemoteRetryAttempted,
+					RemoteAttemptCount:      run.RemoteAttemptCount,
+					RemoteAccepted:          true,
+					RemoteSettled:           run.RemoteSettled,
+					LastConfirmedAt:         run.LastConfirmedAt,
 				}
-				run.RemoteAccepted = true
-				run.RemoteDeliveryAttempted = true
-				run.Outcome = scheduler.Outcome{Status: scheduler.NeedsAttention, Message: "original failure"}
 				return nil
 			}))
 			agentRun := scheduler.Run{
@@ -740,13 +1047,72 @@ func TestResolveRemoteRunConfirmsOwnerAfterLostResponse(t *testing.T) {
 						ResolvedBy string `json:"resolvedBy"`
 					}
 					assert.NoError(t, json.UnmarshalRead(r.Body, &body))
-					agentRun.Status = scheduler.Canceled
-					agentRun.Resolution = &scheduler.RunResolution{ResolvedBy: body.ResolvedBy, ResolvedAt: time.Now().UTC(), Reason: "resolved_after_review"}
+					agentRun = scheduler.Run{ //exhaustruct:enforce
+						ActivityEnvironmentID: agentRun.ActivityEnvironmentID,
+						ActivityID:            agentRun.ActivityID,
+						Resolution: &scheduler.RunResolution{
+							ResolvedBy: body.ResolvedBy,
+							ResolvedAt: time.Now().UTC(),
+							Reason:     "resolved_after_review",
+						},
+						RequestedWithKey:        agentRun.RequestedWithKey,
+						ID:                      agentRun.ID,
+						JobID:                   agentRun.JobID,
+						EnvironmentID:           agentRun.EnvironmentID,
+						Trigger:                 agentRun.Trigger,
+						RequestedBy:             agentRun.RequestedBy,
+						Status:                  scheduler.Canceled,
+						CreatedAt:               agentRun.CreatedAt,
+						UpdatedAt:               agentRun.UpdatedAt,
+						StartedAt:               agentRun.StartedAt,
+						FinishedAt:              agentRun.FinishedAt,
+						NextAttempt:             agentRun.NextAttempt,
+						AttemptCount:            agentRun.AttemptCount,
+						Owner:                   agentRun.Owner,
+						Outcome:                 agentRun.Outcome,
+						Attempts:                agentRun.Attempts,
+						RemoteDeliveryAttempted: agentRun.RemoteDeliveryAttempted,
+						RemoteOutcome:           agentRun.RemoteOutcome,
+						RemoteRetryRequested:    agentRun.RemoteRetryRequested,
+						RemoteRetryAttempted:    agentRun.RemoteRetryAttempted,
+						RemoteAttemptCount:      agentRun.RemoteAttemptCount,
+						RemoteAccepted:          agentRun.RemoteAccepted,
+						RemoteSettled:           agentRun.RemoteSettled,
+						LastConfirmedAt:         agentRun.LastConfirmedAt,
+					}
 					http.Error(w, "lost response", http.StatusServiceUnavailable)
 					return
 				case strings.HasSuffix(r.URL.Path, "/ack"):
 					acknowledgements++
-					agentRun.RemoteSettled = true
+					agentRun = scheduler.Run{ //exhaustruct:enforce
+						ActivityEnvironmentID:   agentRun.ActivityEnvironmentID,
+						ActivityID:              agentRun.ActivityID,
+						Resolution:              agentRun.Resolution,
+						RequestedWithKey:        agentRun.RequestedWithKey,
+						ID:                      agentRun.ID,
+						JobID:                   agentRun.JobID,
+						EnvironmentID:           agentRun.EnvironmentID,
+						Trigger:                 agentRun.Trigger,
+						RequestedBy:             agentRun.RequestedBy,
+						Status:                  agentRun.Status,
+						CreatedAt:               agentRun.CreatedAt,
+						UpdatedAt:               agentRun.UpdatedAt,
+						StartedAt:               agentRun.StartedAt,
+						FinishedAt:              agentRun.FinishedAt,
+						NextAttempt:             agentRun.NextAttempt,
+						AttemptCount:            agentRun.AttemptCount,
+						Owner:                   agentRun.Owner,
+						Outcome:                 agentRun.Outcome,
+						Attempts:                agentRun.Attempts,
+						RemoteDeliveryAttempted: agentRun.RemoteDeliveryAttempted,
+						RemoteOutcome:           agentRun.RemoteOutcome,
+						RemoteRetryRequested:    agentRun.RemoteRetryRequested,
+						RemoteRetryAttempted:    agentRun.RemoteRetryAttempted,
+						RemoteAttemptCount:      agentRun.RemoteAttemptCount,
+						RemoteAccepted:          agentRun.RemoteAccepted,
+						RemoteSettled:           true,
+						LastConfirmedAt:         agentRun.LastConfirmedAt,
+					}
 					if automatic && acknowledgements == 1 {
 						http.Error(w, "lost acknowledgement", http.StatusServiceUnavailable)
 						return
@@ -762,9 +1128,24 @@ func TestResolveRemoteRunConfirmsOwnerAfterLostResponse(t *testing.T) {
 				assert.NoError(t, writeErr)
 			}))
 			defer server.Close()
-			require.NoError(t, db.Create(&environment.Environment{ID: "remote", Name: "agent", ApiUrl: server.URL, Enabled: true}).Error)
+			require.NoError(t, db.Create(&environment.Environment{
+				ID:      "remote",
+				Name:    "agent",
+				ApiUrl:  server.URL,
+				Enabled: true,
+			}).Error)
 			environments := environment.NewEnvironmentService(db, server.Client(), nil, nil, nil, nil)
-			svc := &JobService{runs: q, environment: environments, remote: remote.New(q, nil, environments)}
+			settingsService, err := newSettingsServiceForTest(t, t.Context(), db)
+			require.NoError(t, err)
+			svc := NewJobService(
+				db,
+				settingsService,
+				&config.Config{},
+				q,
+				role.NewRoleService(db),
+				environments,
+				activity.NewActivityService(db, nil),
+			)
 			ctx := context.WithValue(t.Context(), middleware.ContextKeyUserPermissions, authz.EnvironmentPermissionSet("remote"))
 			path := "/api/environments/0/jobs/auto-update/runs/" + local.ID
 			if !automatic {
@@ -776,7 +1157,35 @@ func TestResolveRemoteRunConfirmsOwnerAfterLostResponse(t *testing.T) {
 				require.Equal(t, scheduler.Waiting, outcome.Status)
 			}
 			require.Zero(t, mutations)
-			agentRun.Status = scheduler.NeedsAttention
+			agentRun = scheduler.Run{ //exhaustruct:enforce
+				ActivityEnvironmentID:   agentRun.ActivityEnvironmentID,
+				ActivityID:              agentRun.ActivityID,
+				Resolution:              agentRun.Resolution,
+				RequestedWithKey:        agentRun.RequestedWithKey,
+				ID:                      agentRun.ID,
+				JobID:                   agentRun.JobID,
+				EnvironmentID:           agentRun.EnvironmentID,
+				Trigger:                 agentRun.Trigger,
+				RequestedBy:             agentRun.RequestedBy,
+				Status:                  scheduler.NeedsAttention,
+				CreatedAt:               agentRun.CreatedAt,
+				UpdatedAt:               agentRun.UpdatedAt,
+				StartedAt:               agentRun.StartedAt,
+				FinishedAt:              agentRun.FinishedAt,
+				NextAttempt:             agentRun.NextAttempt,
+				AttemptCount:            agentRun.AttemptCount,
+				Owner:                   agentRun.Owner,
+				Outcome:                 agentRun.Outcome,
+				Attempts:                agentRun.Attempts,
+				RemoteDeliveryAttempted: agentRun.RemoteDeliveryAttempted,
+				RemoteOutcome:           agentRun.RemoteOutcome,
+				RemoteRetryRequested:    agentRun.RemoteRetryRequested,
+				RemoteRetryAttempted:    agentRun.RemoteRetryAttempted,
+				RemoteAttemptCount:      agentRun.RemoteAttemptCount,
+				RemoteAccepted:          agentRun.RemoteAccepted,
+				RemoteSettled:           agentRun.RemoteSettled,
+				LastConfirmedAt:         agentRun.LastConfirmedAt,
+			}
 			if !automatic {
 				_, err = svc.ResolveRun(ctx, "remote", local.JobID, local.ID, "operator")
 				require.Error(t, err)
@@ -806,25 +1215,104 @@ func TestResolveRemoteRunConfirmsOwnerAfterLostResponse(t *testing.T) {
 				require.Equal(t, scheduler.Failed, stored.RemoteOutcome.Status)
 				require.Equal(t, user.SystemUser.Username, stored.Resolution.ResolvedBy)
 				require.NoError(t, q.UpdateRun(ctx, stored, func(current *scheduler.Run) error {
-					current.Status = scheduler.Failed
+					*current = scheduler.Run{ //exhaustruct:enforce
+						ActivityEnvironmentID:   current.ActivityEnvironmentID,
+						ActivityID:              current.ActivityID,
+						Resolution:              current.Resolution,
+						RequestedWithKey:        current.RequestedWithKey,
+						ID:                      current.ID,
+						JobID:                   current.JobID,
+						EnvironmentID:           current.EnvironmentID,
+						Trigger:                 current.Trigger,
+						RequestedBy:             current.RequestedBy,
+						Status:                  scheduler.Failed,
+						CreatedAt:               current.CreatedAt,
+						UpdatedAt:               current.UpdatedAt,
+						StartedAt:               current.StartedAt,
+						FinishedAt:              current.FinishedAt,
+						NextAttempt:             current.NextAttempt,
+						AttemptCount:            current.AttemptCount,
+						Owner:                   current.Owner,
+						Outcome:                 current.Outcome,
+						Attempts:                current.Attempts,
+						RemoteDeliveryAttempted: current.RemoteDeliveryAttempted,
+						RemoteOutcome:           current.RemoteOutcome,
+						RemoteRetryRequested:    current.RemoteRetryRequested,
+						RemoteRetryAttempted:    current.RemoteRetryAttempted,
+						RemoteAttemptCount:      current.RemoteAttemptCount,
+						RemoteAccepted:          current.RemoteAccepted,
+						RemoteSettled:           current.RemoteSettled,
+						LastConfirmedAt:         current.LastConfirmedAt,
+					}
 					return nil
 				}))
 				_, retryErr := svc.RetryRun(ctx, "remote", local.JobID, local.ID)
 				require.ErrorContains(t, retryErr, "upgrade the agent")
-				agentRun.Status = scheduler.Failed
+				agentRun = scheduler.Run{ //exhaustruct:enforce
+					ActivityEnvironmentID:   agentRun.ActivityEnvironmentID,
+					ActivityID:              agentRun.ActivityID,
+					Resolution:              agentRun.Resolution,
+					RequestedWithKey:        agentRun.RequestedWithKey,
+					ID:                      agentRun.ID,
+					JobID:                   agentRun.JobID,
+					EnvironmentID:           agentRun.EnvironmentID,
+					Trigger:                 agentRun.Trigger,
+					RequestedBy:             agentRun.RequestedBy,
+					Status:                  scheduler.Failed,
+					CreatedAt:               agentRun.CreatedAt,
+					UpdatedAt:               agentRun.UpdatedAt,
+					StartedAt:               agentRun.StartedAt,
+					FinishedAt:              agentRun.FinishedAt,
+					NextAttempt:             agentRun.NextAttempt,
+					AttemptCount:            agentRun.AttemptCount,
+					Owner:                   agentRun.Owner,
+					Outcome:                 agentRun.Outcome,
+					Attempts:                agentRun.Attempts,
+					RemoteDeliveryAttempted: agentRun.RemoteDeliveryAttempted,
+					RemoteOutcome:           agentRun.RemoteOutcome,
+					RemoteRetryRequested:    agentRun.RemoteRetryRequested,
+					RemoteRetryAttempted:    agentRun.RemoteRetryAttempted,
+					RemoteAttemptCount:      agentRun.RemoteAttemptCount,
+					RemoteAccepted:          agentRun.RemoteAccepted,
+					RemoteSettled:           agentRun.RemoteSettled,
+					LastConfirmedAt:         agentRun.LastConfirmedAt,
+				}
 				retried, retryErr := svc.RetryRun(ctx, "remote", local.JobID, local.ID)
 				require.NoError(t, retryErr)
 				require.Equal(t, scheduler.Queued, retried.Status)
 				require.Equal(t, local.ID, retried.ID)
 
 				// Adopt agent-owned history without coalescing its explicit identity.
-				agentOwned := agentRun
-				agentOwned.ID = "d7a9a3c7-d364-4c36-831a-381249e5727e"
-				agentOwned.Status = scheduler.NeedsAttention
-				agentOwned.CreatedAt = time.Now().UTC().Add(-time.Hour)
-				agentOwned.FinishedAt = new(agentOwned.CreatedAt.Add(time.Minute))
-				agentOwned.ActivityID = "agent-summary"
-				agentOwned.RemoteSettled = false
+				createdAt := time.Now().UTC().Add(-time.Hour)
+				agentOwned := scheduler.Run{ //exhaustruct:enforce
+					ActivityEnvironmentID:   agentRun.ActivityEnvironmentID,
+					ActivityID:              "agent-summary",
+					Resolution:              agentRun.Resolution,
+					RequestedWithKey:        agentRun.RequestedWithKey,
+					ID:                      "d7a9a3c7-d364-4c36-831a-381249e5727e",
+					JobID:                   agentRun.JobID,
+					EnvironmentID:           agentRun.EnvironmentID,
+					Trigger:                 agentRun.Trigger,
+					RequestedBy:             agentRun.RequestedBy,
+					Status:                  scheduler.NeedsAttention,
+					CreatedAt:               createdAt,
+					UpdatedAt:               agentRun.UpdatedAt,
+					StartedAt:               agentRun.StartedAt,
+					FinishedAt:              new(createdAt.Add(time.Minute)),
+					NextAttempt:             agentRun.NextAttempt,
+					AttemptCount:            agentRun.AttemptCount,
+					Owner:                   agentRun.Owner,
+					Outcome:                 agentRun.Outcome,
+					Attempts:                agentRun.Attempts,
+					RemoteDeliveryAttempted: agentRun.RemoteDeliveryAttempted,
+					RemoteOutcome:           agentRun.RemoteOutcome,
+					RemoteRetryRequested:    agentRun.RemoteRetryRequested,
+					RemoteRetryAttempted:    agentRun.RemoteRetryAttempted,
+					RemoteAttemptCount:      agentRun.RemoteAttemptCount,
+					RemoteAccepted:          agentRun.RemoteAccepted,
+					RemoteSettled:           false,
+					LastConfirmedAt:         agentRun.LastConfirmedAt,
+				}
 				catalog := []jobschedule.JobStatus{{ID: "updates", Children: []jobschedule.JobStatus{{ID: agentOwned.JobID, LastRun: &agentOwned}}}}
 				require.NoError(t, svc.remote.ReconcileLegacyCatalog(ctx, "remote", catalog))
 				require.NoError(t, svc.remote.ReconcileLegacyCatalog(ctx, "remote", catalog))
@@ -837,8 +1325,7 @@ func TestResolveRemoteRunConfirmsOwnerAfterLostResponse(t *testing.T) {
 				require.Equal(t, agentOwned.FinishedAt, adopted.FinishedAt)
 				require.Equal(t, agentOwned.ActivityID, adopted.ActivityID)
 				require.Equal(t, "remote", adopted.ActivityEnvironmentID)
-				status := jobschedule.JobStatus{LastRun: &agentOwned}
-				runtime.ApplyRunStatus(&status, []scheduler.Run{adopted})
+				status := runtime.ApplyRunStatus(jobschedule.JobStatus{LastRun: &agentOwned}, []scheduler.Run{adopted})
 				require.Nil(t, status.CurrentRun)
 				require.Equal(t, scheduler.Failed, status.LastRun.Status)
 				require.Equal(t, "original failure", status.LastError)
@@ -862,13 +1349,48 @@ func TestResolveRemoteRunConfirmsOwnerAfterLostResponse(t *testing.T) {
 }
 
 func TestResolveRunChecksCurrentOperatorPermission(t *testing.T) {
-	db := setupSettingsTestDBInternal(t)
-	svc := &JobService{runs: newJobCoordinatorForTestInternal(t, db)}
+	db := setupSettingsTestDB(t)
+	settingsService, err := newSettingsServiceForTest(t, t.Context(), db)
+	require.NoError(t, err)
+	svc := newJobServiceForTest(t, db, settingsService, &config.Config{})
 	run, err := svc.runs.Submit(t.Context(), scheduler.Request{JobID: "auto-update", Trigger: "scheduled"})
 	require.NoError(t, err)
 	require.NoError(t, svc.runs.UpdateRun(t.Context(), run, func(current *scheduler.Run) error {
-		current.Status = scheduler.NeedsAttention
-		current.Outcome = scheduler.Outcome{Status: scheduler.NeedsAttention, Message: "interrupted"}
+		*current = scheduler.Run{ //exhaustruct:enforce
+			ActivityEnvironmentID: current.ActivityEnvironmentID,
+			ActivityID:            current.ActivityID,
+			Resolution:            current.Resolution,
+			RequestedWithKey:      current.RequestedWithKey,
+			ID:                    current.ID,
+			JobID:                 current.JobID,
+			EnvironmentID:         current.EnvironmentID,
+			Trigger:               current.Trigger,
+			RequestedBy:           current.RequestedBy,
+			Status:                scheduler.NeedsAttention,
+			CreatedAt:             current.CreatedAt,
+			UpdatedAt:             current.UpdatedAt,
+			StartedAt:             current.StartedAt,
+			FinishedAt:            current.FinishedAt,
+			NextAttempt:           current.NextAttempt,
+			AttemptCount:          current.AttemptCount,
+			Owner:                 current.Owner,
+			Outcome: scheduler.Outcome{ //exhaustruct:enforce
+				Status:     scheduler.NeedsAttention,
+				Message:    "interrupted",
+				ActivityID: "",
+				Targets:    nil,
+				Steps:      nil,
+			},
+			Attempts:                current.Attempts,
+			RemoteDeliveryAttempted: current.RemoteDeliveryAttempted,
+			RemoteOutcome:           current.RemoteOutcome,
+			RemoteRetryRequested:    current.RemoteRetryRequested,
+			RemoteRetryAttempted:    current.RemoteRetryAttempted,
+			RemoteAttemptCount:      current.RemoteAttemptCount,
+			RemoteAccepted:          current.RemoteAccepted,
+			RemoteSettled:           current.RemoteSettled,
+			LastConfirmedAt:         current.LastConfirmedAt,
+		}
 		return nil
 	}))
 	_, err = svc.ResolveRun(t.Context(), "0", "auto-update", run.ID, "operator")

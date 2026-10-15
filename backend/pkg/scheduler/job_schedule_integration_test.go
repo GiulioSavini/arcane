@@ -11,11 +11,16 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 
+	"github.com/getarcaneapp/arcane/backend/v2/internal/activity"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/config"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/database"
+	"github.com/getarcaneapp/arcane/backend/v2/internal/environment"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/job"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/kv"
+	"github.com/getarcaneapp/arcane/backend/v2/internal/role"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/settings"
+	"github.com/getarcaneapp/arcane/backend/v2/pkg/scheduler/runs"
+	francistest "github.com/getarcaneapp/arcane/backend/v2/pkg/utils/francis/testing"
 )
 
 func TestDeprecatedImagePollingSchedulePersistsWithoutRuntimeJob(t *testing.T) {
@@ -27,7 +32,19 @@ func TestDeprecatedImagePollingSchedulePersistsWithoutRuntimeJob(t *testing.T) {
 	lifecycleCtx, cancelLifecycle := context.WithCancel(t.Context())
 	jobScheduler := newJobSchedulerForTestInternal(t, lifecycleCtx, appConfig.GetLocation())
 
-	jobService := job.NewJobService(db, settingsService, appConfig, jobScheduler.coordinator, nil, nil, nil)
+	jobRuntime := francistest.New(t)
+	jobCoordinator := runs.New(kv.NewKVService(db), jobRuntime.Service(), appConfig.GetLocation())
+	require.NoError(t, jobCoordinator.Register(jobRuntime))
+	francistest.Start(t, jobRuntime)
+	jobService := job.NewJobService(
+		db,
+		settingsService,
+		appConfig,
+		jobCoordinator,
+		role.NewRoleService(db),
+		environment.NewEnvironmentService(db, nil, nil, nil, nil, nil),
+		activity.NewActivityService(db, settingsService),
+	)
 	jobService.SetScheduler(lifecycleCtx, jobScheduler)
 	require.NoError(t, jobScheduler.StartScheduler(t.Context()))
 
@@ -66,7 +83,19 @@ func TestDeprecatedImagePollingSchedulePersistsWithoutRuntimeJob(t *testing.T) {
 	restartDB, restartSettingsService := openJobScheduleTestDatabaseInternal(t, ctx, databasePath)
 	restartLifecycleCtx, cancelRestartLifecycle := context.WithCancel(t.Context())
 	restartScheduler := newJobSchedulerForTestInternal(t, restartLifecycleCtx, appConfig.GetLocation())
-	restartJobService := job.NewJobService(restartDB, restartSettingsService, appConfig, restartScheduler.coordinator, nil, nil, nil)
+	restartRuntime := francistest.New(t)
+	restartCoordinator := runs.New(kv.NewKVService(restartDB), restartRuntime.Service(), appConfig.GetLocation())
+	require.NoError(t, restartCoordinator.Register(restartRuntime))
+	francistest.Start(t, restartRuntime)
+	restartJobService := job.NewJobService(
+		restartDB,
+		restartSettingsService,
+		appConfig,
+		restartCoordinator,
+		role.NewRoleService(restartDB),
+		environment.NewEnvironmentService(restartDB, nil, nil, nil, nil, nil),
+		activity.NewActivityService(restartDB, restartSettingsService),
+	)
 	restartJobService.SetScheduler(restartLifecycleCtx, restartScheduler)
 	require.NoError(t, restartScheduler.StartScheduler(t.Context()))
 	t.Cleanup(func() {

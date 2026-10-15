@@ -1,6 +1,7 @@
 package job
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"net/http"
@@ -10,6 +11,7 @@ import (
 	"github.com/getarcaneapp/arcane/types/v2/base"
 	"github.com/getarcaneapp/arcane/types/v2/jobschedule"
 	"github.com/getarcaneapp/arcane/types/v2/scheduler"
+	"go.getarcane.app/kit/pkg"
 
 	"github.com/getarcaneapp/arcane/backend/v2/internal/middleware"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/scheduler/runs"
@@ -54,39 +56,43 @@ type JobSchedulesHandler struct {
 }
 
 func (h *JobSchedulesHandler) ListJobs(ctx context.Context, input *ListJobsInput) (*GetJobsOutput, error) {
-	var jobs *jobschedule.JobListResponse
-	var err error
-	if input.ID != "0" {
-		jobs, err = h.jobService.ListRemoteJobs(ctx, input.ID)
-	} else {
-		jobs, err = h.jobService.ListJobs(ctx)
-	}
+	jobs, err := func() (*jobschedule.JobListResponse, error) {
+		if input.ID != "0" {
+			return h.jobService.ListRemoteJobs(ctx, input.ID)
+		}
+		return h.jobService.ListJobs(ctx)
+	}()
 	if err != nil {
-		return nil, jobHTTPErrorInternal(err)
+		return nil, jobHTTPError(err)
 	}
 	return &GetJobsOutput{Body: *jobs}, nil
 }
 
 func (h *JobSchedulesHandler) RunJob(ctx context.Context, input *RunJobInput) (*RunJobOutput, error) {
-	runID := input.RequestID
-	if input.Body != nil && input.Body.RunID != "" {
-		if runID != "" && runID != input.Body.RunID {
-			return nil, huma.Error400BadRequest("Conflicting run IDs")
-		}
-		runID = input.Body.RunID
+	if kit.FromPtr(input.Body).RunID != "" && input.RequestID != "" && input.RequestID != kit.FromPtr(input.Body).RunID {
+		return nil, huma.Error400BadRequest("Conflicting run IDs")
 	}
 	userID, _ := middleware.GetUserIDFromContext(ctx)
 	keyID, _ := ctx.Value(middleware.ContextKeyApiKeyID).(string)
-	trigger := "manual"
-	if h.jobService.cfg.AgentMode && userID == "agent" {
-		userID = ""
-		trigger = "remote"
-	}
-	run, err := h.jobService.Submit(ctx, scheduler.Request{RunID: runID, JobID: input.JobID, EnvironmentID: input.ID, Trigger: trigger, RequestedBy: userID, RequestedWithKey: keyID})
+	run, err := h.jobService.Submit(ctx, scheduler.Request{
+		RunID:            cmp.Or(kit.FromPtr(input.Body).RunID, input.RequestID),
+		JobID:            input.JobID,
+		EnvironmentID:    input.ID,
+		Trigger:          kit.Ternary(h.jobService.cfg.AgentMode && userID == "agent", "remote", "manual"),
+		RequestedWithKey: keyID,
+		RequestedBy:      kit.Ternary(h.jobService.cfg.AgentMode && userID == "agent", "", userID),
+	})
 	if err != nil {
-		return nil, jobHTTPErrorInternal(err)
+		return nil, jobHTTPError(err)
 	}
-	return &RunJobOutput{Body: jobschedule.JobRunResponse{Success: true, Message: "Job accepted", RunID: run.ID, Status: run.Status}}, nil
+	return &RunJobOutput{
+		Body: jobschedule.JobRunResponse{
+			Success: true,
+			Message: "Job accepted",
+			RunID:   run.ID,
+			Status:  run.Status,
+		},
+	}, nil
 }
 
 func (h *JobSchedulesHandler) Get(ctx context.Context, input *GetJobSchedulesInput) (*GetJobSchedulesOutput, error) {
@@ -130,7 +136,7 @@ func (h *JobSchedulesHandler) Update(ctx context.Context, input *UpdateJobSchedu
 func (h *JobSchedulesHandler) ListRuns(ctx context.Context, input *jobschedule.ListRunsInput) (*jobschedule.ListRunsOutput, error) {
 	result, err := h.jobService.ListRuns(ctx, input.ID, input.JobID, input.Page, input.Limit)
 	if err != nil {
-		return nil, jobHTTPErrorInternal(err)
+		return nil, jobHTTPError(err)
 	}
 	return &jobschedule.ListRunsOutput{Body: result}, nil
 }
@@ -140,7 +146,7 @@ func (h *JobSchedulesHandler) ListRuns(ctx context.Context, input *jobschedule.L
 func (h *JobSchedulesHandler) GetRun(ctx context.Context, input *jobschedule.RunInput) (*jobschedule.RunOutput, error) {
 	result, err := h.jobService.GetRun(ctx, input.ID, input.JobID, input.RunID)
 	if err != nil {
-		return nil, jobHTTPErrorInternal(err)
+		return nil, jobHTTPError(err)
 	}
 	return &jobschedule.RunOutput{Body: result}, nil
 }
@@ -150,7 +156,7 @@ func (h *JobSchedulesHandler) GetRun(ctx context.Context, input *jobschedule.Run
 func (h *JobSchedulesHandler) RetryRun(ctx context.Context, input *jobschedule.RunInput) (*jobschedule.RunOutput, error) {
 	result, err := h.jobService.RetryRun(ctx, input.ID, input.JobID, input.RunID)
 	if err != nil {
-		return nil, jobHTTPErrorInternal(err)
+		return nil, jobHTTPError(err)
 	}
 	return &jobschedule.RunOutput{Body: result}, nil
 }
@@ -160,7 +166,7 @@ func (h *JobSchedulesHandler) RetryRun(ctx context.Context, input *jobschedule.R
 func (h *JobSchedulesHandler) CancelRun(ctx context.Context, input *jobschedule.RunInput) (*jobschedule.RunOutput, error) {
 	result, err := h.jobService.CancelRun(ctx, input.ID, input.JobID, input.RunID)
 	if err != nil {
-		return nil, jobHTTPErrorInternal(err)
+		return nil, jobHTTPError(err)
 	}
 	return &jobschedule.RunOutput{Body: result}, nil
 }
@@ -170,19 +176,46 @@ func (h *JobSchedulesHandler) CancelRun(ctx context.Context, input *jobschedule.
 func (h *JobSchedulesHandler) AcknowledgeRun(ctx context.Context, input *jobschedule.RunInput) (*jobschedule.RunOutput, error) {
 	result, err := h.jobService.GetRun(ctx, input.ID, input.JobID, input.RunID)
 	if err != nil {
-		return nil, jobHTTPErrorInternal(err)
+		return nil, jobHTTPError(err)
 	}
 	err = h.jobService.runs.UpdateRun(ctx, result, func(current *scheduler.Run) error {
 		if !current.Status.Terminal() {
 			return errors.New("run is not terminal")
 		}
-		current.RemoteSettled = true
-		current.UpdatedAt = time.Now().UTC()
+		*current = scheduler.Run{ //exhaustruct:enforce
+			ActivityEnvironmentID:   current.ActivityEnvironmentID,
+			ActivityID:              current.ActivityID,
+			Resolution:              current.Resolution,
+			RequestedWithKey:        current.RequestedWithKey,
+			ID:                      current.ID,
+			JobID:                   current.JobID,
+			EnvironmentID:           current.EnvironmentID,
+			Trigger:                 current.Trigger,
+			RequestedBy:             current.RequestedBy,
+			Status:                  current.Status,
+			CreatedAt:               current.CreatedAt,
+			UpdatedAt:               time.Now().UTC(),
+			StartedAt:               current.StartedAt,
+			FinishedAt:              current.FinishedAt,
+			NextAttempt:             current.NextAttempt,
+			AttemptCount:            current.AttemptCount,
+			Owner:                   current.Owner,
+			Outcome:                 current.Outcome,
+			Attempts:                current.Attempts,
+			RemoteDeliveryAttempted: current.RemoteDeliveryAttempted,
+			RemoteOutcome:           current.RemoteOutcome,
+			RemoteRetryRequested:    current.RemoteRetryRequested,
+			RemoteRetryAttempted:    current.RemoteRetryAttempted,
+			RemoteAttemptCount:      current.RemoteAttemptCount,
+			RemoteAccepted:          current.RemoteAccepted,
+			RemoteSettled:           true,
+			LastConfirmedAt:         current.LastConfirmedAt,
+		}
 		result = *current
 		return nil
 	})
 	if err != nil {
-		return nil, jobHTTPErrorInternal(err)
+		return nil, jobHTTPError(err)
 	}
 	return &jobschedule.RunOutput{Body: result}, nil
 }
@@ -202,12 +235,17 @@ func (h *JobSchedulesHandler) RestartWorker(ctx context.Context, input *jobsched
 		return nil, huma.Error503ServiceUnavailable("Scheduler unavailable")
 	}
 	if err := workers.RestartWatcher(ctx, input.JobID); err != nil {
-		return nil, jobHTTPErrorInternal(err)
+		return nil, jobHTTPError(err)
 	}
-	return &RunJobOutput{Body: jobschedule.JobRunResponse{Success: true, Message: "Worker restart requested"}}, nil
+	return &RunJobOutput{
+		Body: jobschedule.JobRunResponse{
+			Success: true,
+			Message: "Worker restart requested",
+		},
+	}, nil
 }
 
-func jobHTTPErrorInternal(err error) error {
+func jobHTTPError(err error) error {
 	if _, ok := errors.AsType[huma.StatusError](err); ok {
 		return err
 	}
@@ -233,7 +271,7 @@ func (h *JobSchedulesHandler) ResolveRun(ctx context.Context, input *jobschedule
 	}
 	run, err := h.jobService.ResolveRun(ctx, input.ID, input.JobID, input.RunID, actor)
 	if err != nil {
-		return nil, jobHTTPErrorInternal(err)
+		return nil, jobHTTPError(err)
 	}
 	return &jobschedule.RunOutput{Body: run}, nil
 }

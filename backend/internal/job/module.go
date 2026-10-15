@@ -82,10 +82,7 @@ func RegisterJobSchedules(api huma.API, jobSvc *JobService, envSvc *environment.
 		Tags:          []string{"JobSchedules"},
 		Security:      handlerutil.DefaultOperationSecurity(),
 	}, authz.PermJobsManage, h.RunJob)
-	h.registerRunRoutesInternal(api)
-}
 
-func (h *JobSchedulesHandler) registerRunRoutesInternal(api huma.API) {
 	basePath := "/environments/{id}/jobs/{jobId}"
 	middleware.RegisterWithPermission(
 		api,

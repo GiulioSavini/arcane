@@ -21,6 +21,7 @@ import (
 	"gorm.io/gorm"
 
 	"github.com/getarcaneapp/arcane/backend/v2/api"
+	"github.com/getarcaneapp/arcane/backend/v2/internal/activity"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/auth"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/config"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/container"
@@ -30,6 +31,7 @@ import (
 	"github.com/getarcaneapp/arcane/backend/v2/internal/job"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/kv"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/project"
+	"github.com/getarcaneapp/arcane/backend/v2/internal/role"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/swarm"
 	"github.com/getarcaneapp/arcane/backend/v2/internal/system"
 	"github.com/getarcaneapp/arcane/backend/v2/pkg/libarcane/edge"
@@ -385,7 +387,7 @@ func TestJobSchedulerStopCancelsItsPrivateContext(t *testing.T) {
 	runtime := francistest.New(t)
 	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
 	require.NoError(t, err)
-	require.NoError(t, db.AutoMigrate(&kv.KVEntry{}, &environment.Environment{}, &project.GitOpsSync{}))
+	require.NoError(t, db.AutoMigrate(&kv.KVEntry{}, &environment.Environment{}, &project.GitOpsSync{}, &activity.Activity{}, &activity.ActivityMessage{}))
 	sqlDB, err := db.DB()
 	require.NoError(t, err)
 	sqlDB.SetMaxOpenConns(1)
@@ -401,7 +403,15 @@ func TestJobSchedulerStopCancelsItsPrivateContext(t *testing.T) {
 		OnStop:  runtime.Stop,
 	})
 	t.Cleanup(func() { lifecycle.RequireStop() })
-	jobService := job.NewJobService(&database.DB{DB: db}, nil, &config.Config{}, coordinator, nil, nil, nil)
+	jobService := job.NewJobService(
+		&database.DB{DB: db},
+		nil,
+		&config.Config{},
+		coordinator,
+		role.NewRoleService(&database.DB{DB: db}),
+		environment.NewEnvironmentService(&database.DB{DB: db}, nil, nil, nil, nil, nil),
+		activity.NewActivityService(&database.DB{DB: db}, nil),
+	)
 	gitopsSync := gitops.NewGitOpsSyncService(&database.DB{DB: db}, nil, nil, nil, nil, nil)
 	require.NoError(t, db.Create(&environment.Environment{ID: "0", Name: "Local", Enabled: true}).Error)
 	require.NoError(t, db.Create(&project.GitOpsSync{ID: "overdue", EnvironmentID: "0", AutoSync: true, SyncInterval: 1}).Error)
