@@ -20,16 +20,16 @@ require (
 	github.com/mattn/go-runewidth v0.0.31
 	github.com/muesli/cancelreader v0.2.2
 	github.com/samber/hot v0.13.1
-	github.com/sigstore/sigstore v1.11.0
+	github.com/sigstore/sigstore v1.11.1
 	github.com/sigstore/sigstore-go v1.3.0
 	github.com/spf13/cobra v1.10.2
 	github.com/spf13/pflag v1.0.10
 	github.com/stretchr/testify v1.12.1
 	github.com/theupdateframework/go-tuf/v2 v2.4.2
-	go.getarcane.app/acfs v0.6.2
-	go.getarcane.app/builds v0.4.4
-	go.getarcane.app/docker v0.1.0
-	go.getarcane.app/kit v0.4.1
+	go.getarcane.app/acfs v0.6.3
+	go.getarcane.app/builds v0.4.5
+	go.getarcane.app/docker v0.1.2
+	go.getarcane.app/kit v0.4.2
 	go.yaml.in/yaml/v4 v4.0.0-rc.6
 	google.golang.org/protobuf v1.36.12
 )
@@ -61,7 +61,6 @@ require (
 	github.com/compose-spec/compose-go/v2 v2.16.1 // indirect
 	github.com/containerd/errdefs v1.0.0 // indirect
 	github.com/containerd/errdefs/pkg v0.3.0 // indirect
-	github.com/coreos/go-oidc/v3 v3.21.0 // indirect
 	github.com/cyberphone/json-canonicalization v0.0.0-20241213102144-19d51d7fe467 // indirect
 	github.com/danieljoos/wincred v1.2.3 // indirect
 	github.com/digitorus/pkcs7 v0.0.0-20230818184609-3a137a874352 // indirect
@@ -157,7 +156,6 @@ require (
 	golang.org/x/sys v0.49.0 // indirect
 	golang.org/x/term v0.47.0 // indirect
 	golang.org/x/text v0.43.0 // indirect
-	golang.org/x/time v0.16.0 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20261005182115-fad411399dd8 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20261005182115-fad411399dd8 // indirect
 	google.golang.org/grpc v1.84.0 // indirect

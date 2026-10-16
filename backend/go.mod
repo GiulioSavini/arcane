@@ -24,7 +24,7 @@ require (
 	github.com/coreos/go-oidc/v3 v3.21.0
 	github.com/danielgtaylor/huma/v2 v2.39.1
 	github.com/distribution/reference v0.6.0
-	github.com/docker/cli v29.9.0+incompatible
+	github.com/docker/cli v29.9.1+incompatible
 	github.com/docker/compose/v5 v5.6.0
 	github.com/docker/go-units v0.5.0
 	github.com/fsnotify/fsnotify v1.10.1
@@ -38,7 +38,7 @@ require (
 	github.com/hashicorp/yamux v0.1.2
 	github.com/italypaleale/francis v0.1.1
 	github.com/jwx-go/jwkfetch/v4 v4.0.4
-	github.com/klauspost/compress v1.20.1
+	github.com/klauspost/compress v1.20.3
 	github.com/labstack/echo-otel/v5 v5.0.0
 	github.com/labstack/echo/v5 v5.4.0
 	github.com/lestrrat-go/httprc/v3 v3.0.6
@@ -48,7 +48,7 @@ require (
 	github.com/moby/buildkit v0.34.0
 	github.com/moby/moby/api v1.56.1
 	github.com/moby/moby/client v0.6.2
-	github.com/nicholas-fedor/shoutrrr v0.21.2
+	github.com/nicholas-fedor/shoutrrr v0.22.0
 	github.com/opencontainers/go-digest v1.0.0
 	github.com/opencontainers/image-spec v1.1.1
 	github.com/orandin/slog-gorm v1.4.0
@@ -64,16 +64,16 @@ require (
 	github.com/stretchr/testify v1.12.1
 	github.com/subosito/gotenv v1.6.0
 	github.com/wneessen/go-mail v0.8.1
-	go.getarcane.app/acfs v0.6.2
-	go.getarcane.app/builds v0.4.4
-	go.getarcane.app/docker v0.1.0
-	go.getarcane.app/docker/compat v0.1.3
-	go.getarcane.app/docker/convert v0.3.4
-	go.getarcane.app/kit v0.4.1
-	go.getarcane.app/streams v0.4.5
-	go.getarcane.app/sys/cgroup v0.2.4
-	go.getarcane.app/sys/crypto v0.3.0
-	go.getarcane.app/updater v0.11.7
+	go.getarcane.app/acfs v0.6.3
+	go.getarcane.app/builds v0.4.5
+	go.getarcane.app/docker v0.1.2
+	go.getarcane.app/docker/compat v0.1.4
+	go.getarcane.app/docker/convert v0.3.5
+	go.getarcane.app/kit v0.4.2
+	go.getarcane.app/streams v0.4.6
+	go.getarcane.app/sys/cgroup v0.2.5
+	go.getarcane.app/sys/crypto v0.3.1
+	go.getarcane.app/updater v0.11.8
 	go.opentelemetry.io/contrib/bridges/otelslog v0.21.0
 	go.opentelemetry.io/contrib/exporters/autoexport v0.72.0
 	go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp v0.72.0
@@ -221,7 +221,7 @@ require (
 	github.com/lestrrat-go/option/v3 v3.0.0-alpha1 // indirect
 	github.com/lucasb-eyer/go-colorful v1.4.1 // indirect
 	github.com/lufia/plan9stats v0.0.0-20260802145828-341c2f0c90b5 // indirect
-	github.com/mattn/go-colorable v0.1.15 // indirect
+	github.com/mattn/go-colorable v0.1.16 // indirect
 	github.com/mattn/go-isatty v0.0.24 // indirect
 	github.com/mattn/go-localereader v0.0.1 // indirect
 	github.com/mattn/go-runewidth v0.0.31 // indirect
@@ -282,7 +282,7 @@ require (
 	github.com/tinylib/msgp v1.6.4 // indirect
 	github.com/tklauser/go-sysconf v0.4.0 // indirect
 	github.com/tklauser/numcpus v0.12.0 // indirect
-	github.com/tonistiigi/fsutil v0.0.0-20260819142231-83cac42c1c52 // indirect
+	github.com/tonistiigi/fsutil v0.0.0-20261009124904-c1c5bffae3b5 // indirect
 	github.com/tonistiigi/go-csvvalue v0.0.0-20240814133006-030d3b2625d0 // indirect
 	github.com/tonistiigi/units v0.0.0-20180711220420-6950e57a87ea // indirect
 	github.com/tonistiigi/vt100 v0.0.0-20240514184818-90bafcd6abab // indirect
