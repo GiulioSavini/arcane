@@ -62,6 +62,18 @@ export const LINUX_CAPABILITIES = [
 	'WAKE_ALARM'
 ] as const;
 
+// RFC 1123 hostname: 1-63 character labels, 253 total.
+const HOSTNAME_PATTERN =
+	/^(?!\d+\.\d+\.\d+\.\d+$)(?=.{1,253}$)[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$/;
+
+function hostnameSchema(existingHostname = '') {
+	return z
+		.string()
+		.refine((value) => !value || value === existingHostname || HOSTNAME_PATTERN.test(value), m.container_hostname_invalid())
+		.optional()
+		.default('');
+}
+
 export const containerFormSchema = z.object({
 	name: z.string().min(1, m.container_name_required()),
 	image: z.string().min(1, m.image_is_required()),
@@ -69,6 +81,7 @@ export const containerFormSchema = z.object({
 	entrypoint: z.string().optional().default(''),
 	workingDir: z.string().optional().default(''),
 	user: z.string().optional().default(''),
+	hostname: hostnameSchema(),
 	restartPolicy: z.string().default('no'),
 	restartMaxRetries: z.coerce.number().min(0).default(0),
 	memoryMb: z.coerce.number().min(0).default(0),
@@ -85,6 +98,11 @@ export const containerFormSchema = z.object({
 	healthStartPeriod: z.coerce.number().min(0).default(0),
 	healthRetries: z.coerce.number().min(0).default(0)
 });
+
+// Docker accepts hostnames outside RFC 1123, so an unchanged existing one must not block saving other edits.
+export function editContainerFormSchema(existingHostname = '') {
+	return containerFormSchema.extend({ hostname: hostnameSchema(existingHostname) });
+}
 
 export type ContainerFormSchema = typeof containerFormSchema;
 export type ContainerFormValues = z.infer<ContainerFormSchema>;
@@ -123,6 +141,7 @@ export function emptyContainerFormValues(): ContainerFormValues {
 		entrypoint: '',
 		workingDir: '',
 		user: '',
+		hostname: '',
 		restartPolicy: 'no',
 		restartMaxRetries: 0,
 		memoryMb: 0,
@@ -168,6 +187,7 @@ export function formValuesFromEditConfig(cfg: ContainerEditConfigDto): Container
 		entrypoint: joinShellWords(cfg.entrypoint),
 		workingDir: cfg.workingDir ?? '',
 		user: cfg.user ?? '',
+		hostname: cfg.hostname ?? '',
 		restartPolicy: hc.restartPolicy?.name || 'no',
 		restartMaxRetries: hc.restartPolicy?.maximumRetryCount ?? 0,
 		memoryMb: hc.memory ? Math.round(hc.memory / (1024 * 1024)) : 0,
@@ -372,6 +392,7 @@ export function toCreateRequest(values: ContainerFormValues, rows: ContainerForm
 		entrypoint: values.entrypoint.trim() ? splitShellWords(values.entrypoint.trim()) : undefined,
 		workingDir: values.workingDir.trim() || undefined,
 		user: values.user.trim() || undefined,
+		hostname: values.hostname.trim() || undefined,
 		env: env.length > 0 ? env : undefined,
 		labels: Object.keys(labels).length > 0 ? labels : undefined,
 		healthcheck: buildHealthcheck(values),
@@ -404,6 +425,7 @@ export function toEditRequest(values: ContainerFormValues, rows: ContainerFormRo
 		image: values.image.trim(),
 		workingDir: values.workingDir.trim(),
 		user: values.user.trim(),
+		hostname: values.hostname.trim(),
 		command: splitShellWords(values.command.trim()),
 		entrypoint: splitShellWords(values.entrypoint.trim()),
 		environment: buildEnv(rows),

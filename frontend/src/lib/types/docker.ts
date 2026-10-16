@@ -115,6 +115,7 @@ export interface ContainerEditRequest {
 	image?: string;
 	workingDir?: string;
 	user?: string;
+	hostname?: string;
 	command?: string[];
 	entrypoint?: string[];
 	environment?: string[];
@@ -156,6 +157,7 @@ export interface ContainerEditConfigDto {
 	entrypoint?: string[];
 	workingDir?: string;
 	user?: string;
+	hostname?: string;
 	environment?: string[];
 	labels?: Record<string, string>;
 	healthcheck?: ContainerHealthcheckCreate;
@@ -296,6 +298,7 @@ export interface ContainerConfigDto {
 	entrypoint?: string[];
 	workingDir?: string;
 	user?: string;
+	hostname?: string;
 	healthcheck?: ContainerHealthcheckDto;
 }
 

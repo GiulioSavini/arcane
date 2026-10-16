@@ -758,6 +758,11 @@ type Config struct {
 	// Required: false
 	User string `json:"user,omitempty"`
 
+	// Hostname of the container.
+	//
+	// Required: false
+	Hostname string `json:"hostname,omitempty"`
+
 	// Healthcheck is the container's healthcheck configuration.
 	//
 	// Required: false
@@ -1313,6 +1318,7 @@ func mapInspectConfig(config *container.Config) (Config, map[string]string, stri
 		Entrypoint: append([]string{}, config.Entrypoint...),
 		WorkingDir: config.WorkingDir,
 		User:       config.User,
+		Hostname:   config.Hostname,
 	}
 
 	if hc := config.Healthcheck; hc != nil {
@@ -1552,6 +1558,11 @@ type Edit struct {
 	// Required: false
 	User *string `json:"user,omitempty"`
 
+	// Hostname for the container. An empty value clears it.
+	//
+	// Required: false
+	Hostname *string `json:"hostname,omitempty"`
+
 	// Command to run in the container.
 	//
 	// Required: false
@@ -1728,6 +1739,11 @@ type EditConfig struct {
 	// Required: false
 	User string `json:"user,omitempty"`
 
+	// Hostname of the container, omitted when it is the Docker default.
+	//
+	// Required: false
+	Hostname string `json:"hostname,omitempty"`
+
 	// Environment variables of the container.
 	//
 	// Required: false
@@ -1791,6 +1807,9 @@ func NewEditConfigFromInspect(c *container.InspectResponse, isCompose, editDisab
 		cfg.Entrypoint = append([]string{}, c.Config.Entrypoint...)
 		cfg.WorkingDir = c.Config.WorkingDir
 		cfg.User = c.Config.User
+		if len(c.ID) < 12 || c.Config.Hostname != c.ID[:12] {
+			cfg.Hostname = c.Config.Hostname
+		}
 		cfg.Environment = append([]string{}, c.Config.Env...)
 		cfg.Labels = c.Config.Labels
 		cfg.ComposeProject = c.Config.Labels["com.docker.compose.project"]

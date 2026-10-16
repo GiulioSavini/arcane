@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { refreshAll } from '$app/navigation';
-	import { createQuery } from '@tanstack/svelte-query';
+	import { createQuery, useQueryClient } from '@tanstack/svelte-query';
 	import { toast } from 'svelte-sonner';
 
 	import { ArcaneButton } from '#lib/components/arcane-button/index.js';
@@ -16,6 +16,7 @@
 	import type { ContainerDetailsDto } from '#lib/types/docker.js';
 	import { handleApiResultWithCallbacks } from '#lib/utils/api.js';
 	import { hasPermission } from '#lib/utils/auth.js';
+	import { getCustomHostname } from '#lib/utils/docker.js';
 	import { tryCatch } from '#lib/utils/try-catch.js';
 
 	interface Props {
@@ -25,7 +26,9 @@
 
 	let { container, environmentId }: Props = $props();
 
+	const queryClient = useQueryClient();
 	const envId = $derived(environmentId);
+	const customHostname = $derived(getCustomHostname(container));
 	const canConnect = $derived(hasPermission('networks:connect', envId));
 	const canDisconnect = $derived(hasPermission('networks:disconnect', envId));
 
@@ -50,6 +53,13 @@
 			.map((name) => ({ value: name, label: name }))
 	);
 
+	// The loader reads the container through the query cache, so a refresh within its stale window would
+	// reuse the detail fetched just before the change and leave the network list on screen out of date.
+	async function refreshContainer(targetEnvId: string, targetContainerId: string) {
+		await queryClient.invalidateQueries({ queryKey: queryKeys.containers.detail(targetEnvId, targetContainerId) });
+		await refreshAll();
+	}
+
 	async function handleConnect() {
 		if (!connectNetwork) return;
 		connectPending = true;
@@ -73,7 +83,7 @@
 					connectNetwork = '';
 					connectAliases = '';
 					connectIp = '';
-					await refreshAll();
+					await refreshContainer(envId, container.id);
 				})()
 			);
 			await handleApiResultWithCallbacks({ result: operationResult, message: m.network_connect_failed() });
@@ -102,7 +112,7 @@
 									target.environmentId
 								);
 								toast.success(m.network_disconnect_success());
-								await refreshAll();
+								await refreshContainer(target.environmentId, target.containerId);
 							})()
 						);
 						await handleApiResultWithCallbacks({ result: operationResult, message: m.network_disconnect_failed() });
@@ -317,6 +327,20 @@
 						/>
 					</div>
 				</div>
+			{/if}
+
+			{#if customHostname}
+				<Card.Root variant="outlined" size="sm" class="mt-4">
+					<Card.Content class="flex flex-col">
+						<div class="mb-2 text-xs font-semibold text-muted-foreground">{m.hostname()}</div>
+						<div
+							class="cursor-pointer font-mono text-sm font-medium break-all text-foreground select-all"
+							title={m.common_click_to_select()}
+						>
+							{customHostname}
+						</div>
+					</Card.Content>
+				</Card.Root>
 			{/if}
 		</Card.Content>
 	</Card.Root>

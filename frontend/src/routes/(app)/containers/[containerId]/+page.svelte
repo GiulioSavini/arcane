@@ -43,7 +43,7 @@
 	import { runContainerLifecycleAction, confirmAndUpdateContainer } from '#lib/utils/container-actions.js';
 	import { isAutoUpdateLabelDisabled } from '#lib/utils/container-auto-update.js';
 	import { createContainerUpdateActivityTracker } from '#lib/utils/container-update-activities.js';
-	import { calculateMemoryUsage, getThemedIconUrl } from '#lib/utils/docker.js';
+	import { calculateMemoryUsage, getCustomHostname, getThemedIconUrl } from '#lib/utils/docker.js';
 	import { environmentHref, listScopes } from '#lib/utils/environments.js';
 	import { bytes } from '#lib/utils/formatting.js';
 	import { tryCatch } from '#lib/utils/try-catch.js';
@@ -147,7 +147,9 @@
 	const hasNetworks = $derived(
 		!!(container?.networkSettings?.networks && Object.keys(container.networkSettings.networks).length > 0)
 	);
-	const showNetworkTab = $derived(hasNetworks || hasPorts);
+	// A container with a hostname but no networks or ports still has something to show here.
+	const hasCustomHostname = $derived(!!(container && getCustomHostname(container)));
+	const showNetworkTab = $derived(hasNetworks || hasPorts || hasCustomHostname);
 	const hasMounts = $derived(!!(container?.mounts && container.mounts.length > 0));
 	const currentEnvId = $derived(data.envId);
 	const canViewLogs = $derived(hasPermission('containers:logs', currentEnvId));

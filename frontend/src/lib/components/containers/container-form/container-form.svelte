@@ -34,6 +34,7 @@
 		submitting = false,
 		cancelHref = '/containers',
 		environmentId,
+		hostnamePlaceholder = m.container_hostname_placeholder(),
 		onSubmit
 	}: {
 		mode: 'create' | 'edit';
@@ -42,6 +43,7 @@
 		rows: ContainerFormRows;
 		submitting?: boolean;
 		cancelHref?: string;
+		hostnamePlaceholder?: string;
 		onSubmit: () => void;
 	} = $props();
 
@@ -118,9 +120,11 @@
 
 	function handleSubmit() {
 		onSubmit();
-		// Required fields live on the general tab; bring failed validation into view.
+		// Bring failed validation into view on the correct tab.
 		if (inputs.name.error || inputs.image.error) {
 			selectedTab = 'general';
+		} else if (inputs.hostname.error) {
+			selectedTab = 'networks';
 		}
 	}
 
@@ -303,6 +307,13 @@
 				<div class="space-y-4">
 					{@render groupTitle(m.resource_networks_cap(), m.aliases_note())}
 					<NetworkAttachmentEditor bind:rows={rows.networks} networks={networkNames} disabled={submitting} />
+					<FormInput
+						label={m.hostname()}
+						type="text"
+						placeholder={hostnamePlaceholder}
+						disabled={submitting}
+						bind:input={inputs.hostname}
+					/>
 				</div>
 			</Tabs.Content>
 

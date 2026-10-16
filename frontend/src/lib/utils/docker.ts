@@ -1,7 +1,7 @@
 import type { Temporal } from 'temporal-polyfill';
 
 import { m } from '#lib/paraglide/messages.js';
-import type { ContainerStats, ContainerSummaryDto } from '#lib/types/docker.js';
+import type { ContainerDetailsDto, ContainerStats, ContainerSummaryDto } from '#lib/types/docker.js';
 import type { Environment, EnvironmentStatus } from '#lib/types/environment.js';
 import type { VulnerabilityScanSummary } from '#lib/types/environment.js';
 import type { SearchPaginationSortRequest } from '#lib/types/shared.js';
@@ -79,6 +79,14 @@ export function getContainerIpAddresses(container: ContainerSummaryDto): string[
 	}
 
 	return ipAddresses;
+}
+
+// Docker falls back to the container's short ID, so only a hostname that was asked for is worth showing.
+export function getCustomHostname(container: Pick<ContainerDetailsDto, 'id' | 'config'>): string | undefined {
+	const hostname = container.config?.hostname?.trim();
+	if (!hostname) return undefined;
+	const shortId = container.id.length >= 12 ? container.id.slice(0, 12) : null;
+	return hostname === shortId ? undefined : hostname;
 }
 
 // --- Swarm service mode helpers ---

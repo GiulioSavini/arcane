@@ -8,6 +8,7 @@
 	import { openConfirmDialog } from '#lib/components/confirm-dialog/index.js';
 	import {
 		containerFormSchema,
+		editContainerFormSchema,
 		formValuesFromEditConfig,
 		rowsFromEditConfig,
 		toEditRequest
@@ -28,7 +29,10 @@
 	const queryClient = useQueryClient();
 	// The form is intentionally seeded once from the load-time snapshot.
 	// svelte-ignore state_referenced_locally
-	const form = createForm<typeof containerFormSchema>(containerFormSchema, formValuesFromEditConfig(data.editConfig));
+	const form = createForm<typeof containerFormSchema>(
+		editContainerFormSchema(data.editConfig.hostname),
+		formValuesFromEditConfig(data.editConfig)
+	);
 	let rows = $state(untrack(() => rowsFromEditConfig(data.editConfig)));
 
 	const editContainerMutation = createMutation(() => ({
@@ -90,6 +94,7 @@
 			bind:rows
 			cancelHref={environmentHref(`/containers/${data.containerId}`, data.envId)}
 			environmentId={data.envId}
+			hostnamePlaceholder={data.editConfig.id.slice(0, 12)}
 			submitting={editContainerMutation.isPending}
 			onSubmit={handleSubmit}
 		/>

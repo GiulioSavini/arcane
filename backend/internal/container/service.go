@@ -851,7 +851,7 @@ func applyEditToContainerConfig(cfg container.Config, previousBindings network.P
 	}
 
 	return container.Config{ //exhaustruct:enforce
-		Hostname:        cfg.Hostname,
+		Hostname:        kit.Ternary(req.Hostname != nil, strings.TrimSpace(kit.FromPtr(req.Hostname)), cfg.Hostname),
 		Domainname:      cfg.Domainname,
 		User:            mo.PointerToOption(req.User).OrElse(cfg.User),
 		AttachStdin:     cfg.AttachStdin,
